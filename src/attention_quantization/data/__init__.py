@@ -1,15 +1,15 @@
 """Data access and calibration-set preparation."""
 
 from .sharegpt4v import (
-    ShareGPT4VCalibrationDataset,
-    ShareGPT4VRecord,
+    LlavaCalibrationCollator,
+    load_llava_processor,
     load_sharegpt4v_records,
     make_calibration_dataset,
 )
 
 __all__ = [
-    "ShareGPT4VCalibrationDataset",
-    "ShareGPT4VRecord",
+    "LlavaCalibrationCollator",
+    "load_llava_processor",
     "load_sharegpt4v_records",
     "make_calibration_dataset",
 ]

@@ -10,7 +10,11 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from attention_quantization.data import make_calibration_dataset  # noqa: E402
+from attention_quantization.data import (  # noqa: E402
+    LlavaCalibrationCollator,
+    load_llava_processor,
+    make_calibration_dataset,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +39,16 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of selected records to print (default: 3).",
     )
+    parser.add_argument(
+        "--tokenize",
+        action="store_true",
+        help="Also tokenize the preview batch with the LLaVA 1.5 Transformers processor.",
+    )
+    parser.add_argument(
+        "--processor",
+        default="llava-hf/llava-1.5-7b-hf",
+        help="Transformers processor ID or local path used with --tokenize.",
+    )
     return parser.parse_args()
 
 
@@ -54,9 +68,20 @@ def main() -> int:
         for index in range(min(args.preview, len(dataset))):
             sample = dataset[index]
             print(f"\n[{index}] record_id: {sample['record_id']}")
-            print(f"Image(s): {len(sample['images'])}")
+            print(f"Image size: {sample['image'].size}")
             print(f"User prompt: {sample['user_prompt']}")
             print(f"Assistant caption: {sample['assistant_caption']}")
+        if args.tokenize:
+            preview_count = min(args.preview, len(dataset))
+            if preview_count == 0:
+                raise ValueError("Use --preview greater than zero with --tokenize")
+            processor = load_llava_processor(args.processor)
+            collator = LlavaCalibrationCollator(processor)
+            batch = collator([dataset[index] for index in range(preview_count)])
+            print("\nLLaVA calibration batch:")
+            print(f"input_ids shape: {tuple(batch['input_ids'].shape)}")
+            print(f"pixel_values shape: {tuple(batch['pixel_values'].shape)}")
+            print(f"assistant target tokens: {(batch['labels'] != -100).sum().item()}")
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

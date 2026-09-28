@@ -21,11 +21,8 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+SHAREGPT4V_REPO_ID = "Lin-Chen/ShareGPT4V"
 SHAREGPT4V_ANNOTATION = "sharegpt4v_instruct_gpt4-vision_cap100k.json"
-SHAREGPT4V_ANNOTATION_URL = (
-    "https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/resolve/main/"
-    + SHAREGPT4V_ANNOTATION
-)
 
 # Public image archives linked by the ShareGPT4V data documentation. Some
 # ShareGPT4V sources require a separate/manual download and are not listed here.
@@ -103,8 +100,23 @@ def download_sharegpt4v_captions(data_root: Path) -> Path:
     if destination.exists():
         print(f"ShareGPT4V caption annotations already exist: {destination}")
     else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as error:
+            raise RuntimeError(
+                "huggingface_hub is required. Install project dependencies with: "
+                "python -m pip install -r requirements.txt"
+            ) from error
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading ShareGPT4V caption annotations to: {destination}")
-        download_file(SHAREGPT4V_ANNOTATION_URL, destination)
+        downloaded_path = hf_hub_download(
+            repo_id=SHAREGPT4V_REPO_ID,
+            filename=SHAREGPT4V_ANNOTATION,
+            repo_type="dataset",
+            local_dir=str(destination.parent),
+        )
+        destination = Path(downloaded_path)
     return destination
 
 

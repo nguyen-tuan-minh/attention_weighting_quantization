@@ -1,79 +1,24 @@
-"""Read ShareGPT4V annotations and expose reproducible calibration samples.
-
-The dataset returns the image(s), human prompt, and assistant caption separately.
-This keeps the data layer independent of LLaVA prompt templating and tokenization;
-the model adapter can form the teacher-forced calibration input from all three.
-"""
+"""Load ShareGPT4V records with 🤗 Datasets for LLaVA calibration."""
 
 from __future__ import annotations
 
-import json
-import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from datasets import Dataset, Image, load_dataset
 
 
 DEFAULT_ANNOTATION_RELATIVE_PATH = Path(
     "raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json"
 )
 DEFAULT_IMAGE_ROOT_RELATIVE_PATH = Path("raw")
+DEFAULT_LLAVA_PROCESSOR = "llava-hf/llava-1.5-7b-hf"
 
 
-@dataclass(frozen=True)
-class ShareGPT4VRecord:
-    """One image/conversation pair from a ShareGPT4V annotation file."""
-
-    record_id: str
-    image_paths: tuple[Path, ...]
-    user_prompt: str
-    assistant_caption: str
-
-
-def _read_annotation_rows(annotation_path: Path) -> list[dict[str, Any]]:
-    if not annotation_path.is_file():
-        raise FileNotFoundError(f"ShareGPT4V annotations not found: {annotation_path}")
-
-    if annotation_path.suffix.lower() == ".jsonl":
-        rows: list[dict[str, Any]] = []
-        with annotation_path.open("r", encoding="utf-8") as source:
-            for line_number, line in enumerate(source, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ValueError(
-                        f"Invalid JSON on line {line_number} of {annotation_path}: {error}"
-                    ) from error
-                if not isinstance(row, dict):
-                    raise ValueError(f"Expected an object on line {line_number} of {annotation_path}")
-                rows.append(row)
-        return rows
-
-    if annotation_path.suffix.lower() != ".json":
-        raise ValueError(f"Expected a .json or .jsonl annotation file: {annotation_path}")
-
-    with annotation_path.open("r", encoding="utf-8") as source:
-        payload = json.load(source)
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict):
-        rows = payload.get("data", payload.get("records"))
-    else:
-        rows = None
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise ValueError(
-            "Expected the annotation JSON to contain a list of records, either at the "
-            "top level or under a 'data'/'records' key."
-        )
-    return rows
-
-
-def _conversation_texts(row: dict[str, Any], row_number: int) -> tuple[str, str]:
+def _conversation_to_fields(row: dict[str, Any], index: int) -> tuple[str, str]:
     conversations = row.get("conversations")
     if not isinstance(conversations, list):
-        raise ValueError(f"Record {row_number} has no conversations list")
+        raise ValueError(f"Record {index} has no conversations list")
 
     user_prompt: str | None = None
     for message in conversations:
@@ -86,37 +31,23 @@ def _conversation_texts(row: dict[str, Any], row_number: int) -> tuple[str, str]
         if role in {"human", "user"} and user_prompt is None:
             user_prompt = content
         elif role in {"gpt", "assistant"} and user_prompt is not None:
-            # The first assistant turn is the caption target. Keep the human text
-            # unchanged, including any <image> marker expected by LLaVA formatting.
             return user_prompt, content
 
-    raise ValueError(f"Record {row_number} must include a user prompt and assistant response")
+    raise ValueError(f"Record {index} must include a user prompt and assistant response")
 
 
-def _image_references(row: dict[str, Any], row_number: int) -> tuple[str, ...]:
-    image_value = row.get("image")
-    if isinstance(image_value, str):
-        references = (image_value,)
-    elif isinstance(image_value, list) and image_value and all(
-        isinstance(path, str) for path in image_value
-    ):
-        references = tuple(image_value)
-    else:
-        raise ValueError(f"Record {row_number} must have an image path or list of image paths")
-    if not all(reference.strip() for reference in references):
-        raise ValueError(f"Record {row_number} contains an empty image path")
-    return references
-
-
-def _resolve_image_path(reference: str, image_root: Path, row_number: int) -> Path:
-    relative_path = Path(reference.replace("\\", "/"))
+def _resolve_image(image_reference: Any, image_root: Path, index: int) -> str:
+    if not isinstance(image_reference, str) or not image_reference.strip():
+        raise ValueError(f"Record {index} must have one image path")
+    relative_path = Path(image_reference.replace("\\", "/"))
     if relative_path.is_absolute():
-        raise ValueError(f"Record {row_number} has an absolute image path: {reference}")
-    resolved = (image_root / relative_path).resolve()
+        raise ValueError(f"Record {index} has an absolute image path: {image_reference}")
+
     root = image_root.resolve()
-    if resolved != root and root not in resolved.parents:
-        raise ValueError(f"Record {row_number} image path escapes the image root: {reference}")
-    return resolved
+    image_path = (root / relative_path).resolve()
+    if image_path != root and root not in image_path.parents:
+        raise ValueError(f"Record {index} image path escapes the image root: {image_reference}")
+    return str(image_path)
 
 
 def load_sharegpt4v_records(
@@ -124,107 +55,68 @@ def load_sharegpt4v_records(
     image_root: str | Path,
     *,
     source_prefix: str | None = "coco/",
-    check_images: bool = True,
-) -> list[ShareGPT4VRecord]:
-    """Load records, optionally filter by image-path prefix, and validate paths.
+    cache_dir: str | Path | None = None,
+) -> Dataset:
+    """Load local JSON/JSONL annotations as a Hugging Face Dataset.
 
-    ``image_root`` is the directory above the source path stored in the JSON.
-    For COCO annotations such as ``coco/train2017/000000000001.jpg``, use the
-    repository data directory's ``data/raw`` folder as the image root.
+    The returned dataset has columns ``record_id``, ``image`` (decoded PIL
+    image), ``user_prompt``, and ``assistant_caption``. Set ``source_prefix`` to
+    ``None`` to retain all image sources in the annotation file.
     """
     annotation_path = Path(annotation_path).expanduser().resolve()
     image_root = Path(image_root).expanduser().resolve()
-    rows = _read_annotation_rows(annotation_path)
-    records: list[ShareGPT4VRecord] = []
-    missing_images: list[str] = []
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"ShareGPT4V annotations not found: {annotation_path}")
 
-    for row_number, row in enumerate(rows):
-        try:
-            references = _image_references(row, row_number)
-        except ValueError:
-            # Other rows can belong to text-only data or have a different schema.
-            # For the selected source, malformed records should be reported.
-            if source_prefix is None:
-                raise
-            continue
+    dataset = load_dataset(
+        "json",
+        data_files={"train": str(annotation_path)},
+        split="train",
+        cache_dir=str(Path(cache_dir).expanduser().resolve()) if cache_dir else None,
+    )
+    if "image" not in dataset.column_names:
+        raise ValueError(f"No 'image' column in ShareGPT4V file: {annotation_path}")
 
-        normalized_references = tuple(reference.replace("\\", "/") for reference in references)
-        if source_prefix is not None and not any(
-            reference.startswith(source_prefix) for reference in normalized_references
-        ):
-            continue
-
-        try:
-            user_prompt, assistant_caption = _conversation_texts(row, row_number)
-            resolved_paths = tuple(
-                _resolve_image_path(reference, image_root, row_number)
-                for reference in references
-            )
-        except ValueError as error:
-            raise ValueError(f"Invalid ShareGPT4V record at row {row_number}: {error}") from error
-
-        if check_images:
-            missing_images.extend(str(path) for path in resolved_paths if not path.is_file())
-
-        record_id = str(row.get("id", row.get("image", row_number)))
-        records.append(
-            ShareGPT4VRecord(
-                record_id=record_id,
-                image_paths=resolved_paths,
-                user_prompt=user_prompt,
-                assistant_caption=assistant_caption,
-            )
+    if source_prefix is not None:
+        prefix = source_prefix.replace("\\", "/")
+        dataset = dataset.filter(
+            lambda row: isinstance(row["image"], str)
+            and row["image"].replace("\\", "/").startswith(prefix),
+            desc=f"Filtering ShareGPT4V records to {prefix}",
         )
 
-    if missing_images:
-        preview = "\n".join(f"  - {path}" for path in missing_images[:10])
-        more = f"\n  ... and {len(missing_images) - 10} more" if len(missing_images) > 10 else ""
-        raise FileNotFoundError(
-            f"{len(missing_images)} referenced image(s) were not found under {image_root}:\n"
-            f"{preview}{more}"
-        )
-    if not records:
-        filter_description = repr(source_prefix) if source_prefix is not None else "no source filter"
+    if not len(dataset):
         raise ValueError(
-            f"No usable ShareGPT4V records found in {annotation_path} for {filter_description}."
+            f"No ShareGPT4V records matched source prefix {source_prefix!r} in {annotation_path}"
         )
-    return records
 
+    source_columns = dataset.column_names
 
-class ShareGPT4VCalibrationDataset:
-    """Indexable dataset with lazy image loading for model-specific collators.
-
-    Each item contains ``record_id``, ``images`` (RGB PIL images),
-    ``user_prompt``, and ``assistant_caption``. The assistant caption is retained
-    as the calibration target; a separate fixed prompt belongs to generation
-    quality evaluation.
-    """
-
-    def __init__(self, records: list[ShareGPT4VRecord]) -> None:
-        self.records = records
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        try:
-            from PIL import Image
-        except ImportError as error:
-            raise RuntimeError(
-                "Pillow is required to open images. Install it with: python -m pip install Pillow"
-            ) from error
-
-        record = self.records[index]
-        images = []
-        for image_path in record.image_paths:
-            with Image.open(image_path) as image:
-                images.append(image.convert("RGB"))
+    def normalize_record(row: dict[str, Any], index: int) -> dict[str, str]:
+        user_prompt, assistant_caption = _conversation_to_fields(row, index)
         return {
-            "record_id": record.record_id,
-            "images": images,
-            "user_prompt": record.user_prompt,
-            "assistant_caption": record.assistant_caption,
+            "record_id": str(row.get("id") or row.get("image") or index),
+            "image": _resolve_image(row.get("image"), image_root, index),
+            "user_prompt": user_prompt,
+            "assistant_caption": assistant_caption,
         }
+
+    dataset = dataset.map(
+        normalize_record,
+        with_indices=True,
+        remove_columns=source_columns,
+        desc="Normalizing ShareGPT4V conversations and image paths",
+    )
+
+    missing_paths = [path for path in dataset["image"] if not Path(path).is_file()]
+    if missing_paths:
+        preview = "\n".join(f"  - {path}" for path in missing_paths[:10])
+        more = f"\n  ... and {len(missing_paths) - 10} more" if len(missing_paths) > 10 else ""
+        raise FileNotFoundError(
+            f"{len(missing_paths)} referenced image(s) were not found:\n{preview}{more}"
+        )
+
+    return dataset.cast_column("image", Image(decode=True))
 
 
 def make_calibration_dataset(
@@ -235,11 +127,11 @@ def make_calibration_dataset(
     annotation_path: str | Path | None = None,
     image_root: str | Path | None = None,
     source_prefix: str | None = "coco/",
-) -> ShareGPT4VCalibrationDataset:
-    """Create a deterministic, no-replacement sample for calibration.
+) -> Dataset:
+    """Return a deterministic, no-replacement calibration subset.
 
-    The default paths match ``scripts/download_dataset.py``. Image pixels are
-    opened lazily when an item is requested, rather than retained in memory.
+    Images are decoded lazily by the Datasets ``Image`` feature. Each selected
+    row retains the ShareGPT4V user prompt and assistant caption.
     """
     if sample_count < 1:
         raise ValueError("sample_count must be a positive integer")
@@ -255,17 +147,91 @@ def make_calibration_dataset(
         if image_root is not None
         else data_dir / DEFAULT_IMAGE_ROOT_RELATIVE_PATH
     )
+    cache_dir = data_dir / "cache" / "datasets"
 
-    records = load_sharegpt4v_records(
+    dataset = load_sharegpt4v_records(
         annotation_path,
         image_root,
         source_prefix=source_prefix,
+        cache_dir=cache_dir,
     )
-    if sample_count > len(records):
+    if sample_count > len(dataset):
         raise ValueError(
-            f"Requested {sample_count} calibration records, but only {len(records)} "
+            f"Requested {sample_count} calibration records, but only {len(dataset)} "
             "matching records are available."
         )
+    return dataset.shuffle(seed=seed).select(range(sample_count))
 
-    selected_indices = random.Random(seed).sample(range(len(records)), sample_count)
-    return ShareGPT4VCalibrationDataset([records[index] for index in selected_indices])
+
+def load_llava_processor(
+    model_name_or_path: str = DEFAULT_LLAVA_PROCESSOR,
+    *,
+    do_pad: bool = True,
+):
+    """Load the Transformers processor matching the LLaVA 1.5 checkpoint."""
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is not None and hasattr(image_processor, "do_pad"):
+        image_processor.do_pad = do_pad
+    return processor
+
+
+class LlavaCalibrationCollator:
+    """Use the Transformers LLaVA processor and mark assistant tokens as targets.
+
+    Prompt formatting follows the LLaVA 1.5 ``USER: <image> ... ASSISTANT:``
+    format. Padding and image preprocessing are handled by the processor.
+    """
+
+    def __init__(self, processor: Any, *, ignore_index: int = -100) -> None:
+        self.processor = processor
+        self.ignore_index = ignore_index
+
+    @staticmethod
+    def _without_image_marker(user_prompt: str) -> str:
+        # Add exactly one image marker in the LLaVA prompt, even if the source
+        # conversation contains a marker on a separate line.
+        return user_prompt.replace("<image>", "").strip()
+
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        if not samples:
+            raise ValueError("Cannot collate an empty sample list")
+
+        images = []
+        full_prompts = []
+        prefix_prompts = []
+        for sample in samples:
+            sample_images = sample["image"]
+            images.append(sample_images)
+            user_text = self._without_image_marker(sample["user_prompt"])
+            prefix = f"USER: <image>\n{user_text} ASSISTANT:"
+            prefix_prompts.append(prefix)
+            full_prompts.append(f"{prefix} {sample['assistant_caption']}</s>")
+
+        batch = self.processor(
+            text=full_prompts,
+            images=images,
+            padding=True,
+            return_tensors="pt",
+        )
+        labels = batch["input_ids"].clone()
+
+        # Determine each assistant boundary with the same processor and image,
+        # so image-token expansion is included in the prefix length.
+        for row_index, (prefix, image) in enumerate(zip(prefix_prompts, images)):
+            prefix_batch = self.processor(
+                text=prefix,
+                images=image,
+                padding=False,
+                return_tensors="pt",
+            )
+            prefix_length = prefix_batch["input_ids"].shape[-1]
+            labels[row_index, :prefix_length] = self.ignore_index
+
+        if "attention_mask" in batch:
+            labels[batch["attention_mask"] == 0] = self.ignore_index
+        batch["labels"] = labels
+        batch["record_ids"] = [sample["record_id"] for sample in samples]
+        return batch

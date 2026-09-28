@@ -6,6 +6,7 @@ This is a planning reference for organizing the Attention Weighting Quantization
 attention_weighting_quantization/
 ├── README.md
 ├── LICENSE
+├── requirements.txt
 ├── pyproject.toml
 ├── configs/
 │   ├── model.yaml
@@ -19,6 +20,7 @@ attention_weighting_quantization/
 │   └── investigate.py
 ├── src/
 │   └── attention_quantization/
+│       ├── __init__.py
 │       ├── model/
 │       │   └── download.py
 │       ├── data/
@@ -43,7 +45,7 @@ attention_weighting_quantization/
 
 - `scripts/` contains command-line entry points. `download_dataset.py` downloads the ShareGPT4V caption annotation JSON and one selected image source under `data/raw/`; COCO is the default. `inspect_calibration_data.py` samples and previews calibration records.
 - `src/attention_quantization/model/` handles model-related setup and downloading.
-- `src/attention_quantization/data/` loads ShareGPT4V records, validates image references, samples reproducibly, and exposes each image with its user prompt and assistant caption.
+- `src/attention_quantization/data/` loads and filters ShareGPT4V through Hugging Face `datasets`, validates image references, samples reproducibly, and uses a Transformers LLaVA processor collator to create calibration batches with assistant caption targets.
 - `src/attention_quantization/quantization/` contains the quantization methods and attention-specific implementation.
 - `src/attention_quantization/evaluation/` compares original and quantized model behavior and computes evaluation metrics.
 - `scripts/investigate.py` is an entry point for evaluation and analysis. If attention behavior analysis grows into its own area, it can later become `src/attention_quantization/analysis/attention/`.
