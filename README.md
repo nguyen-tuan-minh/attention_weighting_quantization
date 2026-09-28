@@ -11,6 +11,10 @@ The project studies how quantizing attention weights affects LLaVA 1.5 7B. The s
 
 Please follow the upstream dataset and model terms when downloading or using these resources. The data and pretrained model weights are not included in this repository.
 
+## Documentation
+
+Planning notes and supporting project documentation are in [`docs/`](docs/). The [proposed project structure](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation modules.
+
 ## License
 
 See [LICENSE](LICENSE) for this repository’s license. Third-party model weights and dataset assets may have separate terms.
