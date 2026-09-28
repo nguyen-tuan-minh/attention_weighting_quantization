@@ -11,6 +11,19 @@ The project studies how quantizing attention weights affects LLaVA 1.5 7B. The s
 
 Please follow the upstream dataset and model terms when downloading or using these resources. The data and pretrained model weights are not included in this repository.
 
+### Downloading captions and image data
+
+The download script stores the ShareGPT4V caption annotations, image archives, and extracted images under `data/raw/`. By default it downloads the ShareGPT4V GPT-4V caption JSON and COCO `train2017`. Other supported image sources can be selected individually:
+
+```bash
+python scripts/download_dataset.py                  # ShareGPT4V captions + COCO train2017
+python scripts/download_dataset.py --dataset gqa
+python scripts/download_dataset.py --dataset textvqa
+python scripts/download_dataset.py --dataset visual-genome
+```
+
+The caption file is saved to `data/raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json`. The script downloads and extracts source data only; it does not sample records or prepare a calibration set. ShareGPT4V also lists sources with separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
+
 ## Documentation
 
 Planning notes and supporting project documentation are in [`docs/`](docs/). The [proposed project structure](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation modules.

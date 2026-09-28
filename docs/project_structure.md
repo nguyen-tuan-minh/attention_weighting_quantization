@@ -40,7 +40,7 @@ attention_weighting_quantization/
 
 ## Responsibilities
 
-- `scripts/` contains command-line entry points. These call reusable code from `src/`.
+- `scripts/` contains command-line entry points. `download_dataset.py` downloads the ShareGPT4V caption annotation JSON and one selected image source under `data/raw/`; COCO is the default. These scripts can later call reusable code from `src/`.
 - `src/attention_quantization/model/` handles model-related setup and downloading.
 - `src/attention_quantization/data/` handles dataset download, organization, and loading for the COCO images and ShareGPT4V captions.
 - `src/attention_quantization/quantization/` contains the quantization methods and attention-specific implementation.
