@@ -22,7 +22,13 @@ python scripts/download_dataset.py --dataset textvqa
 python scripts/download_dataset.py --dataset visual-genome
 ```
 
-The caption file is saved to `data/raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json`. The script downloads and extracts source data only; it does not sample records or prepare a calibration set. ShareGPT4V also lists sources with separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
+The caption file is saved to `data/raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json`. The downloader only retrieves source data. To create and inspect a deterministic COCO calibration sample from the assistant captions, run:
+
+```bash
+python scripts/inspect_calibration_data.py --samples 128 --seed 42
+```
+
+The data interface returns RGB images, the associated user prompt, and the assistant caption. The caption is preserved as the calibration target. Fixed-prompt generation evaluation is a separate later step. ShareGPT4V also lists sources with separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
 
 ## Documentation
 

@@ -14,6 +14,7 @@ attention_weighting_quantization/
 ├── scripts/
 │   ├── download_model.py
 │   ├── download_dataset.py
+│   ├── inspect_calibration_data.py
 │   ├── quantize.py
 │   └── investigate.py
 ├── src/
@@ -21,8 +22,8 @@ attention_weighting_quantization/
 │       ├── model/
 │       │   └── download.py
 │       ├── data/
-│       │   ├── download.py
-│       │   └── coco_sharegpt4v.py
+│       │   ├── __init__.py
+│       │   └── sharegpt4v.py
 │       ├── quantization/
 │       │   ├── methods.py
 │       │   └── attention.py
@@ -40,9 +41,9 @@ attention_weighting_quantization/
 
 ## Responsibilities
 
-- `scripts/` contains command-line entry points. `download_dataset.py` downloads the ShareGPT4V caption annotation JSON and one selected image source under `data/raw/`; COCO is the default. These scripts can later call reusable code from `src/`.
+- `scripts/` contains command-line entry points. `download_dataset.py` downloads the ShareGPT4V caption annotation JSON and one selected image source under `data/raw/`; COCO is the default. `inspect_calibration_data.py` samples and previews calibration records.
 - `src/attention_quantization/model/` handles model-related setup and downloading.
-- `src/attention_quantization/data/` handles dataset download, organization, and loading for the COCO images and ShareGPT4V captions.
+- `src/attention_quantization/data/` loads ShareGPT4V records, validates image references, samples reproducibly, and exposes each image with its user prompt and assistant caption.
 - `src/attention_quantization/quantization/` contains the quantization methods and attention-specific implementation.
 - `src/attention_quantization/evaluation/` compares original and quantized model behavior and computes evaluation metrics.
 - `scripts/investigate.py` is an entry point for evaluation and analysis. If attention behavior analysis grows into its own area, it can later become `src/attention_quantization/analysis/attention/`.
