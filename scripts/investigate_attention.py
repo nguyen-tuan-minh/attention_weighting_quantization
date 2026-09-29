@@ -1,12 +1,15 @@
-"""Run calibration examples through LLaVA and save language attention weights."""
+"""Run calibration examples and analyse or save language attention weights."""
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
 import torch
 import yaml
 from datasets import Dataset
@@ -60,9 +63,10 @@ def conversation_text(sample: dict[str, Any]) -> tuple[str, str]:
 
 def register_attention_hooks(
     model: LlavaForConditionalGeneration,
+    mode: str,
     active_sample: dict[str, Any],
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Write each text self-attention matrix to the active sample directory."""
+    """Compute online IGA vectors or write each matrix for later analysis."""
     handles = []
     for name, module in model.named_modules():
         if not name.endswith(".self_attn") or "vision_tower" in name:
@@ -77,16 +81,26 @@ def register_attention_hooks(
             *,
             key: str = layer_name,
         ) -> None:
-            output_dir = active_sample["directory"]
-            if output_dir is None or not isinstance(output, tuple) or len(output) < 2:
+            if not isinstance(output, tuple) or len(output) < 2:
                 return
             attention_weights = output[1]
             if not torch.is_tensor(attention_weights):
                 return
-            torch.save(
-                attention_weights.detach().to(device="cpu", dtype=torch.float16),
-                output_dir / f"{key}.pt",
-            )
+
+            if mode == "save":
+                output_dir = active_sample["directory"]
+                if output_dir is None:
+                    return
+                torch.save(
+                    attention_weights.detach().to(device="cpu", dtype=torch.float16),
+                    output_dir / f"{key}.pt",
+                )
+            else:
+                text_mask = active_sample["text_mask"].to(attention_weights.device)
+                image_mask = active_sample["image_mask"].to(attention_weights.device)
+                # Shape after selection: heads x text queries x image keys.
+                text_to_image = attention_weights[0][:, text_mask, :][:, :, image_mask]
+                active_sample["iga"][key] = text_to_image.float().mean(dim=(0, 1)).cpu()
             active_sample["captured"] += 1
 
         handles.append(module.register_forward_hook(save_attention))
@@ -94,6 +108,49 @@ def register_attention_hooks(
     if not handles:
         raise RuntimeError("No text self-attention modules were found in the loaded model")
     return handles
+
+
+def show_iga_heatmap(
+    encoded: Any,
+    processor: Any,
+    iga_scores: torch.Tensor,
+    sample_number: int,
+    layer_count: int,
+) -> None:
+    """Display the processed image beside its layer-averaged IGA overlay."""
+    token_count = iga_scores.numel()
+    grid_size = math.isqrt(token_count)
+    if grid_size * grid_size != token_count:
+        raise ValueError(
+            f"Cannot reshape {token_count} image-token scores into a square patch grid"
+        )
+
+    pixel_values = encoded["pixel_values"][0].detach().cpu().float()
+    image_processor = processor.image_processor
+    mean = torch.tensor(image_processor.image_mean).view(-1, 1, 1)
+    std = torch.tensor(image_processor.image_std).view(-1, 1, 1)
+    image = (pixel_values * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+
+    image_height, image_width = image.shape[:2]
+    heatmap = F.interpolate(
+        iga_scores.reshape(1, 1, grid_size, grid_size),
+        size=(image_height, image_width),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0].numpy()
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+    axes[0].imshow(image)
+    axes[0].set_title("Processor image")
+    axes[1].imshow(image)
+    heatmap_view = axes[1].imshow(heatmap, cmap="inferno", alpha=0.5)
+    axes[1].set_title(f"IGA overlay (mean of {layer_count} layers)")
+    for axis in axes:
+        axis.axis("off")
+    figure.colorbar(heatmap_view, ax=axes[1], fraction=0.046, pad=0.04, label="IGA")
+    figure.suptitle(f"Calibration sample {sample_number}")
+    plt.show()
+    plt.close(figure)
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +169,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured seed.")
+    parser.add_argument(
+        "--mode",
+        choices=("online", "save"),
+        default="online",
+        help="online: display one IGA heatmap per sample without saving maps; save: save raw maps for later.",
+    )
     return parser.parse_args()
 
 
@@ -184,9 +247,16 @@ def main() -> int:
                 data_paths["processed_dir"] / "attention_maps",
             )
         )
-        attention_dir.mkdir(parents=True, exist_ok=True)
-        active_sample: dict[str, Any] = {"directory": None, "captured": 0}
-        hook_handles = register_attention_hooks(model, active_sample)
+        if args.mode == "save":
+            attention_dir.mkdir(parents=True, exist_ok=True)
+        active_sample: dict[str, Any] = {
+            "directory": None,
+            "captured": 0,
+            "text_mask": None,
+            "image_mask": None,
+            "iga": {},
+        }
+        hook_handles = register_attention_hooks(model, args.mode, active_sample)
         print(f"Registered hooks on {len(hook_handles)} self-attention layers")
 
         # =====================================================================
@@ -195,10 +265,12 @@ def main() -> int:
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         try:
             for index, sample in enumerate(dataset, start=1):
-                sample_dir = attention_dir / f"sample_{index:04d}"
-                sample_dir.mkdir(parents=True, exist_ok=True)
+                sample_dir = attention_dir / f"sample_{index:04d}" if args.mode == "save" else None
+                if sample_dir is not None:
+                    sample_dir.mkdir(parents=True, exist_ok=True)
                 active_sample["directory"] = sample_dir
                 active_sample["captured"] = 0
+                active_sample["iga"] = {}
 
                 user_text, assistant_text = conversation_text(sample)
                 prompt = f"USER: <image>\n{user_text}\nASSISTANT: {assistant_text}"
@@ -210,6 +282,25 @@ def main() -> int:
                 inputs = {key: value.to(model.device) for key, value in encoded.items()}
                 if "pixel_values" in inputs:
                     inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
+                image_token_id = getattr(model.config, "image_token_id", None)
+                if image_token_id is None:
+                    image_token_id = model.config.image_token_index
+                image_mask = inputs["input_ids"][0] == image_token_id
+                attention_mask = inputs.get("attention_mask")
+                if attention_mask is None:
+                    text_mask = ~image_mask
+                else:
+                    text_mask = attention_mask[0].bool() & ~image_mask
+                if not image_mask.any() or not text_mask.any():
+                    raise ValueError("Could not identify text-query and image-key token positions")
+                # Ignore any prefix tokens before the image: causal attention
+                # prevents those queries from attending to image keys.
+                last_image_position = image_mask.nonzero(as_tuple=True)[0][-1]
+                text_mask &= torch.arange(text_mask.numel(), device=text_mask.device) > last_image_position
+                if not text_mask.any():
+                    raise ValueError("No text query tokens occur after the image tokens")
+                active_sample["image_mask"] = image_mask
+                active_sample["text_mask"] = text_mask
 
                 with torch.inference_mode():
                     outputs = model(**inputs, use_cache=False, output_attentions=True)
@@ -217,10 +308,23 @@ def main() -> int:
                     raise RuntimeError(
                         "Attention hooks captured no weights; check the Transformers attention implementation"
                     )
-                print(
-                    f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}; "
-                    f"saved {active_sample['captured']} attention matrices to {sample_dir}"
-                )
+                print(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}")
+                if args.mode == "online":
+                    layer_scores = list(active_sample["iga"].values())
+                    if not layer_scores:
+                        raise RuntimeError("No per-layer IGA scores were captured")
+                    iga_scores = torch.stack(layer_scores).mean(dim=0)
+                    show_iga_heatmap(
+                        encoded,
+                        processor,
+                        iga_scores,
+                        index,
+                        len(layer_scores),
+                    )
+                else:
+                    print(
+                        f"  Saved {active_sample['captured']} attention matrices to {sample_dir}"
+                    )
                 del outputs, inputs, encoded, sample
         finally:
             for handle in hook_handles:
@@ -229,9 +333,13 @@ def main() -> int:
         # =====================================================================
         # 5. ANALYSE CAPTURED ATTENTION
         # =====================================================================
-        # Reserved for future analysis code.
+        # Online mode calculates IGA and displays the per-sample heatmap in the
+        # forward loop. Add further saved-map analysis here.
 
-        print(f"Attention capture complete: {attention_dir}")
+        if args.mode == "online":
+            print("Online IGA heatmap display complete; no attention maps were saved.")
+        else:
+            print(f"Attention maps saved under: {attention_dir}")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

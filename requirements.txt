@@ -13,3 +13,4 @@ PyYAML>=6.0.1
 # Image and numerical utilities
 Pillow>=10.0.0
 numpy>=1.26.0
+matplotlib>=3.8.0

@@ -50,7 +50,7 @@ attention_weighting_quantization/
 - `scripts/prepare_dataset.py` loads ShareGPT4V, filters records by source (COCO by default), optionally samples records, and saves the result under the configured processed data directory.
 - `scripts/set_up.sh` creates `.venv` and installs the requirements and project package. `scripts/check_device.py` reports CPU, memory, and PyTorch accelerator availability.
 - `scripts/run_calibration.py` downloads LLaVA 1.5 7B, prepares the configured COCO calibration subset, then forwards one example at a time.
-- `scripts/investigate_attention.py` follows the same workflow and registers hooks to save language self-attention matrices for later analysis.
+- `scripts/investigate_attention.py` follows the same workflow with an online summary mode and a mode that saves language self-attention matrices for later analysis.
 - `src/attention_quantization/model/` handles model-related setup and downloading.
 - `src/attention_quantization/data/sharegpt4v.py` exposes the ShareGPT4V loader and related image downloader. By default, the loader downloads COCO, filters to COCO records, and returns images as a lazy feature that decodes them on access. `scripts/prepare_dataset.py` optionally samples and saves the selected data.
 - `src/attention_quantization/quantization/` contains the quantization methods and attention-specific implementation.

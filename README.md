@@ -60,10 +60,11 @@ The original forward-only script has three sections: load model, prepare calibra
 python scripts/run_calibration.py
 ```
 
-The attention investigation script has five sections: load model, prepare calibration, register hooks, forward, and analyse. It saves each captured language attention matrix under `attention_output_dir`:
+The attention investigation script has two modes. The default `online` mode computes IGA for each layer, using non-padding text queries after the image tokens, averages the layer maps, and opens one Matplotlib figure per sample with the processor image beside its IGA overlay. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. The script is divided into five sections: load model, prepare calibration, register hooks, forward, and analyse.
 
 ```bash
-python scripts/investigate_attention.py
+python scripts/investigate_attention.py                 # online analysis
+python scripts/investigate_attention.py --mode save     # save attention maps
 ```
 
 Both scripts forward each image with its ShareGPT4V user prompt and assistant caption. Images are decoded one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
