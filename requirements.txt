@@ -8,6 +8,7 @@ safetensors>=0.4.0
 # Dataset loading, filtering, caching, and Hub downloads
 datasets>=3.0.0
 huggingface_hub>=0.26.0
+PyYAML>=6.0.1
 
 # Image and numerical utilities
 Pillow>=10.0.0

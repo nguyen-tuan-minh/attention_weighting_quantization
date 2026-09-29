@@ -7,38 +7,45 @@ The project studies how quantizing attention weights affects LLaVA 1.5 7B. The s
 ## Model and data
 
 - **Model:** LLaVA 1.5 7B. See the [official LLaVA repository](https://github.com/haotian-liu/LLaVA) for model setup and licensing details.
-- **Dataset:** COCO `train2017` images paired with the COCO records in ShareGPT4V’s `sharegpt4v_instruct_gpt4-vision_cap100k.json` annotation file. The data interface filters image paths beginning with `coco/` and selects a reproducible calibration subset. See [ShareGPT4V data documentation](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md) and the [dataset page](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V).
+- **Dataset:** ShareGPT4V, with COCO as the default source. The dataset preparation script filters records by source and can optionally select a reproducible subset. See [ShareGPT4V data documentation](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md) and the [dataset page](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V).
 
 Please follow the upstream dataset and model terms when downloading or using these resources. The data and pretrained model weights are not included in this repository.
 
-### Downloading captions and image data
+### Downloading image data and preparing ShareGPT4V records
 
 Install the project dependencies on the machine that will run the experiments:
 
 ```bash
 python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-The download script stores the ShareGPT4V caption annotations, image archives, and extracted images under `data/raw/`. By default it downloads the ShareGPT4V GPT-4V caption JSON and COCO `train2017`. Other supported image sources can be selected individually:
+Dataset locations are set in [`configs/dataset.yaml`](configs/dataset.yaml). Relative paths there resolve from the repository root. The ShareGPT4V module downloads image archives and extracts them under the configured `raw_dir`; COCO `train2017` is the default:
 
 ```bash
-python scripts/download_dataset.py                  # ShareGPT4V captions + COCO train2017
-python scripts/download_dataset.py --dataset gqa
-python scripts/download_dataset.py --dataset textvqa
-python scripts/download_dataset.py --dataset visual-genome
+python -m attention_quantization.data.sharegpt4v
+python -m attention_quantization.data.sharegpt4v --dataset gqa
 ```
 
-The caption file is saved to `data/raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json`. The downloader only retrieves source data. To create and inspect a deterministic COCO calibration sample from the assistant captions, run:
+The data module defaults to COCO. Calling the loader downloads the COCO archive if needed, loads the ShareGPT4V records, and connects their image paths to the local files:
+
+```python
+from attention_quantization.data import load_sharegpt4v_dataset
+
+dataset = load_sharegpt4v_dataset()
+```
+
+Image values use Hugging Face's lazy `Image` feature: image files stay on disk and are decoded when accessed (for example, `dataset[0]["image"]`). The dataset files are cached under the configured `cache_dir`. Select another supported source with `source="gqa"`, `source="textvqa"`, or `source="visual-genome"`; set `download_images=False` to skip image downloading when the files are already available. To save a local COCO dataset, optionally sampled, run:
 
 ```bash
-python scripts/inspect_calibration_data.py --samples 128 --seed 42
+python scripts/prepare_dataset.py
 ```
 
-The data interface uses Hugging Face `datasets` to load, filter, shuffle, and select records. It decodes images through the dataset `Image` feature. Add `--tokenize` to the inspection command to load a Transformers LLaVA processor and view the prepared batch shapes. The collator marks assistant caption tokens as targets. Fixed-prompt generation evaluation is a separate later step. ShareGPT4V also lists sources with separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
+The script saves the full COCO subset under the configured `processed_dir/sharegpt4v_coco`. Other supported sources can be selected with `--source` (for example, `--source sam` or `--source all`). Sampling is optional and happens in this script: `python scripts/prepare_dataset.py --samples 128 --seed 42`. Pass a different config file with `--config`. ShareGPT4V image sources can have separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
 
 ## Documentation
 
-Planning notes and supporting project documentation are in [`docs/`](docs/). The [proposed project structure](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation modules.
+Planning notes and supporting project documentation are in [`docs/`](docs/). The [project structure reference](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation scripts and packages.
 
 ## License
 

@@ -1,0 +1,5 @@
+# Paths are relative to the repository root unless they are absolute.
+data_root: data
+raw_dir: data/raw
+cache_dir: data/cache/huggingface
+processed_dir: data/processed

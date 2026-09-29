@@ -1,237 +1,204 @@
-"""Load ShareGPT4V records with 🤗 Datasets for LLaVA calibration."""
+"""Load ShareGPT4V and download its related image datasets."""
 
 from __future__ import annotations
 
+import argparse
+import sys
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 
+import yaml
 from datasets import Dataset, Image, load_dataset
 
 
-DEFAULT_ANNOTATION_RELATIVE_PATH = Path(
-    "raw/sharegpt4v/sharegpt4v_instruct_gpt4-vision_cap100k.json"
-)
-DEFAULT_IMAGE_ROOT_RELATIVE_PATH = Path("raw")
-DEFAULT_LLAVA_PROCESSOR = "llava-hf/llava-1.5-7b-hf"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_CONFIG_PATH = REPOSITORY_ROOT / "configs" / "dataset.yaml"
+SHAREGPT4V_DATASET_ID = "Lin-Chen/ShareGPT4V"
+SHAREGPT4V_CONFIG = "ShareGPT4V"
+
+# Some ShareGPT4V sources require a separate or manual download.
+IMAGE_DATASETS: dict[str, tuple[tuple[str, str], ...]] = {
+    "coco": (("http://images.cocodataset.org/zips/train2017.zip", "coco/train2017.zip"),),
+    "gqa": (("https://downloads.cs.stanford.edu/nlp/data/gqa/images.zip", "gqa/images.zip"),),
+    "textvqa": (
+        ("https://dl.fbaipublicfiles.com/textvqa/images/train_val_images.zip", "textvqa/train_val_images.zip"),
+    ),
+    "visual-genome": (
+        ("https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip", "vg/images.zip"),
+        ("https://cs.stanford.edu/people/rak248/VG_100K_2/images2.zip", "vg/images2.zip"),
+    ),
+}
+SOURCE_PREFIXES = {
+    "coco": "coco/",
+    "gqa": "gqa/",
+    "textvqa": "textvqa/",
+    "visual-genome": "vg/",
+}
 
 
-def _conversation_to_fields(row: dict[str, Any], index: int) -> tuple[str, str]:
-    conversations = row.get("conversations")
-    if not isinstance(conversations, list):
-        raise ValueError(f"Record {index} has no conversations list")
+def get_data_paths(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Path]:
+    """Read dataset paths from YAML, resolving relative paths from the repository root."""
+    config_path = Path(config_path).expanduser()
+    if not config_path.is_absolute():
+        config_path = REPOSITORY_ROOT / config_path
+    with config_path.open(encoding="utf-8") as config_file:
+        config: Any = yaml.safe_load(config_file) or {}
 
-    user_prompt: str | None = None
-    for message in conversations:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("from", message.get("role", ""))).strip().lower()
-        content = message.get("value", message.get("content"))
-        if not isinstance(content, str):
-            continue
-        if role in {"human", "user"} and user_prompt is None:
-            user_prompt = content
-        elif role in {"gpt", "assistant"} and user_prompt is not None:
-            return user_prompt, content
-
-    raise ValueError(f"Record {index} must include a user prompt and assistant response")
+    paths = {}
+    for key in ("data_root", "raw_dir", "cache_dir", "processed_dir"):
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Missing or invalid {key!r} in dataset config: {config_path}")
+        path = Path(value).expanduser()
+        paths[key] = (path if path.is_absolute() else REPOSITORY_ROOT / path).resolve()
+    return paths
 
 
-def _resolve_image(image_reference: Any, image_root: Path, index: int) -> str:
-    if not isinstance(image_reference, str) or not image_reference.strip():
-        raise ValueError(f"Record {index} must have one image path")
-    relative_path = Path(image_reference.replace("\\", "/"))
-    if relative_path.is_absolute():
-        raise ValueError(f"Record {index} has an absolute image path: {image_reference}")
-
-    root = image_root.resolve()
-    image_path = (root / relative_path).resolve()
-    if image_path != root and root not in image_path.parents:
-        raise ValueError(f"Record {index} image path escapes the image root: {image_reference}")
-    return str(image_path)
-
-
-def load_sharegpt4v_records(
-    annotation_path: str | Path,
-    image_root: str | Path,
+def load_sharegpt4v_dataset(
     *,
-    source_prefix: str | None = "coco/",
+    split: str = "train",
+    source: str | None = "coco",
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
     cache_dir: str | Path | None = None,
+    image_dir: str | Path | None = None,
+    download_images: bool = True,
 ) -> Dataset:
-    """Load local JSON/JSONL annotations as a Hugging Face Dataset.
+    """Load ShareGPT4V with local images represented by a lazy ``Image`` feature.
 
-    The returned dataset has columns ``record_id``, ``image`` (decoded PIL
-    image), ``user_prompt``, and ``assistant_caption``. Set ``source_prefix`` to
-    ``None`` to retain all image sources in the annotation file.
+    COCO is selected and downloaded by default. Images remain on disk and are
+    decoded on access, so this does not load the full image collection into RAM.
+    Set ``source=None`` to keep every record, or select another supported image
+    source. Set ``download_images=False`` to use files already present locally.
     """
-    annotation_path = Path(annotation_path).expanduser().resolve()
-    image_root = Path(image_root).expanduser().resolve()
-    if not annotation_path.is_file():
-        raise FileNotFoundError(f"ShareGPT4V annotations not found: {annotation_path}")
+    if source is not None and source not in SOURCE_PREFIXES:
+        raise ValueError(f"Unsupported source {source!r}; choose from {tuple(SOURCE_PREFIXES)} or None")
+
+    paths = get_data_paths(config_path)
+    resolved_cache = Path(cache_dir).expanduser().resolve() if cache_dir else paths["cache_dir"]
+    resolved_image_dir = Path(image_dir).expanduser().resolve() if image_dir else paths["raw_dir"]
+
+    if download_images and source is not None:
+        download_image_dataset(source, config_path=config_path, raw_dir=resolved_image_dir)
 
     dataset = load_dataset(
-        "json",
-        data_files={"train": str(annotation_path)},
-        split="train",
-        cache_dir=str(Path(cache_dir).expanduser().resolve()) if cache_dir else None,
+        SHAREGPT4V_DATASET_ID,
+        SHAREGPT4V_CONFIG,
+        split=split,
+        cache_dir=str(resolved_cache),
     )
     if "image" not in dataset.column_names:
-        raise ValueError(f"No 'image' column in ShareGPT4V file: {annotation_path}")
+        raise ValueError("ShareGPT4V dataset does not contain an 'image' column")
 
-    if source_prefix is not None:
-        prefix = source_prefix.replace("\\", "/")
+    if source is not None:
+        prefix = SOURCE_PREFIXES[source]
         dataset = dataset.filter(
             lambda row: isinstance(row["image"], str)
             and row["image"].replace("\\", "/").startswith(prefix),
-            desc=f"Filtering ShareGPT4V records to {prefix}",
+            desc=f"Filtering ShareGPT4V to {source}",
         )
 
-    if not len(dataset):
-        raise ValueError(
-            f"No ShareGPT4V records matched source prefix {source_prefix!r} in {annotation_path}"
-        )
+    def resolve_image_path(row: dict[str, Any]) -> dict[str, str]:
+        reference = row["image"].replace("\\", "/")
+        relative_path = Path(reference)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(f"Unsafe ShareGPT4V image path: {reference}")
+        return {"image": str((resolved_image_dir / relative_path).resolve())}
 
-    source_columns = dataset.column_names
-
-    def normalize_record(row: dict[str, Any], index: int) -> dict[str, str]:
-        user_prompt, assistant_caption = _conversation_to_fields(row, index)
-        return {
-            "record_id": str(row.get("id") or row.get("image") or index),
-            "image": _resolve_image(row.get("image"), image_root, index),
-            "user_prompt": user_prompt,
-            "assistant_caption": assistant_caption,
-        }
-
-    dataset = dataset.map(
-        normalize_record,
-        with_indices=True,
-        remove_columns=source_columns,
-        desc="Normalizing ShareGPT4V conversations and image paths",
-    )
-
-    missing_paths = [path for path in dataset["image"] if not Path(path).is_file()]
-    if missing_paths:
-        preview = "\n".join(f"  - {path}" for path in missing_paths[:10])
-        more = f"\n  ... and {len(missing_paths) - 10} more" if len(missing_paths) > 10 else ""
-        raise FileNotFoundError(
-            f"{len(missing_paths)} referenced image(s) were not found:\n{preview}{more}"
-        )
-
+    dataset = dataset.map(resolve_image_path, desc="Resolving local ShareGPT4V image paths")
     return dataset.cast_column("image", Image(decode=True))
 
 
-def make_calibration_dataset(
-    data_dir: str | Path,
+def _download_file(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = destination.with_suffix(destination.suffix + ".part")
+
+    def report_progress(block_count: int, block_size: int, total_size: int) -> None:
+        downloaded = block_count * block_size
+        if total_size > 0:
+            percent = min(downloaded * 100 / total_size, 100)
+            print(f"\rDownloading: {percent:5.1f}%", end="", flush=True)
+        else:
+            print(f"\rDownloaded {downloaded / (1024 * 1024):.1f} MiB", end="", flush=True)
+
+    try:
+        urllib.request.urlretrieve(url, temporary_path, reporthook=report_progress)
+        print()
+        temporary_path.replace(destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _extract_zip(archive_path: Path, destination: Path) -> None:
+    """Extract zip contents while rejecting paths that escape the destination."""
+    destination.mkdir(parents=True, exist_ok=True)
+    base = destination.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            target = (destination / member.filename).resolve()
+            if target != base and base not in target.parents:
+                raise ValueError(f"Unsafe path in archive: {member.filename}")
+        archive.extractall(destination)
+
+
+def download_image_dataset(
+    dataset_name: str = "coco",
     *,
-    sample_count: int = 128,
-    seed: int = 42,
-    annotation_path: str | Path | None = None,
-    image_root: str | Path | None = None,
-    source_prefix: str | None = "coco/",
-) -> Dataset:
-    """Return a deterministic, no-replacement calibration subset.
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    raw_dir: str | Path | None = None,
+) -> Path:
+    """Download and extract one image source under the configured raw data directory."""
+    if dataset_name not in IMAGE_DATASETS:
+        raise ValueError(f"Unsupported image dataset {dataset_name!r}; choose from {tuple(IMAGE_DATASETS)}")
 
-    Images are decoded lazily by the Datasets ``Image`` feature. Each selected
-    row retains the ShareGPT4V user prompt and assistant caption.
-    """
-    if sample_count < 1:
-        raise ValueError("sample_count must be a positive integer")
-
-    data_dir = Path(data_dir).expanduser().resolve()
-    annotation_path = (
-        Path(annotation_path).expanduser().resolve()
-        if annotation_path is not None
-        else data_dir / DEFAULT_ANNOTATION_RELATIVE_PATH
+    resolved_raw_dir = (
+        Path(raw_dir).expanduser().resolve()
+        if raw_dir is not None
+        else get_data_paths(config_path)["raw_dir"]
     )
-    image_root = (
-        Path(image_root).expanduser().resolve()
-        if image_root is not None
-        else data_dir / DEFAULT_IMAGE_ROOT_RELATIVE_PATH
+    for url, relative_archive_path in IMAGE_DATASETS[dataset_name]:
+        archive_path = resolved_raw_dir / relative_archive_path
+        extract_dir = archive_path.parent
+        extraction_marker = extract_dir / f".{archive_path.name}.extracted"
+        if archive_path.exists():
+            print(f"Using existing archive: {archive_path}")
+        else:
+            print(f"Downloading {dataset_name} archive to: {archive_path}")
+            _download_file(url, archive_path)
+        if extraction_marker.exists():
+            print(f"Already extracted: {archive_path.name}")
+        else:
+            print(f"Extracting {archive_path.name} into: {extract_dir}")
+            _extract_zip(archive_path, extract_dir)
+            extraction_marker.touch()
+    print(f"{dataset_name} images are ready under: {resolved_raw_dir}")
+    return resolved_raw_dir
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Download image files used by ShareGPT4V.")
+    parser.add_argument(
+        "--dataset",
+        choices=tuple(IMAGE_DATASETS),
+        default="coco",
+        help="Image dataset to download (default: coco).",
     )
-    cache_dir = data_dir / "cache" / "datasets"
-
-    dataset = load_sharegpt4v_records(
-        annotation_path,
-        image_root,
-        source_prefix=source_prefix,
-        cache_dir=cache_dir,
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="YAML dataset path config (default: configs/dataset.yaml).",
     )
-    if sample_count > len(dataset):
-        raise ValueError(
-            f"Requested {sample_count} calibration records, but only {len(dataset)} "
-            "matching records are available."
-        )
-    return dataset.shuffle(seed=seed).select(range(sample_count))
+    args = parser.parse_args()
+    try:
+        download_image_dataset(args.dataset, config_path=args.config)
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
-def load_llava_processor(
-    model_name_or_path: str = DEFAULT_LLAVA_PROCESSOR,
-    *,
-    do_pad: bool = True,
-):
-    """Load the Transformers processor matching the LLaVA 1.5 checkpoint."""
-    from transformers import AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is not None and hasattr(image_processor, "do_pad"):
-        image_processor.do_pad = do_pad
-    return processor
-
-
-class LlavaCalibrationCollator:
-    """Use the Transformers LLaVA processor and mark assistant tokens as targets.
-
-    Prompt formatting follows the LLaVA 1.5 ``USER: <image> ... ASSISTANT:``
-    format. Padding and image preprocessing are handled by the processor.
-    """
-
-    def __init__(self, processor: Any, *, ignore_index: int = -100) -> None:
-        self.processor = processor
-        self.ignore_index = ignore_index
-
-    @staticmethod
-    def _without_image_marker(user_prompt: str) -> str:
-        # Add exactly one image marker in the LLaVA prompt, even if the source
-        # conversation contains a marker on a separate line.
-        return user_prompt.replace("<image>", "").strip()
-
-    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
-        if not samples:
-            raise ValueError("Cannot collate an empty sample list")
-
-        images = []
-        full_prompts = []
-        prefix_prompts = []
-        for sample in samples:
-            sample_images = sample["image"]
-            images.append(sample_images)
-            user_text = self._without_image_marker(sample["user_prompt"])
-            prefix = f"USER: <image>\n{user_text} ASSISTANT:"
-            prefix_prompts.append(prefix)
-            full_prompts.append(f"{prefix} {sample['assistant_caption']}</s>")
-
-        batch = self.processor(
-            text=full_prompts,
-            images=images,
-            padding=True,
-            return_tensors="pt",
-        )
-        labels = batch["input_ids"].clone()
-
-        # Determine each assistant boundary with the same processor and image,
-        # so image-token expansion is included in the prefix length.
-        for row_index, (prefix, image) in enumerate(zip(prefix_prompts, images)):
-            prefix_batch = self.processor(
-                text=prefix,
-                images=image,
-                padding=False,
-                return_tensors="pt",
-            )
-            prefix_length = prefix_batch["input_ids"].shape[-1]
-            labels[row_index, :prefix_length] = self.ignore_index
-
-        if "attention_mask" in batch:
-            labels[batch["attention_mask"] == 0] = self.ignore_index
-        batch["labels"] = labels
-        batch["record_ids"] = [sample["record_id"] for sample in samples]
-        return batch
+if __name__ == "__main__":
+    raise SystemExit(main())
