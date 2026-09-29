@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import torch.nn.functional as F
 import torch
 import yaml
@@ -117,8 +119,9 @@ def show_iga_heatmap(
     processor: Any,
     layer_iga_scores: dict[str, torch.Tensor],
     sample_number: int,
+    heatmap_only: bool = False,
 ) -> None:
-    """Display the image and one IGA overlay for every language layer."""
+    """Display the image and one IGA map for every language layer."""
     if not layer_iga_scores:
         raise ValueError("No per-layer IGA scores are available to plot")
 
@@ -138,10 +141,18 @@ def show_iga_heatmap(
     image = (pixel_values * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
     image_height, image_width = image.shape[:2]
-    # Keep one common color scale across layers so their IGA magnitudes can be compared.
+    # Use a shared logarithmic scale so small IGA differences remain visible
+    # while keeping layer magnitudes comparable within this sample.
     layer_scores = list(layer_iga_scores.values())
-    color_max = max(float(scores.max()) for scores in layer_scores)
-    color_max = max(color_max, torch.finfo(torch.float32).eps)
+    positive_scores = torch.cat([scores.reshape(-1) for scores in layer_scores])
+    positive_scores = positive_scores[positive_scores > 0]
+    if positive_scores.numel() == 0:
+        raise ValueError("IGA scores are all zero; cannot draw a logarithmic heatmap")
+    color_min = float(torch.quantile(positive_scores, 0.01))
+    color_max = float(positive_scores.max())
+    if color_min >= color_max:
+        color_min = color_max * 1e-6
+    color_norm = LogNorm(vmin=color_min, vmax=color_max, clip=True)
 
     # Display the image and all layer overlays together in one figure per sample.
     panel_count = len(layer_iga_scores) + 1
@@ -167,14 +178,11 @@ def show_iga_heatmap(
             mode="bilinear",
             align_corners=False,
         )[0, 0].numpy()
-        axis.imshow(image)
-        heatmap_view = axis.imshow(
-            heatmap,
-            cmap="inferno",
-            alpha=0.5,
-            vmin=0.0,
-            vmax=color_max,
-        )
+        if not heatmap_only:
+            axis.imshow(image)
+        heatmap_view = axis.imshow(heatmap, cmap="inferno", norm=color_norm)
+        if not heatmap_only:
+            heatmap_view.set_alpha(0.5)
         layer_index = layer_name.split("_layers_")[-1].split("_", 1)[0]
         axis.set_title(f"Layer {layer_index}")
 
@@ -188,7 +196,7 @@ def show_iga_heatmap(
             ax=flat_axes[:panel_count].tolist(),
             fraction=0.015,
             pad=0.01,
-            label="IGA",
+            label="IGA (log scale)",
         )
     figure.suptitle(f"Calibration sample {sample_number}")
     plt.show()
@@ -217,6 +225,16 @@ def parse_args() -> argparse.Namespace:
         default="online",
         help="online: display one IGA heatmap per sample without saving maps; save: save raw maps for later.",
     )
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Print elapsed time for setup steps, each forward pass, and each heatmap display.",
+    )
+    parser.add_argument(
+        "--heatmap-only",
+        action="store_true",
+        help="Show standalone heatmaps instead of overlays on the image.",
+    )
     return parser.parse_args()
 
 
@@ -233,9 +251,12 @@ def main() -> int:
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
 
+        total_started = time.perf_counter() if args.timing else None
+
         # =====================================================================
         # 1. LOAD MODEL
         # =====================================================================
+        model_started = time.perf_counter() if args.timing else None
         model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
         model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -254,10 +275,13 @@ def main() -> int:
             attn_implementation=model_config.get("attn_implementation", "eager"),
         )
         model.eval()
+        if model_started is not None:
+            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
         # 2. PREPARE CALIBRATION DATASET
         # =====================================================================
+        dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
             source="coco",
             config_path=args.dataset_config,
@@ -279,10 +303,13 @@ def main() -> int:
         calibration_dir.parent.mkdir(parents=True, exist_ok=True)
         dataset.save_to_disk(str(calibration_dir))
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
+        if dataset_started is not None:
+            print(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
 
         # =====================================================================
         # 3. REGISTER ATTENTION HOOKS
         # =====================================================================
+        hooks_started = time.perf_counter() if args.timing else None
         attention_dir = repository_path(
             dataset_config.get(
                 "attention_output_dir",
@@ -300,6 +327,8 @@ def main() -> int:
         }
         hook_handles = register_attention_hooks(model, args.mode, active_sample)
         print(f"Registered hooks on {len(hook_handles)} self-attention layers")
+        if hooks_started is not None:
+            print(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
 
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
@@ -307,6 +336,7 @@ def main() -> int:
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         try:
             for index, sample in enumerate(dataset, start=1):
+                sample_started = time.perf_counter() if args.timing else None
                 sample_dir = attention_dir / f"sample_{index:04d}" if args.mode == "save" else None
                 if sample_dir is not None:
                     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -343,9 +373,17 @@ def main() -> int:
                     raise ValueError("No text query tokens occur after the image tokens")
                 active_sample["image_mask"] = image_mask
                 active_sample["text_mask"] = text_mask
+                if sample_started is not None:
+                    print(
+                        f"[timing] Sample {index} preprocessing: "
+                        f"{time.perf_counter() - sample_started:.2f} s"
+                    )
 
+                forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
                     outputs = model(**inputs, use_cache=False, output_attentions=True)
+                if forward_started is not None:
+                    print(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if active_sample["captured"] == 0:
                     raise RuntimeError(
                         "Attention hooks captured no weights; check the Transformers attention implementation"
@@ -359,12 +397,19 @@ def main() -> int:
                     print(f"[{index}/{len(dataset)}] Conversation:")
                     print(f"  USER: {user_text}")
                     print(f"  ASSISTANT: {assistant_text}")
+                    plot_started = time.perf_counter() if args.timing else None
                     show_iga_heatmap(
                         encoded,
                         processor,
                         layer_scores,
                         index,
+                        heatmap_only=args.heatmap_only,
                     )
+                    if plot_started is not None:
+                        print(
+                            f"[timing] Sample {index} heatmap display: "
+                            f"{time.perf_counter() - plot_started:.2f} s"
+                        )
                 else:
                     print(
                         f"  Saved {active_sample['captured']} attention matrices to {sample_dir}"
@@ -384,6 +429,8 @@ def main() -> int:
             print("Online IGA heatmap display complete; no attention maps were saved.")
         else:
             print(f"Attention maps saved under: {attention_dir}")
+        if total_started is not None:
+            print(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
