@@ -13,11 +13,18 @@ Please follow the upstream dataset and model terms when downloading or using the
 
 ### Downloading image data and preparing ShareGPT4V records
 
-Install the project dependencies on the machine that will run the experiments:
+Create the project virtual environment and install its dependencies:
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip install -e .
+bash scripts/set_up.sh
+source .venv/bin/activate  # macOS/Linux
+# .venv\Scripts\activate  # Windows PowerShell
+```
+
+If the setup script is already running inside the repository's `.venv`, it exits without changing anything. Check which compute devices PyTorch can use with:
+
+```bash
+python scripts/check_device.py
 ```
 
 Dataset locations are set in [`configs/dataset.yaml`](configs/dataset.yaml). Relative paths there resolve from the repository root. The ShareGPT4V module downloads image archives and extracts them under the configured `raw_dir`; COCO `train2017` is the default:
