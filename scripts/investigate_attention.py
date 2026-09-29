@@ -96,6 +96,8 @@ def register_attention_hooks(
                     output_dir / f"{key}.pt",
                 )
             else:
+                # For each layer, average post-softmax attention over text
+                # query positions and heads to get one score per image token.
                 text_mask = active_sample["text_mask"].to(attention_weights.device)
                 image_mask = active_sample["image_mask"].to(attention_weights.device)
                 # Shape after selection: heads x text queries x image keys.
@@ -125,6 +127,8 @@ def show_iga_heatmap(
             f"Cannot reshape {token_count} image-token scores into a square patch grid"
         )
 
+    # Convert the processor-normalized image back to display colors so its
+    # geometry matches the image patches represented by the IGA scores.
     pixel_values = encoded["pixel_values"][0].detach().cpu().float()
     image_processor = processor.image_processor
     mean = torch.tensor(image_processor.image_mean).view(-1, 1, 1)
@@ -132,6 +136,7 @@ def show_iga_heatmap(
     image = (pixel_values * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
     image_height, image_width = image.shape[:2]
+    # Expand the image-token score grid to the processed image dimensions.
     heatmap = F.interpolate(
         iga_scores.reshape(1, 1, grid_size, grid_size),
         size=(image_height, image_width),
@@ -313,7 +318,12 @@ def main() -> int:
                     layer_scores = list(active_sample["iga"].values())
                     if not layer_scores:
                         raise RuntimeError("No per-layer IGA scores were captured")
+                    # Use one per-sample plot: average the per-layer IGA maps,
+                    # then show the processed image beside its heatmap overlay.
                     iga_scores = torch.stack(layer_scores).mean(dim=0)
+                    print(f"[{index}/{len(dataset)}] Conversation:")
+                    print(f"  USER: {user_text}")
+                    print(f"  ASSISTANT: {assistant_text}")
                     show_iga_heatmap(
                         encoded,
                         processor,
