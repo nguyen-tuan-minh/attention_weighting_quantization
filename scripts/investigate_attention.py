@@ -115,12 +115,14 @@ def register_attention_hooks(
 def show_iga_heatmap(
     encoded: Any,
     processor: Any,
-    iga_scores: torch.Tensor,
+    layer_iga_scores: dict[str, torch.Tensor],
     sample_number: int,
-    layer_count: int,
 ) -> None:
-    """Display the processed image beside its layer-averaged IGA overlay."""
-    token_count = iga_scores.numel()
+    """Display the image and one IGA overlay for every language layer."""
+    if not layer_iga_scores:
+        raise ValueError("No per-layer IGA scores are available to plot")
+
+    token_count = next(iter(layer_iga_scores.values())).numel()
     grid_size = math.isqrt(token_count)
     if grid_size * grid_size != token_count:
         raise ValueError(
@@ -136,23 +138,58 @@ def show_iga_heatmap(
     image = (pixel_values * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
     image_height, image_width = image.shape[:2]
-    # Expand the image-token score grid to the processed image dimensions.
-    heatmap = F.interpolate(
-        iga_scores.reshape(1, 1, grid_size, grid_size),
-        size=(image_height, image_width),
-        mode="bilinear",
-        align_corners=False,
-    )[0, 0].numpy()
+    # Keep one common color scale across layers so their IGA magnitudes can be compared.
+    layer_scores = list(layer_iga_scores.values())
+    color_max = max(float(scores.max()) for scores in layer_scores)
+    color_max = max(color_max, torch.finfo(torch.float32).eps)
 
-    figure, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-    axes[0].imshow(image)
-    axes[0].set_title("Processor image")
-    axes[1].imshow(image)
-    heatmap_view = axes[1].imshow(heatmap, cmap="inferno", alpha=0.5)
-    axes[1].set_title(f"IGA overlay (mean of {layer_count} layers)")
-    for axis in axes:
+    # Display the image and all layer overlays together in one figure per sample.
+    panel_count = len(layer_iga_scores) + 1
+    columns = 6
+    rows = math.ceil(panel_count / columns)
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(columns * 3.5, rows * 3.2),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    flat_axes = axes.ravel()
+    flat_axes[0].imshow(image)
+    flat_axes[0].set_title("Processor image")
+
+    heatmap_view = None
+    for axis, (layer_name, scores) in zip(flat_axes[1:], layer_iga_scores.items()):
+        # Expand this layer's image-token scores to the processed image size.
+        heatmap = F.interpolate(
+            scores.reshape(1, 1, grid_size, grid_size),
+            size=(image_height, image_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0].numpy()
+        axis.imshow(image)
+        heatmap_view = axis.imshow(
+            heatmap,
+            cmap="inferno",
+            alpha=0.5,
+            vmin=0.0,
+            vmax=color_max,
+        )
+        layer_index = layer_name.split("_layers_")[-1].split("_", 1)[0]
+        axis.set_title(f"Layer {layer_index}")
+
+    for axis in flat_axes[panel_count:]:
         axis.axis("off")
-    figure.colorbar(heatmap_view, ax=axes[1], fraction=0.046, pad=0.04, label="IGA")
+    for axis in flat_axes[:panel_count]:
+        axis.axis("off")
+    if heatmap_view is not None:
+        figure.colorbar(
+            heatmap_view,
+            ax=flat_axes[:panel_count].tolist(),
+            fraction=0.015,
+            pad=0.01,
+            label="IGA",
+        )
     figure.suptitle(f"Calibration sample {sample_number}")
     plt.show()
     plt.close(figure)
@@ -315,21 +352,18 @@ def main() -> int:
                     )
                 print(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}")
                 if args.mode == "online":
-                    layer_scores = list(active_sample["iga"].values())
+                    layer_scores = active_sample["iga"]
                     if not layer_scores:
                         raise RuntimeError("No per-layer IGA scores were captured")
-                    # Use one per-sample plot: average the per-layer IGA maps,
-                    # then show the processed image beside its heatmap overlay.
-                    iga_scores = torch.stack(layer_scores).mean(dim=0)
+                    # Print the conversation before showing the image and every layer's map.
                     print(f"[{index}/{len(dataset)}] Conversation:")
                     print(f"  USER: {user_text}")
                     print(f"  ASSISTANT: {assistant_text}")
                     show_iga_heatmap(
                         encoded,
                         processor,
-                        iga_scores,
+                        layer_scores,
                         index,
-                        len(layer_scores),
                     )
                 else:
                     print(

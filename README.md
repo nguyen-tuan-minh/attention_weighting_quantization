@@ -60,7 +60,7 @@ The original forward-only script has three sections: load model, prepare calibra
 python scripts/run_calibration.py
 ```
 
-The attention investigation script has two modes. The default `online` mode computes IGA for each layer, using non-padding text queries after the image tokens, averages the layer maps, and opens one Matplotlib figure per sample with the processor image beside its IGA overlay. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. The script is divided into five sections: load model, prepare calibration, register hooks, forward, and analyse.
+The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. The script is divided into five sections: load model, prepare calibration, register hooks, forward, and analyse.
 
 ```bash
 python scripts/investigate_attention.py                 # online analysis
