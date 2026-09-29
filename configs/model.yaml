@@ -3,3 +3,4 @@ model_id: llava-hf/llava-1.5-7b-hf
 model_dir: models/llava-1.5-7b
 torch_dtype: float16
 device_map: auto
+attn_implementation: eager

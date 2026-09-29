@@ -43,17 +43,23 @@ python scripts/prepare_dataset.py
 
 The script saves the full COCO subset under the configured `processed_dir/sharegpt4v_coco`. Other downloadable sources can be selected with `--source gqa`, `--source textvqa`, or `--source visual-genome`; `--source all` keeps all ShareGPT4V records. Sampling is optional and happens in this script: `python scripts/prepare_dataset.py --samples 128 --seed 42`. Pass a different config file with `--config`. ShareGPT4V image sources can have separate or restricted download steps; see its [data instructions](https://github.com/ShareGPT4Omni/ShareGPT4V/blob/master/docs/Data.md).
 
-### Run LLaVA calibration forwards
+### Run LLaVA calibration and inspect attention
 
-[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` and `calibration_seed`. The default seed is `null`, which means each run samples without a fixed seed. Model ID, local download directory, dtype, and device mapping are in [`configs/model.yaml`](configs/model.yaml).
+[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. The model ID, local download directory, dtype, device mapping, and attention implementation are in [`configs/model.yaml`](configs/model.yaml).
 
-Run the complete workflow on a machine with enough storage and memory for COCO and LLaVA 1.5 7B:
+The original forward-only script has three sections: load model, prepare calibration, and forward:
 
 ```bash
 python scripts/run_calibration.py
 ```
 
-This downloads the model, saves a sampled COCO dataset, then forwards each image and its ShareGPT4V user prompt and assistant caption individually. Images are decoded as each record is processed. To override the configured sample count or seed, use `--samples` or `--seed`; use `--download-model-only` to only download the model.
+The attention investigation script has five sections: load model, prepare calibration, register hooks, forward, and analyse. It saves each captured language attention matrix under `attention_output_dir`:
+
+```bash
+python scripts/investigate_attention.py
+```
+
+Both scripts forward each image with its ShareGPT4V user prompt and assistant caption. Images are decoded one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
 
 ## Documentation
 

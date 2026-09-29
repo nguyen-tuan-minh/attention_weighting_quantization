@@ -84,13 +84,16 @@ def main() -> int:
         model_config = read_yaml(args.model_config)
         data_paths = get_data_paths(args.dataset_config)
 
-        sample_count = args.samples if args.samples is not None else dataset_config.get("calibration_samples", 128)
+        sample_count = args.samples if args.samples is not None else dataset_config.get("calibration_samples", 2)
         seed = args.seed if args.seed is not None else dataset_config.get("calibration_seed")
         if not isinstance(sample_count, int) or sample_count < 1:
             raise ValueError("calibration_samples must be a positive integer")
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
 
+        # ==================================================================
+        # 1. LOAD MODEL
+        # ==================================================================
         model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
         model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -100,6 +103,9 @@ def main() -> int:
             print("Model download complete.")
             return 0
 
+        # ==================================================================
+        # 2. PREPARE CALIBRATION DATASET
+        # ==================================================================
         print("Loading COCO ShareGPT4V data and ensuring COCO images are available...")
         dataset = load_sharegpt4v_dataset(
             source="coco",
@@ -136,6 +142,9 @@ def main() -> int:
         )
         model.eval()
 
+        # ==================================================================
+        # 3. FORWARD CALIBRATION SAMPLES
+        # ==================================================================
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         for index, sample in enumerate(dataset, start=1):
             user_text, assistant_text = conversation_text(sample)
