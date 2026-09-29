@@ -2,7 +2,7 @@
 
 Examples:
     python scripts/prepare_dataset.py
-    python scripts/prepare_dataset.py --source sam
+    python scripts/prepare_dataset.py --source gqa
     python scripts/prepare_dataset.py --source coco --samples 128 --seed 42
 
 The full selected subset is saved by default. Sampling is optional.

@@ -3,3 +3,6 @@ data_root: data
 raw_dir: data/raw
 cache_dir: data/cache/huggingface
 processed_dir: data/processed
+calibration_samples: 128
+calibration_seed: null
+calibration_output_dir: data/processed/llava15_coco_calibration
