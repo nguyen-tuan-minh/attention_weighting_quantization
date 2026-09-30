@@ -35,6 +35,7 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
     exit 1
 fi
 
+echo "Installing project dependencies, including the CUDA 12.1 PyTorch build..."
 "${VENV_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements.txt"
 "${VENV_PYTHON}" -m pip install -e "${REPOSITORY_ROOT}"
 

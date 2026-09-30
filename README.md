@@ -21,6 +21,8 @@ source .venv/bin/activate  # macOS/Linux
 # .venv\Scripts\activate  # Windows PowerShell
 ```
 
+The requirements pin PyTorch to its CUDA 12.1 build to match the older NVIDIA driver reported on the target machine. That driver must still expose an NVIDIA GPU to the environment; the setup script cannot update a system driver. Confirm GPU access with `nvidia-smi` and `python scripts/check_device.py` after setup.
+
 If the setup script is already running inside the repository's `.venv`, it exits without changing anything. Check which compute devices PyTorch can use with:
 
 ```bash
@@ -70,6 +72,12 @@ python scripts/investigate_attention.py --heatmap-only  # standalone maps, no im
 ```
 
 Both scripts forward each image with its ShareGPT4V user prompt and assistant caption. Images are decoded one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
+
+### Reusing components with other models or datasets
+
+Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/huggingface.py` loads a Transformers model and processor, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
+
+The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. To try a different model checkpoint, update `model_id`, `model_dir`, and `model_class` in `configs/model.yaml`. The default `AutoModelForVision2Seq` covers compatible Transformers vision-to-sequence models; `LlavaForConditionalGeneration` is also supported for checkpoints that require the explicit class. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
 
 ## Documentation
 

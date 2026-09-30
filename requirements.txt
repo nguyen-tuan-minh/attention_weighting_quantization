@@ -1,5 +1,9 @@
 # Model execution and LLaVA 1.5 processing
-torch>=2.2.0
+# The reported machine exposes an NVIDIA driver compatible with CUDA 12.2.
+# Use a CUDA 12.1 wheel so it can run with that driver (the installed cu130
+# wheel requires a newer driver). Keep this index for the pinned GPU build.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
 transformers>=4.45.0,<5.0.0
 accelerate>=1.0.0
 sentencepiece>=0.2.0

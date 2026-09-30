@@ -5,56 +5,21 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
 
 import torch
-import yaml
 from huggingface_hub import snapshot_download
-from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
-
-
-def read_yaml(path: Path) -> dict[str, Any]:
-    with path.expanduser().open(encoding="utf-8") as config_file:
-        value = yaml.safe_load(config_file) or {}
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a YAML mapping in {path}")
-    return value
-
-
-def repository_path(value: str | Path) -> Path:
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else REPOSITORY_ROOT / path).resolve()
-
-
-def conversation_text(sample: dict[str, Any]) -> tuple[str, str]:
-    conversations = sample.get("conversations")
-    if not isinstance(conversations, list):
-        raise ValueError("ShareGPT4V sample has no 'conversations' list")
-
-    user_text = None
-    assistant_text = None
-    for message in conversations:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("from", message.get("role", ""))).strip().lower()
-        text = message.get("value", message.get("content"))
-        if not isinstance(text, str):
-            continue
-        if role in {"human", "user"} and user_text is None:
-            user_text = text.replace("<image>", "").strip()
-        elif role in {"gpt", "assistant"} and user_text is not None:
-            assistant_text = text.strip()
-            break
-
-    if not user_text or assistant_text is None:
-        raise ValueError("ShareGPT4V sample needs a user prompt and assistant caption")
-    return user_text, assistant_text
+from attention_quantization.config import read_yaml, repository_path  # noqa: E402
+from attention_quantization.data import (  # noqa: E402
+    get_data_paths,
+    get_user_assistant_text,
+    load_sharegpt4v_dataset,
+)
+from attention_quantization.models import load_huggingface_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,25 +94,20 @@ def main() -> int:
         dataset.save_to_disk(str(calibration_dir))
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
 
-        processor = AutoProcessor.from_pretrained(str(model_dir))
-        dtype_name = model_config.get("torch_dtype", "float16")
-        model_dtype = getattr(torch, dtype_name, None)
-        if model_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
-            raise ValueError("torch_dtype must be float16, bfloat16, or float32")
-        device_map = model_config.get("device_map", "auto")
-        model = LlavaForConditionalGeneration.from_pretrained(
-            str(model_dir),
-            torch_dtype=model_dtype,
-            device_map=device_map,
+        model, processor = load_huggingface_model(
+            model_dir,
+            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
+            torch_dtype=model_config.get("torch_dtype", "float16"),
+            device_map=model_config.get("device_map", "auto"),
+            attn_implementation=model_config.get("attn_implementation"),
         )
-        model.eval()
 
         # ==================================================================
         # 3. FORWARD CALIBRATION SAMPLES
         # ==================================================================
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         for index, sample in enumerate(dataset, start=1):
-            user_text, assistant_text = conversation_text(sample)
+            user_text, assistant_text = get_user_assistant_text(sample)
             prompt = f"USER: <image>\n{user_text}\nASSISTANT: {assistant_text}"
             encoded = processor(
                 text=prompt,
