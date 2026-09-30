@@ -36,7 +36,7 @@ python -m attention_quantization.data.sharegpt4v
 python -m attention_quantization.data.sharegpt4v --dataset gqa
 ```
 
-The data module defaults to COCO. Calling the loader downloads the COCO archive if needed, loads the ShareGPT4V records, and connects their image paths to the local files:
+The data module defaults to COCO. Calling the loader downloads the COCO archive if needed, loads the ShareGPT4V records, and connects their image paths to the local files. After extraction, `data/raw/coco/train2017.zip` is redundant; the extracted images under `data/raw/coco/train2017/` are what the loader uses. You can remove the zip to reclaim space. The extraction marker lets future runs recognize the existing images without downloading the archive again.
 
 ```python
 from attention_quantization.data import load_sharegpt4v_dataset

@@ -162,17 +162,22 @@ def download_image_dataset(
         archive_path = resolved_raw_dir / relative_archive_path
         extract_dir = archive_path.parent
         extraction_marker = extract_dir / f".{archive_path.name}.extracted"
+
+        # The archive is disposable once extraction completes. Check this
+        # marker before looking for the archive so users can remove the zip
+        # without triggering a redundant download on the next load.
+        if extraction_marker.exists():
+            print(f"Already extracted: {archive_path.name}")
+            continue
+
         if archive_path.exists():
             print(f"Using existing archive: {archive_path}")
         else:
             print(f"Downloading {dataset_name} archive to: {archive_path}")
             _download_file(url, archive_path)
-        if extraction_marker.exists():
-            print(f"Already extracted: {archive_path.name}")
-        else:
-            print(f"Extracting {archive_path.name} into: {extract_dir}")
-            _extract_zip(archive_path, extract_dir)
-            extraction_marker.touch()
+        print(f"Extracting {archive_path.name} into: {extract_dir}")
+        _extract_zip(archive_path, extract_dir)
+        extraction_marker.touch()
     print(f"{dataset_name} images are ready under: {resolved_raw_dir}")
     return resolved_raw_dir
 
