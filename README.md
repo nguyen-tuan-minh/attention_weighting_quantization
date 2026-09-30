@@ -79,6 +79,40 @@ Task-independent helpers live in `src/attention_quantization/`: `config.py` read
 
 The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. To try a different model checkpoint, update `model_id`, `model_dir`, and `model_class` in `configs/model.yaml`. The default `AutoModelForVision2Seq` covers compatible Transformers vision-to-sequence models; `LlavaForConditionalGeneration` is also supported for checkpoints that require the explicit class. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
 
+### Run QIG quantization
+
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5:
+
+```bash
+bash scripts/quantize_qig.sh \
+  --output-dir models/quantized/llava-1.5-7b-qig-w4g128 \
+  --samples 128 \
+  --seed 42 \
+  --method qig \
+  --w-bit 4 \
+  --w-group 128
+```
+
+The output directory must not already exist unless `--overwrite` is passed. Supported `--method` values are `qig`, `mbq`, `awq`, `smoothquant`, `rtn`, and `gptq`, matching the methods exposed by QIG's quantization wrapper. Add `--reweight` or `--distort` for methods that support those options (`qig` and `mbq`). Use `--a-bit`, `--alpha`, and `--percdamp` to set activation precision, SmoothQuant scaling, and GPTQ damping. RTN does not need calibration data; the other methods sample ShareGPT4V COCO. The script uses micro batches of one by default to limit GPU memory use; change this with `--micro-batch-size` if needed.
+
+The QIG adapter is isolated in `src/attention_quantization/quantization/qig/`. `requirements-qig.txt` lists the imports reached by this LLaVA workflow and pins the same PyTorch 2.5.1 CUDA 12.1 build used by the project's Linux setup. The setup script deliberately does not install QIG's broad `requirements.txt`; it installs the three source checkouts editable with dependency resolution disabled, then installs the selected dependency set. This keeps QIG's historical PyTorch 2.8 pin from replacing the project's CUDA-compatible build. QIG source and dependencies stay in `.third_party/QIG` and `.venv-qig`, separate from `.venv`.
+
+There is one upstream caveat: QIG's README model list does not advertise classic `llava`, but the checked-in QIG package contains an `llava_v15` processor and its companion LMMS-Eval fork registers a `llava` model adapter. This integration connects those two source paths directly for LLaVA 1.5. The source and dependency versions are recorded in each artifact; the combination still needs a run on the target CUDA machine to confirm runtime compatibility.
+
+QIG's pseudo quantization path saves scale parameters rather than exporting packed low bit weights. This script saves the resulting model checkpoint, method scales when applicable, the sampled calibration JSONL, and run metadata in the chosen directory. For pseudo-quantized weights, model tensors remain floating point, so the research checkpoint does not provide packed INT4 storage savings. The source implementation and its model adapter are documented in the [QIG repository](https://github.com/ucas-xiang/QIG).
+
+Load the saved checkpoint with the QIG environment:
+
+```python
+from attention_quantization.models import load_qig_quantized_model
+
+wrapper = load_qig_quantized_model("models/quantized/llava-1.5-7b-qig-w4g128")
+model = wrapper._model
+tokenizer = wrapper._tokenizer
+```
+
+The loader uses QIG's LMMS-Eval `llava` adapter, so call it from `.venv-qig` after running the setup/quantization script.
+
 ## Documentation
 
 Planning notes and supporting project documentation are in [`docs/`](docs/). The [project structure reference](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation scripts and packages.
