@@ -56,7 +56,7 @@ if [[ ! -x "${QIG_VENV_DIR}/bin/python" ]]; then
 fi
 
 QIG_PYTHON="${QIG_VENV_DIR}/bin/python"
-QIG_SETUP_MARKER="${QIG_VENV_DIR}/.qig-dependencies-source-selected-v2"
+QIG_SETUP_MARKER="${QIG_VENV_DIR}/.qig-dependencies-source-selected-v3"
 if [[ ! -f "${QIG_SETUP_MARKER}" ]]; then
     "${QIG_PYTHON}" -m pip install --upgrade pip
     "${QIG_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements-qig.txt"
