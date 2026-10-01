@@ -45,8 +45,9 @@ def load_qig_quantized_model(
         ) from error
 
     model_class = get_model("llava")
-    dtype = metadata.get("model_dtype", "float16")
-    model_args = f"pretrained={checkpoint},dtype={dtype}"
+    # QIG's classic LLaVA adapter rejects a `dtype` argument. Its upstream
+    # LLaVA builder defaults to float16, matching the saved checkpoint.
+    model_args = f"pretrained={checkpoint}"
     return model_class.create_from_arg_string(
         model_args,
         {"batch_size": batch_size, "device": device},

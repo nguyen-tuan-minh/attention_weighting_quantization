@@ -180,7 +180,9 @@ def main() -> int:
 
         qig = load_qig_runtime(qig_source)
         model_class = qig.get_model("llava")
-        model_args = f"pretrained={args.base_model},dtype=float16"
+        # QIG's classic LLaVA adapter does not accept a `dtype` argument.
+        # Its upstream LLaVA builder defaults to loading the model in float16.
+        model_args = f"pretrained={args.base_model}"
         lm = model_class.create_from_arg_string(
             model_args,
             {"batch_size": 1, "device": "cuda"},
