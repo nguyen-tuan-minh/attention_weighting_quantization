@@ -81,7 +81,7 @@ The scripts keep calibration selection and forwarding local to the workflow. Att
 
 ### Run QIG quantization
 
-On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5. It expects COCO images to already exist under the configured `raw_dir` and does not download image archives during quantization:
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5. It uses images under the configured `raw_dir`; if a selected calibration image is missing, it fetches only that JPEG and never downloads the full COCO ZIP during quantization:
 
 ```bash
 bash scripts/quantize_qig.sh \

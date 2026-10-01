@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,33 @@ def qig_git_revision(path: Path) -> str | None:
         return None
 
 
+def ensure_coco_image(image_path: Path, relative_image_path: Path) -> None:
+    """Fetch one missing COCO calibration image without downloading the ZIP."""
+    if image_path.is_file():
+        return
+
+    if (
+        len(relative_image_path.parts) != 3
+        or relative_image_path.parts[:2] != ("coco", "train2017")
+        or relative_image_path.suffix.lower() != ".jpg"
+    ):
+        raise FileNotFoundError(f"Missing calibration image is not a COCO train2017 JPEG: {image_path}")
+
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = image_path.with_suffix(image_path.suffix + ".part")
+    url = f"https://images.cocodataset.org/train2017/{image_path.name}"
+    print(f"Missing calibration image; downloading this image only: {image_path}")
+    try:
+        urllib.request.urlretrieve(url, temporary_path)
+        with temporary_path.open("rb") as downloaded:
+            if downloaded.read(2) != b"\xff\xd8":
+                raise ValueError(f"Downloaded file is not a JPEG image: {url}")
+        temporary_path.replace(image_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def write_qig_calibration_jsonl(
     dataset_config_path: Path,
     sample_count: int,
@@ -106,6 +134,7 @@ def write_qig_calibration_jsonl(
                 relative_image = resolved_image.relative_to(image_root)
             except ValueError as error:
                 raise ValueError(f"Image path {resolved_image} is outside configured raw_dir {image_root}") from error
+            ensure_coco_image(resolved_image, relative_image)
 
             conversations = row.get("conversations")
             if not isinstance(conversations, list):
