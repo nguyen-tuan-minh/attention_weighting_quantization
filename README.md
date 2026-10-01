@@ -36,7 +36,7 @@ python -m attention_quantization.data.sharegpt4v
 python -m attention_quantization.data.sharegpt4v --dataset gqa
 ```
 
-The data module defaults to COCO. Calling the loader downloads the archive only when its images are not already present, loads the ShareGPT4V records, and connects their image paths to the local files. It removes each downloaded ZIP after extraction and leaves a small marker so future runs can reuse the extracted files without downloading again. The same cleanup applies to all supported image sources, including both Visual Genome archives. An interrupted `.part` download is removed before retrying.
+The data module defaults to COCO. Calling the loader downloads the archive only when its images are not already present, loads the ShareGPT4V records, and connects their image paths to the local files. It recognizes a full existing COCO `train2017` directory even if it was extracted manually or by an older script, then leaves a marker so future runs can reuse it. It removes each downloaded ZIP after extraction. The same archive cleanup applies to all supported image sources, including both Visual Genome archives. An interrupted `.part` download is removed before retrying.
 
 ```python
 from attention_quantization.data import load_sharegpt4v_dataset

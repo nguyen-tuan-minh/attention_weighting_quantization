@@ -36,6 +36,7 @@ SOURCE_PREFIXES = {
     "textvqa": "textvqa/",
     "visual-genome": "vg/",
 }
+COCO_TRAIN2017_MIN_FILES = 100_000
 
 
 def get_data_paths(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Path]:
@@ -165,11 +166,23 @@ def download_image_dataset(
         extraction_marker = extract_dir / f".{archive_path.name}.extracted"
         partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
         partial_path.unlink(missing_ok=True)
+        coco_images_dir = resolved_raw_dir / "coco" / "train2017"
+        marked_extraction_is_present = extraction_marker.exists() and (
+            dataset_name != "coco"
+            or (coco_images_dir.is_dir() and any(coco_images_dir.iterdir()))
+        )
+        has_existing_coco_images = (
+            not extraction_marker.exists()
+            and dataset_name == "coco"
+            and coco_images_dir.is_dir()
+            and sum(1 for _ in coco_images_dir.iterdir()) >= COCO_TRAIN2017_MIN_FILES
+        )
 
-        # The marker is written only after extraction completes. The archive
-        # is disposable, so remove a leftover copy before continuing.
-        if extraction_marker.exists():
+        # Also recognize a full COCO extraction made by hand or by an older
+        # downloader version that did not leave the marker file.
+        if marked_extraction_is_present or has_existing_coco_images:
             print(f"Already extracted: {archive_path.name}")
+            extraction_marker.touch(exist_ok=True)
             if archive_path.exists():
                 archive_path.unlink()
                 print(f"Removed redundant archive: {archive_path}")
