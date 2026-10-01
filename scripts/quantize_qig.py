@@ -77,7 +77,9 @@ def write_qig_calibration_jsonl(
     dataset = load_sharegpt4v_dataset(
         source="coco",
         config_path=dataset_config_path,
-        download_images=True,
+        # QIG should use the COCO files already downloaded by the data
+        # workflow; do not start another large ZIP download during quantization.
+        download_images=False,
     ).cast_column("image", Image(decode=False))
     if sample_count < 1:
         raise ValueError("--samples must be a positive integer")

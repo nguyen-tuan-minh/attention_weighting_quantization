@@ -113,6 +113,7 @@ def load_sharegpt4v_dataset(
 def _download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = destination.with_suffix(destination.suffix + ".part")
+    temporary_path.unlink(missing_ok=True)
 
     def report_progress(block_count: int, block_size: int, total_size: int) -> None:
         downloaded = block_count * block_size
@@ -162,12 +163,16 @@ def download_image_dataset(
         archive_path = resolved_raw_dir / relative_archive_path
         extract_dir = archive_path.parent
         extraction_marker = extract_dir / f".{archive_path.name}.extracted"
+        partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
+        partial_path.unlink(missing_ok=True)
 
-        # The archive is disposable once extraction completes. Check this
-        # marker before looking for the archive so users can remove the zip
-        # without triggering a redundant download on the next load.
+        # The marker is written only after extraction completes. The archive
+        # is disposable, so remove a leftover copy before continuing.
         if extraction_marker.exists():
             print(f"Already extracted: {archive_path.name}")
+            if archive_path.exists():
+                archive_path.unlink()
+                print(f"Removed redundant archive: {archive_path}")
             continue
 
         if archive_path.exists():
@@ -178,6 +183,8 @@ def download_image_dataset(
         print(f"Extracting {archive_path.name} into: {extract_dir}")
         _extract_zip(archive_path, extract_dir)
         extraction_marker.touch()
+        archive_path.unlink()
+        print(f"Removed extracted archive: {archive_path}")
     print(f"{dataset_name} images are ready under: {resolved_raw_dir}")
     return resolved_raw_dir
 

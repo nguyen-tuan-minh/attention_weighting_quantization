@@ -36,7 +36,7 @@ python -m attention_quantization.data.sharegpt4v
 python -m attention_quantization.data.sharegpt4v --dataset gqa
 ```
 
-The data module defaults to COCO. Calling the loader downloads the COCO archive if needed, loads the ShareGPT4V records, and connects their image paths to the local files. After extraction, `data/raw/coco/train2017.zip` is redundant; the extracted images under `data/raw/coco/train2017/` are what the loader uses. You can remove the zip to reclaim space. The extraction marker lets future runs recognize the existing images without downloading the archive again.
+The data module defaults to COCO. Calling the loader downloads the archive only when its images are not already present, loads the ShareGPT4V records, and connects their image paths to the local files. It removes each downloaded ZIP after extraction and leaves a small marker so future runs can reuse the extracted files without downloading again. The same cleanup applies to all supported image sources, including both Visual Genome archives. An interrupted `.part` download is removed before retrying.
 
 ```python
 from attention_quantization.data import load_sharegpt4v_dataset
@@ -81,7 +81,7 @@ The scripts keep calibration selection and forwarding local to the workflow. Att
 
 ### Run QIG quantization
 
-On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5:
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5. It expects COCO images to already exist under the configured `raw_dir` and does not download image archives during quantization:
 
 ```bash
 bash scripts/quantize_qig.sh \
