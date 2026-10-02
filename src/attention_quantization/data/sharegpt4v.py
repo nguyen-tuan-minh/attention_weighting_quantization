@@ -87,6 +87,7 @@ def load_sharegpt4v_dataset(
     download_images: bool = True,
     max_images: int | None = None,
     seed: int | None = None,
+    existing_images_only: bool = False,
 ) -> Dataset:
     """Load ShareGPT4V with local images represented by a lazy ``Image`` feature.
 
@@ -95,6 +96,7 @@ def load_sharegpt4v_dataset(
     Set ``source=None`` to keep every record, or select another supported image
     source. Set ``download_images=False`` to use files already present locally.
     ``max_images`` and ``seed`` default to the values in dataset config.
+    Set ``existing_images_only=True`` to omit records whose local image is missing.
     """
     if source is not None and source not in SOURCE_PREFIXES:
         raise ValueError(f"Unsupported source {source!r}; choose from {tuple(SOURCE_PREFIXES)} or None")
@@ -137,6 +139,17 @@ def load_sharegpt4v_dataset(
         return {"image": str((resolved_image_dir / relative_path).resolve())}
 
     dataset = dataset.map(resolve_image_path, desc="Resolving local ShareGPT4V image paths")
+    if existing_images_only:
+        dataset = dataset.cast_column("image", Image(decode=False))
+        total_records = len(dataset)
+
+        def image_exists(row: dict[str, Any]) -> bool:
+            image_value = row.get("image")
+            image_path = image_value.get("path") if isinstance(image_value, dict) else None
+            return isinstance(image_path, str) and Path(image_path).is_file()
+
+        dataset = dataset.filter(image_exists, desc="Filtering to records with local images")
+        print(f"Records with local images: {len(dataset):,}/{total_records:,}")
     return dataset.cast_column("image", Image(decode=True))
 
 

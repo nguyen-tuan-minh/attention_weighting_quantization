@@ -73,7 +73,7 @@ python scripts/investigate_attention.py --timing        # print step durations
 python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
 ```
 
-Both scripts forward each image with its ShareGPT4V user prompt and assistant caption. Images are decoded one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
+Both scripts first filter calibration records to images that exist locally, then sample from that available subset; this works with the configured 1,024-image extraction and skips missing COCO files. They forward each image with its ShareGPT4V user prompt and assistant caption, decoding images one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
 
 ### Reusing components with other models or datasets
 

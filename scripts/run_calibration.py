@@ -68,6 +68,7 @@ def main() -> int:
             source="coco",
             config_path=args.dataset_config,
             download_images=True,
+            existing_images_only=True,
         )
         if sample_count > len(dataset):
             raise ValueError(
