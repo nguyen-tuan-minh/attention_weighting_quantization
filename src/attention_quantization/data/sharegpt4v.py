@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import random
+import shutil
 import sys
 import urllib.request
 import zipfile
@@ -37,6 +40,7 @@ SOURCE_PREFIXES = {
     "visual-genome": "vg/",
 }
 COCO_TRAIN2017_MIN_FILES = 100_000
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def get_data_paths(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Path]:
@@ -57,6 +61,22 @@ def get_data_paths(config_path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, P
     return paths
 
 
+def _get_image_download_settings(config_path: str | Path) -> tuple[int | None, int | None]:
+    config_path = Path(config_path).expanduser()
+    if not config_path.is_absolute():
+        config_path = REPOSITORY_ROOT / config_path
+    with config_path.open(encoding="utf-8") as config_file:
+        config: Any = yaml.safe_load(config_file) or {}
+
+    max_images = config.get("max_images")
+    seed = config.get("download_seed")
+    if max_images is not None and (not isinstance(max_images, int) or max_images < 1):
+        raise ValueError("max_images in dataset config must be a positive integer or null")
+    if seed is not None and not isinstance(seed, int):
+        raise ValueError("download_seed in dataset config must be an integer or null")
+    return max_images, seed
+
+
 def load_sharegpt4v_dataset(
     *,
     split: str = "train",
@@ -65,6 +85,8 @@ def load_sharegpt4v_dataset(
     cache_dir: str | Path | None = None,
     image_dir: str | Path | None = None,
     download_images: bool = True,
+    max_images: int | None = None,
+    seed: int | None = None,
 ) -> Dataset:
     """Load ShareGPT4V with local images represented by a lazy ``Image`` feature.
 
@@ -72,6 +94,7 @@ def load_sharegpt4v_dataset(
     decoded on access, so this does not load the full image collection into RAM.
     Set ``source=None`` to keep every record, or select another supported image
     source. Set ``download_images=False`` to use files already present locally.
+    ``max_images`` and ``seed`` default to the values in dataset config.
     """
     if source is not None and source not in SOURCE_PREFIXES:
         raise ValueError(f"Unsupported source {source!r}; choose from {tuple(SOURCE_PREFIXES)} or None")
@@ -81,7 +104,13 @@ def load_sharegpt4v_dataset(
     resolved_image_dir = Path(image_dir).expanduser().resolve() if image_dir else paths["raw_dir"]
 
     if download_images and source is not None:
-        download_image_dataset(source, config_path=config_path, raw_dir=resolved_image_dir)
+        download_image_dataset(
+            source,
+            config_path=config_path,
+            raw_dir=resolved_image_dir,
+            max_images=max_images,
+            seed=seed,
+        )
 
     dataset = load_dataset(
         SHAREGPT4V_DATASET_ID,
@@ -133,16 +162,64 @@ def _download_file(url: str, destination: Path) -> None:
         raise
 
 
-def _extract_zip(archive_path: Path, destination: Path) -> None:
-    """Extract zip contents while rejecting paths that escape the destination."""
+def _count_images(directory: Path) -> int:
+    if not directory.is_dir():
+        return 0
+    return sum(
+        1
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+
+
+def _extract_zip(
+    archive_path: Path,
+    destination: Path,
+    max_images: int | None = None,
+    seed: int | None = None,
+) -> int:
+    """Extract a zip safely, optionally limiting newly extracted image files."""
     destination.mkdir(parents=True, exist_ok=True)
     base = destination.resolve()
+    extracted_images = 0
     with zipfile.ZipFile(archive_path) as archive:
-        for member in archive.infolist():
+        members = archive.infolist()
+        for member in members:
             target = (destination / member.filename).resolve()
             if target != base and base not in target.parents:
                 raise ValueError(f"Unsafe path in archive: {member.filename}")
-        archive.extractall(destination)
+        if max_images is None:
+            archive.extractall(destination)
+            return sum(
+                1
+                for member in members
+                if not member.is_dir() and Path(member.filename).suffix.lower() in IMAGE_SUFFIXES
+            )
+
+        candidates = [
+            member
+            for member in members
+            if not member.is_dir()
+            and Path(member.filename).suffix.lower() in IMAGE_SUFFIXES
+            and not (destination / member.filename).is_file()
+        ]
+        if len(candidates) > max_images:
+            candidates = random.Random(seed).sample(candidates, max_images)
+        chosen_images = {member.filename for member in candidates}
+
+        for member in members:
+            if member.is_dir():
+                continue
+            is_image = Path(member.filename).suffix.lower() in IMAGE_SUFFIXES
+            if is_image and member.filename not in chosen_images:
+                continue
+            target = destination / member.filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            if is_image:
+                extracted_images += 1
+    return extracted_images
 
 
 def download_image_dataset(
@@ -150,10 +227,19 @@ def download_image_dataset(
     *,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     raw_dir: str | Path | None = None,
+    max_images: int | None = None,
+    seed: int | None = None,
 ) -> Path:
     """Download and extract one image source under the configured raw data directory."""
     if dataset_name not in IMAGE_DATASETS:
         raise ValueError(f"Unsupported image dataset {dataset_name!r}; choose from {tuple(IMAGE_DATASETS)}")
+    configured_max_images, configured_seed = _get_image_download_settings(config_path)
+    max_images = configured_max_images if max_images is None else max_images
+    seed = configured_seed if seed is None else seed
+    if max_images is not None and (not isinstance(max_images, int) or max_images < 1):
+        raise ValueError("max_images must be a positive integer or None")
+    if seed is not None and not isinstance(seed, int):
+        raise ValueError("seed must be an integer or None")
 
     resolved_raw_dir = (
         Path(raw_dir).expanduser().resolve()
@@ -166,23 +252,35 @@ def download_image_dataset(
         extraction_marker = extract_dir / f".{archive_path.name}.extracted"
         partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
         partial_path.unlink(missing_ok=True)
-        coco_images_dir = resolved_raw_dir / "coco" / "train2017"
-        marked_extraction_is_present = extraction_marker.exists() and (
-            dataset_name != "coco"
-            or (coco_images_dir.is_dir() and any(coco_images_dir.iterdir()))
-        )
-        has_existing_coco_images = (
-            not extraction_marker.exists()
-            and dataset_name == "coco"
-            and coco_images_dir.is_dir()
-            and sum(1 for _ in coco_images_dir.iterdir()) >= COCO_TRAIN2017_MIN_FILES
-        )
-
-        # Also recognize a full COCO extraction made by hand or by an older
-        # downloader version that did not leave the marker file.
-        if marked_extraction_is_present or has_existing_coco_images:
+        existing_images = _count_images(extract_dir)
+        if max_images is not None and existing_images >= max_images:
             print(f"Already extracted: {archive_path.name}")
-            extraction_marker.touch(exist_ok=True)
+            extraction_marker.write_text(
+                json.dumps({"max_images": max_images, "image_count": existing_images}) + "\n",
+                encoding="utf-8",
+            )
+            if archive_path.exists():
+                archive_path.unlink()
+                print(f"Removed redundant archive: {archive_path}")
+            continue
+
+        marker_data: dict[str, Any] = {}
+        if extraction_marker.exists():
+            try:
+                saved_marker = json.loads(extraction_marker.read_text(encoding="utf-8"))
+                marker_data = saved_marker if isinstance(saved_marker, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                marker_data = {}
+        marker_means_full_extraction = marker_data.get("max_images") is None and (
+            "max_images" in marker_data or existing_images >= COCO_TRAIN2017_MIN_FILES
+        )
+        legacy_full_extraction = (
+            not marker_data
+            and extraction_marker.exists()
+            and existing_images >= COCO_TRAIN2017_MIN_FILES
+        )
+        if max_images is None and (marker_means_full_extraction or legacy_full_extraction):
+            print(f"Already extracted: {archive_path.name}")
             if archive_path.exists():
                 archive_path.unlink()
                 print(f"Removed redundant archive: {archive_path}")
@@ -194,8 +292,20 @@ def download_image_dataset(
             print(f"Downloading {dataset_name} archive to: {archive_path}")
             _download_file(url, archive_path)
         print(f"Extracting {archive_path.name} into: {extract_dir}")
-        _extract_zip(archive_path, extract_dir)
-        extraction_marker.touch()
+        remaining_images = None if max_images is None else max_images - existing_images
+        extracted_images = _extract_zip(archive_path, extract_dir, remaining_images, seed)
+        extraction_marker.write_text(
+            json.dumps(
+                {
+                    "max_images": max_images,
+                    "seed": seed,
+                    "image_count": _count_images(extract_dir),
+                    "newly_extracted": extracted_images,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         archive_path.unlink()
         print(f"Removed extracted archive: {archive_path}")
     print(f"{dataset_name} images are ready under: {resolved_raw_dir}")
@@ -216,9 +326,26 @@ def main() -> int:
         default=DEFAULT_CONFIG_PATH,
         help="YAML dataset path config (default: configs/dataset.yaml).",
     )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Override configured maximum image count (dataset.yaml default: 1024; null in config means all).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override download_seed in dataset.yaml (default: null, meaning choose a new random subset).",
+    )
     args = parser.parse_args()
     try:
-        download_image_dataset(args.dataset, config_path=args.config)
+        download_image_dataset(
+            args.dataset,
+            config_path=args.config,
+            max_images=args.max_images,
+            seed=args.seed,
+        )
     except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

@@ -34,9 +34,11 @@ Dataset locations are set in [`configs/dataset.yaml`](configs/dataset.yaml). Rel
 ```bash
 python -m attention_quantization.data.sharegpt4v
 python -m attention_quantization.data.sharegpt4v --dataset gqa
+python -m attention_quantization.data.sharegpt4v --dataset coco
+python -m attention_quantization.data.sharegpt4v --dataset coco --max-images 50000 --seed 42
 ```
 
-The data module defaults to COCO. Calling the loader downloads the archive only when its images are not already present, loads the ShareGPT4V records, and connects their image paths to the local files. It recognizes a full existing COCO `train2017` directory even if it was extracted manually or by an older script, then leaves a marker so future runs can reuse it. It removes each downloaded ZIP after extraction. The same archive cleanup applies to all supported image sources, including both Visual Genome archives. An interrupted `.part` download is removed before retrying.
+The data module defaults to COCO. `configs/dataset.yaml` sets `max_images: 1024` and `download_seed: null`, so downloading extracts a random subset of up to 1,024 images by default; a null seed chooses a new subset on each fresh extraction. Set a numeric `download_seed` for a repeatable subset. `--max-images` and `--seed` override these settings for one run. Setting `max_images: null` in the config extracts every image. The archive itself is still downloaded in full, then deleted after extraction. Existing image files are kept, so lowering the limit does not remove files already on disk. The loader also accepts `max_images=...` and `seed=...`, and removes each archive after extraction. An interrupted `.part` download is removed before retrying. QIG filters its calibration candidates to images present locally, so it can use a capped COCO extraction without attempting to fetch missing images.
 
 ```python
 from attention_quantization.data import load_sharegpt4v_dataset

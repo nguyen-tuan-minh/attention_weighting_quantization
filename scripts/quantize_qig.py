@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,33 +64,6 @@ def qig_git_revision(path: Path) -> str | None:
         return None
 
 
-def ensure_coco_image(image_path: Path, relative_image_path: Path) -> None:
-    """Fetch one missing COCO calibration image without downloading the ZIP."""
-    if image_path.is_file():
-        return
-
-    if (
-        len(relative_image_path.parts) != 3
-        or relative_image_path.parts[:2] != ("coco", "train2017")
-        or relative_image_path.suffix.lower() != ".jpg"
-    ):
-        raise FileNotFoundError(f"Missing calibration image is not a COCO train2017 JPEG: {image_path}")
-
-    image_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = image_path.with_suffix(image_path.suffix + ".part")
-    url = f"https://images.cocodataset.org/train2017/{image_path.name}"
-    print(f"Missing calibration image; downloading this image only: {image_path}")
-    try:
-        urllib.request.urlretrieve(url, temporary_path)
-        with temporary_path.open("rb") as downloaded:
-            if downloaded.read(2) != b"\xff\xd8":
-                raise ValueError(f"Downloaded file is not a JPEG image: {url}")
-        temporary_path.replace(image_path)
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        raise
-
-
 def write_qig_calibration_jsonl(
     dataset_config_path: Path,
     sample_count: int,
@@ -111,8 +83,37 @@ def write_qig_calibration_jsonl(
     ).cast_column("image", Image(decode=False))
     if sample_count < 1:
         raise ValueError("--samples must be a positive integer")
-    if sample_count > len(dataset):
-        raise ValueError(f"Requested {sample_count} samples, but only {len(dataset)} COCO records are available")
+
+    image_root = paths["raw_dir"].resolve()
+
+    def image_is_available(row: dict[str, Any]) -> bool:
+        image_value = row.get("image")
+        image_path = image_value.get("path") if isinstance(image_value, dict) else None
+        if not isinstance(image_path, str) or not image_path:
+            return False
+        resolved_image = Path(image_path).expanduser().resolve()
+        try:
+            resolved_image.relative_to(image_root)
+        except ValueError:
+            return False
+        return resolved_image.is_file()
+
+    total_records = len(dataset)
+    dataset = dataset.filter(
+        image_is_available,
+        desc="Keeping ShareGPT4V COCO records with local images",
+    )
+    available_records = len(dataset)
+    missing_records = total_records - available_records
+    print(
+        f"COCO records with images on disk: {available_records:,}/{total_records:,} "
+        f"({missing_records:,} records skipped)"
+    )
+    if sample_count > available_records:
+        raise ValueError(
+            f"Requested {sample_count} samples, but only {available_records} COCO records "
+            "have images available locally"
+        )
 
     if seed is None:
         dataset = dataset.shuffle()
@@ -120,7 +121,6 @@ def write_qig_calibration_jsonl(
         dataset = dataset.shuffle(seed=seed)
     dataset = dataset.select(range(sample_count))
 
-    image_root = paths["raw_dir"].resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     selected_ids: list[str] = []
     with destination.open("w", encoding="utf-8") as output:
@@ -134,7 +134,10 @@ def write_qig_calibration_jsonl(
                 relative_image = resolved_image.relative_to(image_root)
             except ValueError as error:
                 raise ValueError(f"Image path {resolved_image} is outside configured raw_dir {image_root}") from error
-            ensure_coco_image(resolved_image, relative_image)
+            if not resolved_image.is_file():
+                raise FileNotFoundError(
+                    f"COCO image disappeared after local-image filtering: {resolved_image}"
+                )
 
             conversations = row.get("conversations")
             if not isinstance(conversations, list):
