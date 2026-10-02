@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -325,5 +326,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, ImportError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        if os.environ.get("ATTENTION_QUANTIZATION_DEBUG") == "1":
+            traceback.print_exc()
+        else:
+            print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1)
