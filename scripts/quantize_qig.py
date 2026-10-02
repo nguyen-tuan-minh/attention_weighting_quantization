@@ -65,6 +65,19 @@ def qig_git_revision(path: Path) -> str | None:
         return None
 
 
+def resolve_base_model(model_reference: str) -> str:
+    """Resolve local relative checkpoints from the project root, not QIG's cwd."""
+    model_path = Path(model_reference).expanduser()
+    if model_path.is_absolute():
+        return str(model_path.resolve())
+
+    project_model_path = (REPOSITORY_ROOT / model_path).resolve()
+    if project_model_path.exists():
+        return str(project_model_path)
+    # Keep Hub IDs such as ``liuhaotian/llava-v1.5-7b`` unchanged.
+    return model_reference
+
+
 def write_qig_calibration_jsonl(
     dataset_config_path: Path,
     sample_count: int,
@@ -220,7 +233,8 @@ def main() -> int:
         # (llava-1.5-7b) does not match its LLaVA 1.5 detection pattern, so
         # provide the recognized architecture name explicitly while loading
         # weights from the requested local path.
-        model_args = f"pretrained={args.base_model},model_name=llava-v1.5-7b"
+        base_model = resolve_base_model(args.base_model)
+        model_args = f"pretrained={base_model},model_name=llava-v1.5-7b"
         lm = model_class.create_from_arg_string(
             model_args,
             {"batch_size": 1, "device": "cuda"},
@@ -283,7 +297,7 @@ def main() -> int:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "method": args.method,
             "model_type": "llava",
-            "base_model": args.base_model,
+            "base_model": base_model,
             "model_dtype": "float16",
             "weight_bits": args.w_bit,
             "activation_bits": args.a_bit,
