@@ -215,7 +215,12 @@ def main() -> int:
         model_class = qig.get_model("llava")
         # QIG's classic LLaVA adapter does not accept a `dtype` argument.
         # Its upstream LLaVA builder defaults to loading the model in float16.
-        model_args = f"pretrained={args.base_model}"
+        # QIG's LLaVA builder infers the model family from the checkpoint's
+        # final path component. The project's local directory name
+        # (llava-1.5-7b) does not match its LLaVA 1.5 detection pattern, so
+        # provide the recognized architecture name explicitly while loading
+        # weights from the requested local path.
+        model_args = f"pretrained={args.base_model},model_name=llava-v1.5-7b"
         lm = model_class.create_from_arg_string(
             model_args,
             {"batch_size": 1, "device": "cuda"},
