@@ -220,27 +220,7 @@ def main() -> int:
         total_started = time.perf_counter() if args.timing else None
 
         # =====================================================================
-        # 1. LOAD MODEL
-        # =====================================================================
-        model_started = time.perf_counter() if args.timing else None
-        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
-        model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading or updating model {model_id} at {model_dir}")
-        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
-
-        model, processor = load_huggingface_model(
-            model_dir,
-            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
-            torch_dtype=model_config.get("torch_dtype", "float16"),
-            device_map=model_config.get("device_map", "auto"),
-            attn_implementation=model_config.get("attn_implementation", "eager"),
-        )
-        if model_started is not None:
-            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
-
-        # =====================================================================
-        # 2. PREPARE CALIBRATION DATASET
+        # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
         dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
@@ -266,6 +246,26 @@ def main() -> int:
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
         if dataset_started is not None:
             print(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
+
+        # =====================================================================
+        # 2. LOAD MODEL
+        # =====================================================================
+        model_started = time.perf_counter() if args.timing else None
+        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading or updating model {model_id} at {model_dir}")
+        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+
+        model, processor = load_huggingface_model(
+            model_dir,
+            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
+            torch_dtype=model_config.get("torch_dtype", "float16"),
+            device_map=model_config.get("device_map", "auto"),
+            attn_implementation=model_config.get("attn_implementation", "eager"),
+        )
+        if model_started is not None:
+            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
         # 3. REGISTER ATTENTION HOOKS

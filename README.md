@@ -56,13 +56,13 @@ The script saves the full COCO subset under the configured `processed_dir/shareg
 
 [`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. The model ID, local download directory, dtype, device mapping, and attention implementation are in [`configs/model.yaml`](configs/model.yaml).
 
-The original forward-only script has three sections: load model, prepare calibration, and forward:
+The forward-only script prepares and saves the calibration dataset first. Its downloader extracts COCO and removes the ZIP before it downloads or loads LLaVA. The script then forwards the selected samples:
 
 ```bash
 python scripts/run_calibration.py
 ```
 
-The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. The script is divided into five sections: load model, prepare calibration, register hooks, forward, and analyse.
+The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. It prepares the dataset and removes the COCO ZIP before downloading or loading LLaVA. Its five sections are: prepare calibration, load model, register hooks, forward, and analyse.
 
 ```bash
 python scripts/investigate_attention.py                 # online analysis

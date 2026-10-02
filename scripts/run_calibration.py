@@ -1,4 +1,4 @@
-"""Download LLaVA, prepare a COCO subset, and forward samples individually."""
+"""Prepare COCO data, download LLaVA, and forward samples individually."""
 
 from __future__ import annotations
 
@@ -38,7 +38,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured seed.")
-    parser.add_argument("--download-model-only", action="store_true")
+    parser.add_argument(
+        "--download-model-only",
+        action="store_true",
+        help="Prepare the dataset first, download the model, then exit without forwarding samples.",
+    )
     return parser.parse_args()
 
 
@@ -57,19 +61,7 @@ def main() -> int:
             raise ValueError("calibration_seed must be an integer or null")
 
         # ==================================================================
-        # 1. LOAD MODEL
-        # ==================================================================
-        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
-        model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading or updating model {model_id} at {model_dir}")
-        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
-        if args.download_model_only:
-            print("Model download complete.")
-            return 0
-
-        # ==================================================================
-        # 2. PREPARE CALIBRATION DATASET
+        # 1. PREPARE CALIBRATION DATASET
         # ==================================================================
         print("Loading COCO ShareGPT4V data and ensuring COCO images are available...")
         dataset = load_sharegpt4v_dataset(
@@ -93,6 +85,18 @@ def main() -> int:
         calibration_dir.parent.mkdir(parents=True, exist_ok=True)
         dataset.save_to_disk(str(calibration_dir))
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
+
+        # ==================================================================
+        # 2. DOWNLOAD AND LOAD MODEL
+        # ==================================================================
+        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading or updating model {model_id} at {model_dir}")
+        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+        if args.download_model_only:
+            print("Dataset preparation and model download complete.")
+            return 0
 
         model, processor = load_huggingface_model(
             model_dir,
