@@ -151,23 +151,25 @@ def show_activation_pca(
         coordinates, is_image = projected[layer_index]
         image_points = coordinates[is_image].numpy()
         text_points = coordinates[~is_image].numpy()
+        # Draw image tokens fully opaque first, then let text tokens blend
+        # over them so coincident image points remain visible underneath.
         axis.scatter(
             image_points[:, 0],
             image_points[:, 1],
-            s=28,
-            facecolors="none",
-            edgecolors=image_color,
-            linewidths=0.8,
+            s=7,
+            alpha=1.0,
+            color=image_color,
+            marker=".",
             label="Image tokens",
             rasterized=True,
         )
         axis.scatter(
             text_points[:, 0],
             text_points[:, 1],
-            s=10,
-            alpha=0.8,
+            s=5,
+            alpha=0.18,
             color=text_color,
-            marker="o",
+            marker=".",
             label="Text tokens",
             rasterized=True,
         )
@@ -180,6 +182,9 @@ def show_activation_pca(
         axis.axis("off")
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
+    legend_items = dict(zip(labels, handles))
+    handles = [legend_items[label] for label in ("Image tokens", "Text tokens")]
+    labels = ["Image tokens", "Text tokens"]
     figure.subplots_adjust(top=0.88, hspace=0.45, wspace=0.35)
     figure.suptitle(figure_title, y=0.99)
     figure.legend(
