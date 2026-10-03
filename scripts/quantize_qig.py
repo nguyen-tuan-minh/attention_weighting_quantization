@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,15 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.quantization.qig import load_qig_runtime  # noqa: E402
+
+
+def progress(message: str, started_at: float | None = None) -> float:
+    """Print a timestamped stage update immediately, including in redirected logs."""
+    now = time.perf_counter()
+    elapsed = f" ({now - started_at:.1f}s)" if started_at is not None else ""
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}{elapsed}", flush=True)
+    return now
 
 
 def parse_args() -> argparse.Namespace:
@@ -218,23 +228,32 @@ def main() -> int:
 
     staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=output_dir.parent))
     try:
+        progress("Preparing calibration data")
         calibration_path: Path | None = None
         if args.method == "rtn":
             sample_count, selected_sample_ids = 0, []
         else:
             calibration_path = staging_dir / "calibration.jsonl"
+            stage_started = time.perf_counter()
             sample_count, selected_sample_ids = write_qig_calibration_jsonl(
                 args.dataset_config,
                 args.samples,
                 args.seed,
                 calibration_path,
             )
+            progress(
+                f"Calibration records ready ({sample_count} samples)",
+                stage_started,
+            )
 
         # Load and run QIG through this project's isolated integration module.
         import torch
 
+        stage_started = time.perf_counter()
+        progress("Loading quantization runtime")
         qig = load_qig_runtime(qig_source)
         model_class = qig.get_model("llava")
+        progress("Quantization runtime ready", stage_started)
         # QIG's classic LLaVA adapter does not accept a `dtype` argument.
         # Its upstream LLaVA builder defaults to loading the model in float16.
         # QIG's LLaVA builder infers the model family from the checkpoint's
@@ -250,8 +269,10 @@ def main() -> int:
                 from huggingface_hub import snapshot_download
 
                 model_dir.mkdir(parents=True, exist_ok=True)
-                print(f"Downloading original LLaVA checkpoint {model_id} to {model_dir}")
+                progress(f"Downloading LLaVA checkpoint {model_id} to {model_dir}")
+                stage_started = time.perf_counter()
                 snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+                progress("LLaVA checkpoint download complete", stage_started)
             base_model = str(model_dir.resolve())
         else:
             base_model = resolve_base_model(args.base_model)
@@ -260,21 +281,30 @@ def main() -> int:
             f"pretrained={base_model},model_name=llava-v1.5-7b,"
             f"attn_implementation={attn_implementation}"
         )
+        progress(f"Loading LLaVA model from {base_model}")
+        stage_started = time.perf_counter()
         lm = model_class.create_from_arg_string(
             model_args,
             {"batch_size": 1, "device": "cuda"},
         )
+        progress("LLaVA model initialization complete", stage_started)
+
+        progress("Preparing model adapter")
+        stage_started = time.perf_counter()
         process_class = qig.get_process_model("llava")
         process_model = process_class(
             lm._model,
             lm._tokenizer,
             getattr(lm, "processor", None),
         )
+        progress("Model adapter ready", stage_started)
 
         if calibration_path is None:
             prompt_inputs, prompt_kwargs = None, None
         else:
             data_paths = get_data_paths(args.dataset_config)
+            progress(f"Building calibration inputs ({sample_count} samples)")
+            stage_started = time.perf_counter()
             prompt_inputs, prompt_kwargs = qig.get_multimodal_calib_dataset(
                 data_path=str(calibration_path),
                 image_folder=str(data_paths["raw_dir"]),
@@ -282,6 +312,7 @@ def main() -> int:
                 n_samples=sample_count,
                 micro_bs=args.micro_batch_size,
             )
+            progress("Calibration inputs ready", stage_started)
 
         scales_path = (
             None
@@ -304,10 +335,15 @@ def main() -> int:
             model="llava",
             model_args=model_args,
         )
+        progress(f"Running {args.method.upper()} quantization")
+        stage_started = time.perf_counter()
         qig.qwrapper(process_model, prompt_inputs, prompt_kwargs, qig_args)
+        progress("Quantization complete", stage_started)
 
         # QIG uses pseudo quantization: the weights are rounded onto the
         # requested grid but stored here in their normal floating-point dtype.
+        progress("Saving model and tokenizer")
+        stage_started = time.perf_counter()
         lm._model.save_pretrained(
             str(staging_dir),
             safe_serialization=True,
@@ -317,6 +353,7 @@ def main() -> int:
         image_processor = getattr(process_model, "image_processor", None)
         if image_processor is not None and hasattr(image_processor, "save_pretrained"):
             image_processor.save_pretrained(str(staging_dir))
+        progress("Model files saved", stage_started)
 
         metadata = {
             "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -359,7 +396,7 @@ def main() -> int:
         )
 
         publish_directory(staging_dir, output_dir, args.overwrite)
-        print(f"Saved QIG quantization artifact to: {output_dir}")
+        progress(f"Saved QIG quantization artifact to: {output_dir}")
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
