@@ -129,6 +129,7 @@ def show_activation_pca(
     figure_title: str,
     save_dir: Path | None = None,
     output_name: str = "activation_pca.png",
+    contributing_samples: int = 1,
 ) -> None:
     """Display one image/text PCA scatter plot for every decoder layer."""
     if not projected:
@@ -147,6 +148,8 @@ def show_activation_pca(
 
     image_color = "#2878B5"
     text_color = "#E87500"
+    base_text_alpha = 0.18
+    text_alpha = 1.0 - (1.0 - base_text_alpha) ** (1.0 / max(contributing_samples, 1))
     for axis, layer_index in zip(axes.ravel(), layer_indices):
         coordinates, is_image = projected[layer_index]
         image_points = coordinates[is_image].numpy()
@@ -167,7 +170,7 @@ def show_activation_pca(
             text_points[:, 0],
             text_points[:, 1],
             s=5,
-            alpha=0.18,
+            alpha=text_alpha,
             color=text_color,
             marker=".",
             label="Text tokens",
@@ -420,6 +423,7 @@ def main() -> int:
                 f"All {len(activation_samples)} samples: post-input-LayerNorm activations",
                 args.save_dir,
                 output_name="all_samples_activation_pca.png",
+                contributing_samples=len(activation_samples),
             )
             if analyse_started is not None:
                 print(f"[timing] Pooled PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
