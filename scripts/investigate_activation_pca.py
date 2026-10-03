@@ -150,6 +150,9 @@ def show_activation_pca(
     text_color = "#E87500"
     base_text_alpha = 0.18
     text_alpha = 1.0 - (1.0 - base_text_alpha) ** (1.0 / max(contributing_samples, 1))
+    first_layer_labels = projected[layer_indices[0]][1]
+    image_label = f"Image tokens (n={int(first_layer_labels.sum()):,})"
+    text_label = f"Text tokens (n={int((~first_layer_labels).sum()):,})"
     for axis, layer_index in zip(axes.ravel(), layer_indices):
         coordinates, is_image = projected[layer_index]
         image_points = coordinates[is_image].numpy()
@@ -163,7 +166,7 @@ def show_activation_pca(
             alpha=1.0,
             color=image_color,
             marker=".",
-            label="Image tokens",
+            label=image_label,
             rasterized=True,
         )
         axis.scatter(
@@ -173,7 +176,7 @@ def show_activation_pca(
             alpha=text_alpha,
             color=text_color,
             marker=".",
-            label="Text tokens",
+            label=text_label,
             rasterized=True,
         )
         axis.set_title(f"Layer {layer_index}")
@@ -186,8 +189,8 @@ def show_activation_pca(
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
     legend_items = dict(zip(labels, handles))
-    handles = [legend_items[label] for label in ("Image tokens", "Text tokens")]
-    labels = ["Image tokens", "Text tokens"]
+    labels = [image_label, text_label]
+    handles = [legend_items[label] for label in labels]
     figure.subplots_adjust(top=0.88, hspace=0.45, wspace=0.35)
     figure.suptitle(figure_title, y=0.99)
     figure.legend(
@@ -340,26 +343,6 @@ def main() -> int:
                 text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify image and text token positions")
-
-                user_text = next(
-                    (
-                        turn.get("value", "")
-                        for turn in sample["conversations"]
-                        if turn.get("from") in {"human", "user"}
-                    ),
-                    "",
-                )
-                assistant_text = next(
-                    (
-                        turn.get("value", "")
-                        for turn in sample["conversations"]
-                        if turn.get("from") in {"gpt", "assistant"}
-                    ),
-                    "",
-                )
-                print(f"[{index}/{len(dataset)}] Conversation:")
-                print(f"  USER: {user_text}")
-                print(f"  ASSISTANT: {assistant_text}")
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
