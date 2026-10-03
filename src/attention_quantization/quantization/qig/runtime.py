@@ -21,8 +21,8 @@ class QIGRuntime:
 def load_qig_runtime(source_dir: str | Path) -> QIGRuntime:
     """Import QIG and its LLaVA helpers from an existing source checkout.
 
-    QIG-specific imports are delayed so dataset and model tools in the main
-    project remain importable without installing QIG or LMMS-Eval.
+    QIG-specific imports are delayed so dataset and model tools remain
+    importable before the selected source checkouts are installed.
     """
     source = Path(source_dir).expanduser().resolve()
     if not (source / "main_quant.py").is_file():
@@ -37,8 +37,8 @@ def load_qig_runtime(source_dir: str | Path) -> QIGRuntime:
         from qmllm.quantization.quant_wrapper import qwrapper
     except ImportError as error:
         raise ImportError(
-            "QIG runtime dependencies are unavailable. Run scripts/quantize_qig.sh "
-            "to install the project-selected dependencies in .venv-qig."
+            "QIG runtime dependencies are unavailable. Run scripts/set_up.sh "
+            "to install the project-selected dependencies in .venv."
         ) from error
 
     return QIGRuntime(

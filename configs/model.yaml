@@ -1,6 +1,8 @@
 # Model paths are relative to the repository root unless they are absolute.
 model_id: liuhaotian/llava-v1.5-7b
-model_dir: models/llava-v1.5-7b-qig
+model_dir: models/llava-v1.5-7b
+model_family: llava-v1.5
+implementation_source_dir: .third_party/QIG
 # The original checkpoint is loaded by QIG's companion LLaVA implementation,
 # not Transformers AutoModelForVision2Seq.
 torch_dtype: float16

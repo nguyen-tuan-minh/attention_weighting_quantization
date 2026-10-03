@@ -10,4 +10,5 @@ max_images: 1024
 download_seed: null
 calibration_samples: 2
 calibration_seed: null
-calibration_output_dir: data/processed/llava15_coco_calibration
+calibration_source: coco
+calibration_output_dir: data/processed/calibration_samples

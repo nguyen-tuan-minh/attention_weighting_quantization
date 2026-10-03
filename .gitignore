@@ -184,4 +184,5 @@ cython_debug/
 /data/
 /models/
 /.third_party/QIG/
+# Legacy environment path from the previous setup; current scripts use .venv.
 /.venv-qig/

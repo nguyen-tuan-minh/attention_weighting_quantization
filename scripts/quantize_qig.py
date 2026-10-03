@@ -245,7 +245,7 @@ def main() -> int:
         model_config = read_yaml(args.model_config)
         if args.base_model is None:
             model_id = model_config.get("model_id", "liuhaotian/llava-v1.5-7b")
-            model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b-qig"))
+            model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
             if not has_local_model_weights(model_dir):
                 from huggingface_hub import snapshot_download
 

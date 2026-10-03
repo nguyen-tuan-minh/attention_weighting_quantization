@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import sys
 import time
 from pathlib import Path
@@ -28,7 +27,7 @@ from attention_quantization.data import (  # noqa: E402
     get_data_paths,
     load_sharegpt4v_dataset,
 )
-from attention_quantization.models import load_qig_llava_model  # noqa: E402
+from attention_quantization.models import load_model  # noqa: E402
 
 
 def register_attention_hooks(
@@ -254,20 +253,17 @@ def main() -> int:
         # 2. LOAD MODEL
         # =====================================================================
         model_started = time.perf_counter() if args.timing else None
-        model_id = model_config.get("model_id", "liuhaotian/llava-v1.5-7b")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b-qig"))
+        model_id = model_config["model_id"]
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
         model_dir.mkdir(parents=True, exist_ok=True)
         print(f"Downloading or updating model {model_id} at {model_dir}")
         snapshot_download(repo_id=model_id, local_dir=str(model_dir))
 
-        qig_source = Path(os.environ.get("QIG_SOURCE_DIR", REPOSITORY_ROOT / ".third_party" / "QIG"))
-        lm, process_model = load_qig_llava_model(
+        model, input_adapter = load_model(
             model_dir,
-            qig_source_dir=qig_source,
-            device=model_config.get("device_map", "cuda:0"),
-            attn_implementation=model_config.get("attn_implementation", "eager"),
+            model_config,
+            repository_root=REPOSITORY_ROOT,
         )
-        model = lm._model
         model.config.output_attentions = True
         if model_started is not None:
             print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
@@ -323,9 +319,9 @@ def main() -> int:
                     "id": sample.get("id", str(index)),
                     "image": "local",
                 }
-                prepared = process_model.preprocess_data([sample["image"]], row)
-                batch = process_model.data_collator([prepared])
-                prompt_inputs, prompt_kwargs = process_model.generate_input(batch)
+                prepared = input_adapter.preprocess_data([sample["image"]], row)
+                batch = input_adapter.data_collator([prepared])
+                prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
                 attention_mask = prompt_kwargs["attention_mask"][0].bool()
                 image_mask = prompt_kwargs["vision_mask"][0].bool()
                 text_mask = attention_mask & ~image_mask
@@ -345,7 +341,7 @@ def main() -> int:
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
-                    outputs = process_model(
+                    outputs = input_adapter(
                         inputs_embeds=prompt_inputs["inputs_embeds"],
                         attention_mask=prompt_kwargs["attention_mask"],
                         labels=prompt_kwargs["labels"],

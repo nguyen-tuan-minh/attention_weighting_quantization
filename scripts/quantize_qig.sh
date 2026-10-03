@@ -5,10 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 QIG_SOURCE_DIR="${QIG_SOURCE_DIR:-${REPOSITORY_ROOT}/.third_party/QIG}"
-QIG_VENV_DIR="${QIG_VENV_DIR:-${REPOSITORY_ROOT}/.venv-qig}"
-PYTHON311="${PYTHON311:-python3.11}"
+VENV_DIR="${VENV_DIR:-${REPOSITORY_ROOT}/.venv}"
+PYTHON_BIN="${PYTHON:-python3.11}"
 LLAVA_SOURCE_DIR="${QIG_SOURCE_DIR}/3rdparty/LLaVA-NeXT"
 LMMS_EVAL_SOURCE_DIR="${QIG_SOURCE_DIR}/3rdparty/lmms-eval"
+
+if [[ "${VENV_DIR}" != /* ]]; then
+    VENV_DIR="${REPOSITORY_ROOT}/${VENV_DIR}"
+fi
 SETUP_ONLY=false
 FORWARD_ARGS=()
 
@@ -56,35 +60,42 @@ clone_companion() {
 clone_companion "https://github.com/LSY-noya/LLaVA-NeXT.git" "${LLAVA_SOURCE_DIR}"
 clone_companion "https://github.com/LSY-noya/lmms-eval.git" "${LMMS_EVAL_SOURCE_DIR}"
 
-if [[ ! -x "${QIG_VENV_DIR}/bin/python" ]]; then
-    if ! command -v "${PYTHON311}" >/dev/null 2>&1; then
-        echo "Python 3.11 was not found (${PYTHON311}); QIG documents Python 3.11." >&2
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+    if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+        echo "Python 3.11 was not found (${PYTHON_BIN}); this project's shared environment uses Python 3.11." >&2
         exit 1
     fi
-    echo "Creating isolated QIG environment: ${QIG_VENV_DIR}"
-    "${PYTHON311}" -m venv "${QIG_VENV_DIR}"
+    echo "Creating project environment: ${VENV_DIR}"
+    mkdir -p "$(dirname -- "${VENV_DIR}")"
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi
 
-QIG_PYTHON="${QIG_VENV_DIR}/bin/python"
-QIG_SETUP_MARKER="${QIG_VENV_DIR}/.qig-dependencies-source-selected-v4"
-if [[ ! -f "${QIG_SETUP_MARKER}" ]]; then
-    "${QIG_PYTHON}" -m pip install --upgrade pip
-    "${QIG_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements-qig.txt"
-    "${QIG_PYTHON}" -m pip install -e "${LLAVA_SOURCE_DIR}" --no-deps
-    "${QIG_PYTHON}" -m pip install -e "${LMMS_EVAL_SOURCE_DIR}" --no-deps
-    "${QIG_PYTHON}" -m pip install -e "${QIG_SOURCE_DIR}" --no-deps
-    "${QIG_PYTHON}" -m pip install -e "${REPOSITORY_ROOT}" --no-deps
-    "${QIG_PYTHON}" -c 'import torch; assert torch.cuda.is_available(), "CUDA is not available to this PyTorch install"; print(f"PyTorch {torch.__version__}; CUDA device: {torch.cuda.get_device_name(0)}")'
-    touch "${QIG_SETUP_MARKER}"
+PROJECT_PYTHON="${VENV_DIR}/bin/python"
+PYTHON_VERSION="$(${PROJECT_PYTHON} -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')"
+if [[ "${PYTHON_VERSION}" != "3.11" ]]; then
+    echo "The shared .venv uses Python ${PYTHON_VERSION}; recreate it with Python 3.11 before installing the quantization packages." >&2
+    exit 1
+fi
+
+SETUP_MARKER="${VENV_DIR}/.project-dependencies-source-selected-v5"
+if [[ ! -f "${SETUP_MARKER}" ]]; then
+    "${PROJECT_PYTHON}" -m pip install --upgrade pip
+    "${PROJECT_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements.txt"
+    "${PROJECT_PYTHON}" -m pip install -e "${LLAVA_SOURCE_DIR}" --no-deps
+    "${PROJECT_PYTHON}" -m pip install -e "${LMMS_EVAL_SOURCE_DIR}" --no-deps
+    "${PROJECT_PYTHON}" -m pip install -e "${QIG_SOURCE_DIR}" --no-deps
+    "${PROJECT_PYTHON}" -m pip install -e "${REPOSITORY_ROOT}" --no-deps
+    "${PROJECT_PYTHON}" -c 'import torch; assert torch.cuda.is_available(), "CUDA is not available to this PyTorch install"; print(f"PyTorch {torch.__version__}; CUDA device: {torch.cuda.get_device_name(0)}")'
+    touch "${SETUP_MARKER}"
 else
-    echo "Using installed QIG environment: ${QIG_VENV_DIR}"
+    echo "Using installed project environment: ${VENV_DIR}"
 fi
 
 if [[ "${SETUP_ONLY}" == true ]]; then
-    echo "QIG environment is ready: ${QIG_VENV_DIR}"
+    echo "Project environment is ready: ${VENV_DIR}"
     exit 0
 fi
 
 export QIG_SOURCE_DIR
 cd "${QIG_SOURCE_DIR}"
-exec "${QIG_PYTHON}" "${REPOSITORY_ROOT}/scripts/quantize_qig.py" "${FORWARD_ARGS[@]}"
+exec "${PROJECT_PYTHON}" "${REPOSITORY_ROOT}/scripts/quantize_qig.py" "${FORWARD_ARGS[@]}"

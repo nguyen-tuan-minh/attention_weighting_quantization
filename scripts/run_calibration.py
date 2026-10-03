@@ -1,9 +1,8 @@
-"""Prepare COCO data, download LLaVA, and forward samples individually."""
+"""Load the configured model and forward calibration samples individually."""
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -19,12 +18,12 @@ from attention_quantization.data import (  # noqa: E402
     get_data_paths,
     load_sharegpt4v_dataset,
 )
-from attention_quantization.models import load_qig_llava_model  # noqa: E402
+from attention_quantization.models import load_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download LLaVA 1.5 7B, prepare calibration data, and forward each sample."
+        description="Download the configured model, prepare calibration data, and forward each sample."
     )
     parser.add_argument(
         "--dataset-config",
@@ -63,16 +62,18 @@ def main() -> int:
         # ==================================================================
         # 1. PREPARE CALIBRATION DATASET
         # ==================================================================
-        print("Loading COCO ShareGPT4V data and ensuring COCO images are available...")
+        dataset_source = dataset_config.get("calibration_source", "coco")
+        print(f"Loading ShareGPT4V {dataset_source} data and ensuring images are available...")
         dataset = load_sharegpt4v_dataset(
-            source="coco",
+            source=dataset_source,
             config_path=args.dataset_config,
             download_images=True,
             existing_images_only=True,
         )
         if sample_count > len(dataset):
             raise ValueError(
-                f"Requested {sample_count} samples, but only {len(dataset)} COCO records are available"
+                f"Requested {sample_count} samples, but only {len(dataset)} "
+                f"{dataset_source} records are available"
             )
         if seed is not None or sample_count < len(dataset):
             dataset = dataset.shuffle(seed=seed).select(range(sample_count))
@@ -80,7 +81,7 @@ def main() -> int:
         calibration_dir = repository_path(
             dataset_config.get(
                 "calibration_output_dir",
-                data_paths["processed_dir"] / "llava15_coco_calibration",
+                data_paths["processed_dir"] / "calibration_samples",
             )
         )
         calibration_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -90,8 +91,8 @@ def main() -> int:
         # ==================================================================
         # 2. DOWNLOAD AND LOAD MODEL
         # ==================================================================
-        model_id = model_config.get("model_id", "liuhaotian/llava-v1.5-7b")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b-qig"))
+        model_id = model_config["model_id"]
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
         model_dir.mkdir(parents=True, exist_ok=True)
         print(f"Downloading or updating model {model_id} at {model_dir}")
         snapshot_download(repo_id=model_id, local_dir=str(model_dir))
@@ -99,14 +100,11 @@ def main() -> int:
             print("Dataset preparation and model download complete.")
             return 0
 
-        qig_source = Path(os.environ.get("QIG_SOURCE_DIR", REPOSITORY_ROOT / ".third_party" / "QIG"))
-        lm, process_model = load_qig_llava_model(
+        model, input_adapter = load_model(
             model_dir,
-            qig_source_dir=qig_source,
-            device=model_config.get("device_map", "cuda:0"),
-            attn_implementation=model_config.get("attn_implementation", "eager"),
+            model_config,
+            repository_root=REPOSITORY_ROOT,
         )
-        model = lm._model
 
         # ==================================================================
         # 3. FORWARD CALIBRATION SAMPLES
@@ -114,12 +112,12 @@ def main() -> int:
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         for index, sample in enumerate(dataset, start=1):
             row = {"conversations": sample["conversations"], "id": sample.get("id", str(index)), "image": "local"}
-            prepared = process_model.preprocess_data([sample["image"]], row)
-            batch = process_model.data_collator([prepared])
-            prompt_inputs, prompt_kwargs = process_model.generate_input(batch)
+            prepared = input_adapter.preprocess_data([sample["image"]], row)
+            batch = input_adapter.data_collator([prepared])
+            prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
             with torch.inference_mode():
-                outputs = process_model(
+                outputs = input_adapter(
                     inputs_embeds=prompt_inputs["inputs_embeds"],
                     attention_mask=prompt_kwargs["attention_mask"],
                     labels=prompt_kwargs["labels"],

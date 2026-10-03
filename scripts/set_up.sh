@@ -16,28 +16,15 @@ fi
 
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
     if ACTIVE_ENV="$(cd -- "${VIRTUAL_ENV}" 2>/dev/null && pwd)" && [[ "${ACTIVE_ENV}" == "${VENV_DIR}" ]]; then
+        ACTIVE_PYTHON_VERSION="$("${VENV_DIR}/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')"
+        if [[ "${ACTIVE_PYTHON_VERSION}" != "3.11" ]]; then
+            echo "The active .venv uses Python ${ACTIVE_PYTHON_VERSION}; recreate it with Python 3.11 before setup." >&2
+            exit 1
+        fi
         echo "Already running in the requested environment: ${VENV_DIR}"
         exit 0
     fi
 fi
 
-PYTHON_BIN="${PYTHON:-python3}"
-VENV_PYTHON="${VENV_DIR}/bin/python"
-
-if [[ ! -x "${VENV_PYTHON}" ]]; then
-    mkdir -p "$(dirname -- "${VENV_DIR}")"
-    echo "Creating virtual environment: ${VENV_DIR}"
-    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-fi
-
-if [[ ! -x "${VENV_PYTHON}" ]]; then
-    echo "Virtual environment Python was not found: ${VENV_PYTHON}" >&2
-    exit 1
-fi
-
-echo "Installing project dependencies, including the CUDA 12.1 PyTorch build..."
-"${VENV_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements.txt"
-"${VENV_PYTHON}" -m pip install -e "${REPOSITORY_ROOT}"
-
-echo "Setup complete. Activate the environment with:"
-echo "  source \"${VENV_DIR}/bin/activate\""
+export VENV_DIR
+exec "${SCRIPT_DIR}/quantize_qig.sh" --setup-only

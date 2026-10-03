@@ -84,8 +84,8 @@ def load_qig_quantized_model(
         from lmms_eval.models import get_model
     except ImportError as error:
         raise ImportError(
-            "QIG dependencies are unavailable. Run this loader with the isolated QIG "
-            "environment created by scripts/quantize_qig.sh."
+            "The model loading dependencies are unavailable. Run scripts/set_up.sh "
+            "to install the project environment."
         ) from error
 
     model_class = get_model("llava")
