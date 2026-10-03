@@ -59,22 +59,31 @@ def register_layernorm_hooks(
 
 
 def layerwise_pca(
-    activations: dict[int, torch.Tensor],
-    image_mask: torch.Tensor,
-    text_mask: torch.Tensor,
+    activation_samples: list[dict[int, torch.Tensor]],
+    token_masks: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-    """Project the combined image and text token cloud to two PCA components."""
-    projected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    for layer_index, activation in sorted(activations.items()):
-        if activation.shape[0] != image_mask.numel() or activation.shape[0] != text_mask.numel():
-            raise ValueError(
-                f"Layer {layer_index} has {activation.shape[0]} token positions, "
-                f"but masks have {image_mask.numel()} and {text_mask.numel()}"
-            )
+    """Project pooled image and text tokens to two PCA components per layer."""
+    if not activation_samples or len(activation_samples) != len(token_masks):
+        raise ValueError("Each activation sample must have a matching pair of token masks")
 
-        selected_mask = image_mask | text_mask
-        values = activation[selected_mask].float()
-        labels = image_mask[selected_mask]
+    projected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    layer_indices = sorted(activation_samples[0])
+    for layer_index in layer_indices:
+        token_chunks: list[torch.Tensor] = []
+        label_chunks: list[torch.Tensor] = []
+        for activations, (image_mask, text_mask) in zip(activation_samples, token_masks):
+            activation = activations[layer_index]
+            if activation.shape[0] != image_mask.numel() or activation.shape[0] != text_mask.numel():
+                raise ValueError(
+                    f"Layer {layer_index} has {activation.shape[0]} token positions, "
+                    f"but masks have {image_mask.numel()} and {text_mask.numel()}"
+                )
+            selected_mask = image_mask | text_mask
+            token_chunks.append(activation[selected_mask].float())
+            label_chunks.append(image_mask[selected_mask])
+
+        values = torch.cat(token_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)
         if values.shape[0] < 3:
             raise ValueError(f"Layer {layer_index} has too few image/text tokens for 2D PCA")
 
@@ -92,8 +101,9 @@ def layerwise_pca(
 
 def show_activation_pca(
     projected: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    sample_number: int,
+    figure_title: str,
     save_dir: Path | None = None,
+    output_name: str = "activation_pca.png",
 ) -> None:
     """Display one image/text PCA scatter plot for every decoder layer."""
     if not projected:
@@ -106,7 +116,7 @@ def show_activation_pca(
         rows,
         columns,
         figsize=(columns * 3.3, rows * 2.8),
-        constrained_layout=True,
+        constrained_layout=False,
         squeeze=False,
     )
 
@@ -143,14 +153,20 @@ def show_activation_pca(
         axis.axis("off")
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="upper center", ncol=2)
-    figure.suptitle(
-        f"Sample {sample_number}: post-input-LayerNorm activations",
-        y=1.02,
+    figure.subplots_adjust(top=0.88, hspace=0.45, wspace=0.35)
+    figure.suptitle(figure_title, y=0.99)
+    figure.legend(
+        handles,
+        labels,
+        title="Token type",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.955),
+        ncol=2,
+        frameon=True,
     )
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
-        output_path = save_dir / f"sample_{sample_number:04d}_activation_pca.png"
+        output_path = save_dir / output_name
         figure.savefig(output_path, dpi=160, bbox_inches="tight")
         print(f"Saved PCA figure to {output_path}")
     plt.show()
@@ -177,7 +193,13 @@ def parse_args() -> argparse.Namespace:
         "--save-dir",
         type=Path,
         default=None,
-        help="Optionally save each sample's PCA figure to this directory.",
+        help="Optionally save PCA figure(s) to this directory.",
+    )
+    parser.add_argument(
+        "--plot-scope",
+        choices=("all", "per-sample"),
+        default="all",
+        help="Pool all selected samples into each layer's PCA (default), or plot each sample separately.",
     )
     parser.add_argument("--timing", action="store_true", help="Print elapsed time for each stage and sample.")
     return parser.parse_args()
@@ -258,6 +280,8 @@ def main() -> int:
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
         print(f"Forwarding {len(dataset):,} samples one at a time...")
+        activation_samples: list[dict[int, torch.Tensor]] = []
+        token_masks: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
             for index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
@@ -311,28 +335,49 @@ def main() -> int:
                 if not active_sample["activations"]:
                     raise RuntimeError("No layernorm hooks captured activations")
 
-                # =============================================================
-                # 5. ANALYSE ACTIVATIONS FOR THIS SAMPLE
-                # =============================================================
-                # Run PCA before the next forward pass, then release this
-                # sample's activations instead of retaining all samples in RAM.
-                analyse_started = time.perf_counter() if args.timing else None
-                projected = layerwise_pca(
-                    active_sample["activations"],
-                    image_mask,
-                    text_mask,
-                )
-                print(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers")
-                show_activation_pca(projected, index, args.save_dir)
-                if analyse_started is not None:
-                    print(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
+                if args.plot_scope == "all":
+                    activation_samples.append(active_sample["activations"])
+                    token_masks.append((image_mask, text_mask))
+                else:
+                    analyse_started = time.perf_counter() if args.timing else None
+                    projected = layerwise_pca(
+                        [active_sample["activations"]],
+                        [(image_mask, text_mask)],
+                    )
+                    print(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers")
+                    show_activation_pca(
+                        projected,
+                        f"Sample {index}: post-input-LayerNorm activations",
+                        args.save_dir,
+                        output_name=f"sample_{index:04d}_activation_pca.png",
+                    )
+                    if analyse_started is not None:
+                        print(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
                 if sample_started is not None:
                     print(f"[timing] Sample {index} total: {time.perf_counter() - sample_started:.2f} s")
-                del outputs, prompt_inputs, prompt_kwargs, batch, prepared, projected, sample
+                del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
         finally:
             for handle in hook_handles:
                 handle.remove()
 
+        # =====================================================================
+        # 5. ANALYSE ACTIVATIONS
+        # =====================================================================
+        if args.plot_scope == "all":
+            analyse_started = time.perf_counter() if args.timing else None
+            projected = layerwise_pca(activation_samples, token_masks)
+            print(
+                f"PCA calculated for {len(projected)} layers using "
+                f"{len(activation_samples)} samples"
+            )
+            show_activation_pca(
+                projected,
+                f"All {len(activation_samples)} samples: post-input-LayerNorm activations",
+                args.save_dir,
+                output_name="all_samples_activation_pca.png",
+            )
+            if analyse_started is not None:
+                print(f"[timing] Pooled PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
         print("Layer-wise image/text activation PCA complete.")
         if total_started is not None:
             print(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
