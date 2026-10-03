@@ -1,20 +1,40 @@
-# Model execution and LLaVA 1.5 processing
-# The reported machine exposes an NVIDIA driver compatible with CUDA 12.2.
-# Use a CUDA 12.1 wheel so it can run with that driver (the installed cu130
-# wheel requires a newer driver). Keep this index for the pinned GPU build.
+# Shared project and quantization environment. Use Python 3.11 on Linux with
+# the NVIDIA CUDA 12.1 wheels, compatible with the reported CUDA 12.2 driver.
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1+cu121
-transformers>=4.45.0,<5.0.0
-accelerate>=1.0.0
-sentencepiece>=0.2.0
-safetensors>=0.4.0
+torchvision==0.20.1+cu121
 
-# Dataset loading, filtering, caching, and Hub downloads
-datasets>=3.0.0
+# Transformers, model loading, and dataset access
+transformers==4.49.0
+accelerate>=0.29.1
+datasets==2.16.1
 huggingface_hub>=0.26.0
-PyYAML>=6.0.1
+tokenizers>=0.21.0,<0.22.0
+safetensors>=0.4.0
+sentencepiece==0.1.99
+protobuf==3.20.3
 
-# Image and numerical utilities
+# Images, plots, numerics, and configuration
 Pillow>=10.0.0
-numpy>=1.26.0
+numpy==1.26.4
 matplotlib>=3.8.0
+PyYAML>=6.0.1
+packaging>=23.0
+tqdm>=4.66.0
+
+# Imports reached through the quantization and evaluation source packages
+evaluate>=0.4.0
+einops>=0.6.1
+ftfy>=6.1.0
+hf-transfer>=0.1.8
+imageio>=2.31.0
+loguru>=0.7.0
+opencv-python-headless>=4.8.0
+pytz>=2023.3
+requests>=2.31.0
+sqlitedict>=2.1.0
+timm>=0.9.0
+av>=11.0.0
+decord>=0.6.0
+shortuuid>=1.0.11
+jinja2>=3.1.0

@@ -11,8 +11,10 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from PIL import Image
 import torch.nn.functional as F
 import torch
+import numpy as np
 from datasets import Dataset
 from huggingface_hub import snapshot_download
 
@@ -23,10 +25,9 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import (  # noqa: E402
     get_data_paths,
-    get_user_assistant_text,
     load_sharegpt4v_dataset,
 )
-from attention_quantization.models import load_huggingface_model  # noqa: E402
+from attention_quantization.models import load_model  # noqa: E402
 
 
 def register_attention_hooks(
@@ -81,8 +82,7 @@ def register_attention_hooks(
 
 
 def show_iga_heatmap(
-    encoded: Any,
-    processor: Any,
+    source_image: Image.Image,
     layer_iga_scores: dict[str, torch.Tensor],
     sample_number: int,
     heatmap_only: bool = False,
@@ -98,13 +98,14 @@ def show_iga_heatmap(
             f"Cannot reshape {token_count} image-token scores into a square patch grid"
         )
 
-    # Convert the processor-normalized image back to display colors so its
-    # geometry matches the image patches represented by the IGA scores.
-    pixel_values = encoded["pixel_values"][0].detach().cpu().float()
-    image_processor = processor.image_processor
-    mean = torch.tensor(image_processor.image_mean).view(-1, 1, 1)
-    std = torch.tensor(image_processor.image_std).view(-1, 1, 1)
-    image = (pixel_values * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+    # QIG's classic LLaVA preprocessing pads to square before resizing.
+    source_image = source_image.convert("RGB")
+    width, height = source_image.size
+    side = max(width, height)
+    background = tuple(round(value * 255) for value in (0.48145466, 0.4578275, 0.40821073))
+    square_image = Image.new("RGB", (side, side), background)
+    square_image.paste(source_image, ((side - width) // 2, (side - height) // 2))
+    image = np.asarray(square_image).astype(np.float32) / 255.0
 
     image_height, image_width = image.shape[:2]
     # Use a shared logarithmic scale so small IGA differences remain visible
@@ -220,33 +221,14 @@ def main() -> int:
         total_started = time.perf_counter() if args.timing else None
 
         # =====================================================================
-        # 1. LOAD MODEL
-        # =====================================================================
-        model_started = time.perf_counter() if args.timing else None
-        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
-        model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading or updating model {model_id} at {model_dir}")
-        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
-
-        model, processor = load_huggingface_model(
-            model_dir,
-            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
-            torch_dtype=model_config.get("torch_dtype", "float16"),
-            device_map=model_config.get("device_map", "auto"),
-            attn_implementation=model_config.get("attn_implementation", "eager"),
-        )
-        if model_started is not None:
-            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
-
-        # =====================================================================
-        # 2. PREPARE CALIBRATION DATASET
+        # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
         dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
             source="coco",
             config_path=args.dataset_config,
             download_images=True,
+            existing_images_only=True,
         )
         if sample_count > len(dataset):
             raise ValueError(
@@ -266,6 +248,25 @@ def main() -> int:
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
         if dataset_started is not None:
             print(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
+
+        # =====================================================================
+        # 2. LOAD MODEL
+        # =====================================================================
+        model_started = time.perf_counter() if args.timing else None
+        model_id = model_config["model_id"]
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading or updating model {model_id} at {model_dir}")
+        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+
+        model, input_adapter = load_model(
+            model_dir,
+            model_config,
+            repository_root=REPOSITORY_ROOT,
+        )
+        model.config.output_attentions = True
+        if model_started is not None:
+            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
         # 3. REGISTER ATTENTION HOOKS
@@ -305,31 +306,29 @@ def main() -> int:
                 active_sample["captured"] = 0
                 active_sample["iga"] = {}
 
-                user_text, assistant_text = get_user_assistant_text(sample)
-                prompt = f"USER: <image>\n{user_text}\nASSISTANT: {assistant_text}"
-                encoded = processor(
-                    text=prompt,
-                    images=sample["image"],
-                    return_tensors="pt",
+                user_text = next(
+                    (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"human", "user"}),
+                    "",
                 )
-                inputs = {key: value.to(model.device) for key, value in encoded.items()}
-                if "pixel_values" in inputs:
-                    inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
-                image_token_id = getattr(model.config, "image_token_id", None)
-                if image_token_id is None:
-                    image_token_id = model.config.image_token_index
-                image_mask = inputs["input_ids"][0] == image_token_id
-                attention_mask = inputs.get("attention_mask")
-                if attention_mask is None:
-                    text_mask = ~image_mask
-                else:
-                    text_mask = attention_mask[0].bool() & ~image_mask
+                assistant_text = next(
+                    (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"gpt", "assistant"}),
+                    "",
+                )
+                row = {
+                    "conversations": sample["conversations"],
+                    "id": sample.get("id", str(index)),
+                    "image": "local",
+                }
+                prepared = input_adapter.preprocess_data([sample["image"]], row)
+                batch = input_adapter.data_collator([prepared])
+                prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
+                attention_mask = prompt_kwargs["attention_mask"][0].bool()
+                image_mask = prompt_kwargs["vision_mask"][0].bool()
+                text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify text-query and image-key token positions")
-                # Ignore any prefix tokens before the image: causal attention
-                # prevents those queries from attending to image keys.
-                last_image_position = image_mask.nonzero(as_tuple=True)[0][-1]
-                text_mask &= torch.arange(text_mask.numel(), device=text_mask.device) > last_image_position
+                image_end = image_mask.nonzero(as_tuple=True)[0][-1]
+                text_mask &= torch.arange(text_mask.numel(), device=text_mask.device) > image_end
                 if not text_mask.any():
                     raise ValueError("No text query tokens occur after the image tokens")
                 active_sample["image_mask"] = image_mask
@@ -342,7 +341,13 @@ def main() -> int:
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
-                    outputs = model(**inputs, use_cache=False, output_attentions=True)
+                    outputs = input_adapter(
+                        inputs_embeds=prompt_inputs["inputs_embeds"],
+                        attention_mask=prompt_kwargs["attention_mask"],
+                        labels=prompt_kwargs["labels"],
+                        use_cache=False,
+                        return_dict=True,
+                    )
                 if forward_started is not None:
                     print(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if active_sample["captured"] == 0:
@@ -360,8 +365,7 @@ def main() -> int:
                     print(f"  ASSISTANT: {assistant_text}")
                     plot_started = time.perf_counter() if args.timing else None
                     show_iga_heatmap(
-                        encoded,
-                        processor,
+                        sample["image"],
                         layer_scores,
                         index,
                         heatmap_only=args.heatmap_only,
@@ -375,7 +379,7 @@ def main() -> int:
                     print(
                         f"  Saved {active_sample['captured']} attention matrices to {sample_dir}"
                     )
-                del outputs, inputs, encoded, sample
+                del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
         finally:
             for handle in hook_handles:
                 handle.remove()

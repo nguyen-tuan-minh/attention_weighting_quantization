@@ -31,7 +31,10 @@ attention_weighting_quantization/
 │       │   └── sharegpt4v.py
 │       ├── quantization/
 │       │   ├── methods.py
-│       │   └── attention.py
+│       │   ├── attention.py
+│       │   └── qig/
+│       │       ├── __init__.py
+│       │       └── runtime.py
 │       ├── evaluation/
 │       │   ├── metrics.py
 │       │   └── compare.py
@@ -54,6 +57,7 @@ attention_weighting_quantization/
 - `src/attention_quantization/model/` handles model-related setup and downloading.
 - `src/attention_quantization/data/sharegpt4v.py` exposes the ShareGPT4V loader and related image downloader. By default, the loader downloads COCO, filters to COCO records, and returns images as a lazy feature that decodes them on access. `scripts/prepare_dataset.py` optionally samples and saves the selected data.
 - `src/attention_quantization/quantization/` contains the quantization methods and attention-specific implementation.
+- `src/attention_quantization/quantization/qig/` contains the isolated adapter for the external QIG source; it imports QIG and LMMS-Eval lazily so the project's normal data and analysis tools do not require that environment.
 - `src/attention_quantization/evaluation/` compares original and quantized model behavior and computes evaluation metrics.
 - `scripts/investigate.py` is an entry point for evaluation and analysis. If attention behavior analysis grows into its own area, it can later become `src/attention_quantization/analysis/attention/`.
 - `configs/dataset.yaml` stores dataset locations as paths relative to the repository root. `configs/` also stores model and experiment settings.

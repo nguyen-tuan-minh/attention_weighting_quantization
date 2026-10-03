@@ -179,3 +179,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Downloaded models, datasets, quantization outputs, and the external QIG source.
+/data/
+/models/
+/.third_party/QIG/
+# Legacy environment path from the previous setup; current scripts use .venv.
+/.venv-qig/

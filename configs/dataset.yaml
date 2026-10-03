@@ -3,6 +3,12 @@ data_root: data
 raw_dir: data/raw
 cache_dir: data/cache/huggingface
 processed_dir: data/processed
+# Maximum image files to extract from a downloaded image archive.
+# Set to null to extract every image.
+max_images: 1024
+# Random selection seed for archive images; null gives a different subset per run.
+download_seed: null
 calibration_samples: 2
 calibration_seed: null
-calibration_output_dir: data/processed/llava15_coco_calibration
+calibration_source: coco
+calibration_output_dir: data/processed/calibration_samples

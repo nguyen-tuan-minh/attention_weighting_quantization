@@ -34,9 +34,11 @@ Dataset locations are set in [`configs/dataset.yaml`](configs/dataset.yaml). Rel
 ```bash
 python -m attention_quantization.data.sharegpt4v
 python -m attention_quantization.data.sharegpt4v --dataset gqa
+python -m attention_quantization.data.sharegpt4v --dataset coco
+python -m attention_quantization.data.sharegpt4v --dataset coco --max-images 50000 --seed 42
 ```
 
-The data module defaults to COCO. Calling the loader downloads the COCO archive if needed, loads the ShareGPT4V records, and connects their image paths to the local files:
+The data module defaults to COCO. `configs/dataset.yaml` sets `max_images: 1024` and `download_seed: null`, so downloading extracts a random subset of up to 1,024 images by default; a null seed chooses a new subset on each fresh extraction. Set a numeric `download_seed` for a repeatable subset. `--max-images` and `--seed` override these settings for one run. Setting `max_images: null` in the config extracts every image. The archive itself is still downloaded in full, then deleted after extraction. Existing image files are kept, so lowering the limit does not remove files already on disk. The loader also accepts `max_images=...` and `seed=...`, and removes each archive after extraction. An interrupted `.part` download is removed before retrying. QIG filters its calibration candidates to images present locally, so it can use a capped COCO extraction without attempting to fetch missing images.
 
 ```python
 from attention_quantization.data import load_sharegpt4v_dataset
@@ -54,30 +56,72 @@ The script saves the full COCO subset under the configured `processed_dir/shareg
 
 ### Run LLaVA calibration and inspect attention
 
-[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. The model ID, local download directory, dtype, device mapping, and attention implementation are in [`configs/model.yaml`](configs/model.yaml).
+[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. [`configs/model.yaml`](configs/model.yaml) selects the original `liuhaotian/llava-v1.5-7b` checkpoint and stores it under `models/llava-v1.5-7b`.
 
-The original forward-only script has three sections: load model, prepare calibration, and forward:
+On a new machine, create the shared Python 3.11 project environment with `bash scripts/set_up.sh`. Use `.venv/bin/python` for calibration and attention commands. If `.venv` already exists with another Python version, move or remove that environment before setup; virtual environments cannot be merged in place.
 
-```bash
-python scripts/run_calibration.py
-```
-
-The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. The script is divided into five sections: load model, prepare calibration, register hooks, forward, and analyse.
+To download only the model from the Hub, run:
 
 ```bash
-python scripts/investigate_attention.py                 # online analysis
-python scripts/investigate_attention.py --mode save     # save attention maps
-python scripts/investigate_attention.py --timing        # print step durations
-python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
+.venv/bin/hf download liuhaotian/llava-v1.5-7b --local-dir models/llava-v1.5-7b
 ```
 
-Both scripts forward each image with its ShareGPT4V user prompt and assistant caption. Images are decoded one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
+The forward-only script prepares and saves the calibration dataset first. Its downloader extracts COCO and removes the ZIP before it downloads or loads LLaVA. The script then forwards the selected samples:
+
+```bash
+.venv/bin/python scripts/run_calibration.py
+```
+
+The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. It prepares the dataset and removes the COCO ZIP before downloading or loading LLaVA. Its five sections are: prepare calibration, load model, register hooks, forward, and analyse.
+
+```bash
+.venv/bin/python scripts/investigate_attention.py                 # online analysis
+.venv/bin/python scripts/investigate_attention.py --mode save     # save attention maps
+.venv/bin/python scripts/investigate_attention.py --timing        # print step durations
+.venv/bin/python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
+```
+
+Both scripts first filter calibration records to images that exist locally, then sample from that available subset; this works with the configured 1,024-image extraction and skips missing COCO files. They forward each image with its ShareGPT4V user prompt and assistant caption, decoding images one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
 
 ### Reusing components with other models or datasets
 
-Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/huggingface.py` loads a Transformers model and processor, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
+Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/loader.py` selects the configured model loader, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
 
-The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. To try a different model checkpoint, update `model_id`, `model_dir`, and `model_class` in `configs/model.yaml`. The default `AutoModelForVision2Seq` covers compatible Transformers vision-to-sequence models; `LlavaForConditionalGeneration` is also supported for checkpoints that require the explicit class. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
+The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. This QIG workflow currently targets the original `liuhaotian/llava-v1.5-7b` checkpoint format. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
+
+### Run QIG quantization
+
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, uses the shared Python 3.11 `.venv`, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected method against the original `liuhaotian/llava-v1.5-7b` model. When `--base-model` is omitted, it downloads the model from `configs/model.yaml` into `models/llava-v1.5-7b` if that directory does not already contain a config and weight file. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
+
+```bash
+bash scripts/quantize_qig.sh \
+  --output-dir models/quantized/llava-1.5-7b-qig-w4g128 \
+  --samples 128 \
+  --seed 42 \
+  --method qig \
+  --w-bit 4 \
+  --w-group 128
+```
+
+The output directory must not already exist unless `--overwrite` is passed. Supported `--method` values are `qig`, `mbq`, `awq`, `smoothquant`, `rtn`, and `gptq`, matching the methods exposed by QIG's quantization wrapper. Add `--reweight` or `--distort` for methods that support those options (`qig` and `mbq`). Use `--a-bit`, `--alpha`, and `--percdamp` to set activation precision, SmoothQuant scaling, and GPTQ damping. RTN does not need calibration data; the other methods sample ShareGPT4V COCO. The script uses micro batches of one by default to limit GPU memory use; change this with `--micro-batch-size` if needed.
+
+The QIG integration is in `src/attention_quantization/quantization/qig/`. The shared `requirements.txt` pins PyTorch 2.5.1 with CUDA 12.1 and includes the dependencies used by QIG, LLaVA, and the project scripts. Setup installs the three source checkouts editable with dependency resolution disabled, so QIG's broader requirements cannot replace the selected PyTorch build. Source checkouts stay under `.third_party/QIG`; all Python packages use `.venv`.
+
+There is one upstream caveat: QIG's README model list does not advertise classic `llava`, but the checked-in QIG package contains an `llava_v15` processor and its companion LMMS-Eval fork registers a `llava` model adapter. This integration connects those two source paths directly for LLaVA 1.5. The source and dependency versions are recorded in each artifact; the combination still needs a run on the target CUDA machine to confirm runtime compatibility.
+
+QIG's pseudo quantization path saves scale parameters rather than exporting packed low bit weights. This script saves the resulting model checkpoint, method scales when applicable, the sampled calibration JSONL, and run metadata in the chosen directory. For pseudo-quantized weights, model tensors remain floating point, so the research checkpoint does not provide packed INT4 storage savings. The source implementation and its model adapter are documented in the [QIG repository](https://github.com/ucas-xiang/QIG).
+
+Load the saved checkpoint with the shared project environment:
+
+```python
+from attention_quantization.models import load_qig_quantized_model
+
+wrapper = load_qig_quantized_model("models/quantized/llava-1.5-7b-qig-w4g128")
+model = wrapper._model
+tokenizer = wrapper._tokenizer
+```
+
+The loader uses QIG's LMMS-Eval `llava` adapter, so call it from `.venv` after running setup.
 
 ## Documentation
 

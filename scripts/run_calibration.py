@@ -1,4 +1,4 @@
-"""Download LLaVA, prepare a COCO subset, and forward samples individually."""
+"""Load the configured model and forward calibration samples individually."""
 
 from __future__ import annotations
 
@@ -16,15 +16,14 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import (  # noqa: E402
     get_data_paths,
-    get_user_assistant_text,
     load_sharegpt4v_dataset,
 )
-from attention_quantization.models import load_huggingface_model  # noqa: E402
+from attention_quantization.models import load_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download LLaVA 1.5 7B, prepare calibration data, and forward each sample."
+        description="Download the configured model, prepare calibration data, and forward each sample."
     )
     parser.add_argument(
         "--dataset-config",
@@ -38,7 +37,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured seed.")
-    parser.add_argument("--download-model-only", action="store_true")
+    parser.add_argument(
+        "--download-model-only",
+        action="store_true",
+        help="Prepare the dataset first, download the model, then exit without forwarding samples.",
+    )
     return parser.parse_args()
 
 
@@ -57,29 +60,20 @@ def main() -> int:
             raise ValueError("calibration_seed must be an integer or null")
 
         # ==================================================================
-        # 1. LOAD MODEL
+        # 1. PREPARE CALIBRATION DATASET
         # ==================================================================
-        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
-        model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading or updating model {model_id} at {model_dir}")
-        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
-        if args.download_model_only:
-            print("Model download complete.")
-            return 0
-
-        # ==================================================================
-        # 2. PREPARE CALIBRATION DATASET
-        # ==================================================================
-        print("Loading COCO ShareGPT4V data and ensuring COCO images are available...")
+        dataset_source = dataset_config.get("calibration_source", "coco")
+        print(f"Loading ShareGPT4V {dataset_source} data and ensuring images are available...")
         dataset = load_sharegpt4v_dataset(
-            source="coco",
+            source=dataset_source,
             config_path=args.dataset_config,
             download_images=True,
+            existing_images_only=True,
         )
         if sample_count > len(dataset):
             raise ValueError(
-                f"Requested {sample_count} samples, but only {len(dataset)} COCO records are available"
+                f"Requested {sample_count} samples, but only {len(dataset)} "
+                f"{dataset_source} records are available"
             )
         if seed is not None or sample_count < len(dataset):
             dataset = dataset.shuffle(seed=seed).select(range(sample_count))
@@ -87,19 +81,29 @@ def main() -> int:
         calibration_dir = repository_path(
             dataset_config.get(
                 "calibration_output_dir",
-                data_paths["processed_dir"] / "llava15_coco_calibration",
+                data_paths["processed_dir"] / "calibration_samples",
             )
         )
         calibration_dir.parent.mkdir(parents=True, exist_ok=True)
         dataset.save_to_disk(str(calibration_dir))
         print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
 
-        model, processor = load_huggingface_model(
+        # ==================================================================
+        # 2. DOWNLOAD AND LOAD MODEL
+        # ==================================================================
+        model_id = model_config["model_id"]
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading or updating model {model_id} at {model_dir}")
+        snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+        if args.download_model_only:
+            print("Dataset preparation and model download complete.")
+            return 0
+
+        model, input_adapter = load_model(
             model_dir,
-            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
-            torch_dtype=model_config.get("torch_dtype", "float16"),
-            device_map=model_config.get("device_map", "auto"),
-            attn_implementation=model_config.get("attn_implementation"),
+            model_config,
+            repository_root=REPOSITORY_ROOT,
         )
 
         # ==================================================================
@@ -107,21 +111,21 @@ def main() -> int:
         # ==================================================================
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         for index, sample in enumerate(dataset, start=1):
-            user_text, assistant_text = get_user_assistant_text(sample)
-            prompt = f"USER: <image>\n{user_text}\nASSISTANT: {assistant_text}"
-            encoded = processor(
-                text=prompt,
-                images=sample["image"],
-                return_tensors="pt",
-            )
-            inputs = {key: value.to(model.device) for key, value in encoded.items()}
-            if "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
+            row = {"conversations": sample["conversations"], "id": sample.get("id", str(index)), "image": "local"}
+            prepared = input_adapter.preprocess_data([sample["image"]], row)
+            batch = input_adapter.data_collator([prepared])
+            prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
             with torch.inference_mode():
-                outputs = model(**inputs, use_cache=False)
+                outputs = input_adapter(
+                    inputs_embeds=prompt_inputs["inputs_embeds"],
+                    attention_mask=prompt_kwargs["attention_mask"],
+                    labels=prompt_kwargs["labels"],
+                    use_cache=False,
+                    return_dict=True,
+                )
             print(f"[{index}/{len(dataset)}] logits shape: {tuple(outputs.logits.shape)}")
-            del outputs, inputs, encoded, sample
+            del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
 
         print("Calibration forward passes complete.")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "attention-weighting-quantization"
 version = "0.1.0"
 description = "Research code for attention weighting quantization in vision-language models"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.12"
 
 [tool.setuptools.packages.find]
 where = ["src"]
