@@ -61,6 +61,9 @@ def register_layernorm_hooks(
 def layerwise_pca(
     activation_samples: list[dict[int, torch.Tensor]],
     token_masks: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    balance_pca: bool = False,
+    seed: int | None = None,
 ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
     """Project pooled image and text tokens to two PCA components per layer."""
     if not activation_samples or len(activation_samples) != len(token_masks):
@@ -87,15 +90,37 @@ def layerwise_pca(
         if values.shape[0] < 3:
             raise ValueError(f"Layer {layer_index} has too few image/text tokens for 2D PCA")
 
+        fit_values = values
+        if balance_pca:
+            image_indices = labels.nonzero(as_tuple=True)[0]
+            text_indices = (~labels).nonzero(as_tuple=True)[0]
+            balanced_count = min(image_indices.numel(), text_indices.numel())
+            if balanced_count == 0:
+                raise ValueError(f"Layer {layer_index} does not contain both token types")
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device="cpu").manual_seed(seed + layer_index)
+            image_indices = image_indices[
+                torch.randperm(image_indices.numel(), generator=generator)[:balanced_count]
+            ]
+            text_indices = text_indices[
+                torch.randperm(text_indices.numel(), generator=generator)[:balanced_count]
+            ]
+            fit_indices = torch.cat((image_indices, text_indices))
+            fit_values = values[fit_indices]
+
         # Randomized low-rank PCA avoids forming a hidden_size x hidden_size
-        # covariance matrix for every transformer layer.
-        scores, singular_values, _ = torch.pca_lowrank(
-            values,
+        # covariance matrix for every transformer layer. In balanced mode,
+        # fit the axes on an equal number of tokens per modality, then project
+        # every token into those same axes for the plot.
+        _, _, components = torch.pca_lowrank(
+            fit_values,
             q=2,
             center=True,
             niter=2,
         )
-        projected[layer_index] = (scores * singular_values, labels)
+        coordinates = (values - fit_values.mean(dim=0)) @ components
+        projected[layer_index] = (coordinates, labels)
     return projected
 
 
@@ -138,9 +163,11 @@ def show_activation_pca(
         axis.scatter(
             text_points[:, 0],
             text_points[:, 1],
-            s=15,
+            s=24,
             alpha=0.8,
             color=text_color,
+            marker="x",
+            linewidths=0.8,
             label="Text tokens",
             rasterized=True,
         )
@@ -200,6 +227,11 @@ def parse_args() -> argparse.Namespace:
         choices=("all", "per-sample"),
         default="all",
         help="Pool all selected samples into each layer's PCA (default), or plot each sample separately.",
+    )
+    parser.add_argument(
+        "--balance-pca",
+        action="store_true",
+        help="Fit each PCA using equal numbers of image and text tokens; plot all tokens.",
     )
     parser.add_argument("--timing", action="store_true", help="Print elapsed time for each stage and sample.")
     return parser.parse_args()
@@ -343,6 +375,8 @@ def main() -> int:
                     projected = layerwise_pca(
                         [active_sample["activations"]],
                         [(image_mask, text_mask)],
+                        balance_pca=args.balance_pca,
+                        seed=seed,
                     )
                     print(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers")
                     show_activation_pca(
@@ -365,10 +399,16 @@ def main() -> int:
         # =====================================================================
         if args.plot_scope == "all":
             analyse_started = time.perf_counter() if args.timing else None
-            projected = layerwise_pca(activation_samples, token_masks)
+            projected = layerwise_pca(
+                activation_samples,
+                token_masks,
+                balance_pca=args.balance_pca,
+                seed=seed,
+            )
+            balance_label = " with balanced PCA fitting" if args.balance_pca else ""
             print(
                 f"PCA calculated for {len(projected)} layers using "
-                f"{len(activation_samples)} samples"
+                f"{len(activation_samples)} samples{balance_label}"
             )
             show_activation_pca(
                 projected,
