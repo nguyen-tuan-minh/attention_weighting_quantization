@@ -154,20 +154,20 @@ def show_activation_pca(
         axis.scatter(
             image_points[:, 0],
             image_points[:, 1],
-            s=8,
-            alpha=0.55,
-            color=image_color,
+            s=28,
+            facecolors="none",
+            edgecolors=image_color,
+            linewidths=0.8,
             label="Image tokens",
             rasterized=True,
         )
         axis.scatter(
             text_points[:, 0],
             text_points[:, 1],
-            s=24,
+            s=10,
             alpha=0.8,
             color=text_color,
-            marker="x",
-            linewidths=0.8,
+            marker="o",
             label="Text tokens",
             rasterized=True,
         )
