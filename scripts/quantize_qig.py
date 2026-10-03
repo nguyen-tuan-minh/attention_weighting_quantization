@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -30,6 +31,69 @@ def progress(message: str, started_at: float | None = None) -> float:
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}{elapsed}", flush=True)
     return now
+
+
+def runtime_memory_summary(torch: Any) -> str:
+    """Return a compact host and CUDA memory snapshot when the OS exposes it."""
+    details: list[str] = []
+    try:
+        memory_info: dict[str, int] = {}
+        with Path("/proc/meminfo").open(encoding="utf-8") as source:
+            for line in source:
+                key, value, *_ = line.split()
+                if key in {"MemTotal:", "MemAvailable:"}:
+                    memory_info[key] = int(value) * 1024
+        with Path("/proc/self/status").open(encoding="utf-8") as source:
+            for line in source:
+                if line.startswith("VmRSS:"):
+                    memory_info["VmRSS:"] = int(line.split()[1]) * 1024
+                    break
+        to_gib = lambda value: value / (1024**3)
+        details.append(
+            "RAM "
+            f"available {to_gib(memory_info['MemAvailable:']):.1f}/"
+            f"{to_gib(memory_info['MemTotal:']):.1f} GiB, "
+            f"process RSS {to_gib(memory_info['VmRSS:']):.1f} GiB"
+        )
+    except (OSError, KeyError, ValueError):
+        pass
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        allocated = torch.cuda.memory_allocated(0)
+        reserved = torch.cuda.memory_reserved(0)
+        to_gib = lambda value: value / (1024**3)
+        details.append(
+            "CUDA: "
+            f"free {to_gib(free_bytes):.1f}/{to_gib(total_bytes):.1f} GiB, "
+            f"this process allocated {to_gib(allocated):.1f} GiB "
+            f"(reserved {to_gib(reserved):.1f} GiB)"
+        )
+    except (RuntimeError, AssertionError):
+        pass
+    return " | ".join(details) if details else "memory details unavailable"
+
+
+def report_model_transfer(process_model: Any, method_name: str, torch: Any) -> None:
+    """Add progress messages around QIG's model device transfers."""
+    original_method = getattr(process_model, method_name, None)
+    if not callable(original_method):
+        return
+
+    action = "CPU" if method_name == "to_cpu" else "CUDA"
+
+    def wrapped_method() -> Any:
+        progress(f"Moving model to {action}")
+        stage_started = time.perf_counter()
+        try:
+            return original_method()
+        finally:
+            progress(
+                f"Model device transfer finished ({runtime_memory_summary(torch)})",
+                stage_started,
+            )
+
+    setattr(process_model, method_name, wrapped_method)
 
 
 def parse_args() -> argparse.Namespace:
@@ -335,9 +399,32 @@ def main() -> int:
             model="llava",
             model_args=model_args,
         )
+        report_model_transfer(process_model, "to_cpu", torch)
+        report_model_transfer(process_model, "to_cuda", torch)
+
         progress(f"Running {args.method.upper()} quantization")
         stage_started = time.perf_counter()
-        qig.qwrapper(process_model, prompt_inputs, prompt_kwargs, qig_args)
+        progress(f"Quantization resources | {runtime_memory_summary(torch)}")
+        monitor_stop = threading.Event()
+
+        def report_quantization_progress() -> None:
+            while not monitor_stop.wait(5.0):
+                progress(
+                    f"{args.method.upper()} processing | {runtime_memory_summary(torch)}",
+                    stage_started,
+                )
+
+        monitor = threading.Thread(
+            target=report_quantization_progress,
+            name="quantization-progress",
+            daemon=True,
+        )
+        monitor.start()
+        try:
+            qig.qwrapper(process_model, prompt_inputs, prompt_kwargs, qig_args)
+        finally:
+            monitor_stop.set()
+            monitor.join(timeout=1.0)
         progress("Quantization complete", stage_started)
 
         # QIG uses pseudo quantization: the weights are rounded onto the
