@@ -56,34 +56,42 @@ The script saves the full COCO subset under the configured `processed_dir/shareg
 
 ### Run LLaVA calibration and inspect attention
 
-[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. The model ID, local download directory, dtype, device mapping, and attention implementation are in [`configs/model.yaml`](configs/model.yaml).
+[`configs/dataset.yaml`](configs/dataset.yaml) sets `calibration_samples` to `2` and `calibration_seed` to `null` by default. [`configs/model.yaml`](configs/model.yaml) selects the original `liuhaotian/llava-v1.5-7b` checkpoint and stores it under `models/llava-v1.5-7b-qig`. These workflows load it through QIG's companion LLaVA implementation; this checkpoint is not loaded with Transformers `AutoModelForVision2Seq`.
+
+On a new machine, create the QIG environment first with `bash scripts/quantize_qig.sh --setup-only`. Use `.venv-qig/bin/python` for the calibration and attention commands below.
+
+To download only the model from the Hub, run:
+
+```bash
+.venv-qig/bin/hf download liuhaotian/llava-v1.5-7b --local-dir models/llava-v1.5-7b-qig
+```
 
 The forward-only script prepares and saves the calibration dataset first. Its downloader extracts COCO and removes the ZIP before it downloads or loads LLaVA. The script then forwards the selected samples:
 
 ```bash
-python scripts/run_calibration.py
+.venv-qig/bin/python scripts/run_calibration.py
 ```
 
 The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. It prepares the dataset and removes the COCO ZIP before downloading or loading LLaVA. Its five sections are: prepare calibration, load model, register hooks, forward, and analyse.
 
 ```bash
-python scripts/investigate_attention.py                 # online analysis
-python scripts/investigate_attention.py --mode save     # save attention maps
-python scripts/investigate_attention.py --timing        # print step durations
-python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
+.venv-qig/bin/python scripts/investigate_attention.py                 # online analysis
+.venv-qig/bin/python scripts/investigate_attention.py --mode save     # save attention maps
+.venv-qig/bin/python scripts/investigate_attention.py --timing        # print step durations
+.venv-qig/bin/python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
 ```
 
 Both scripts first filter calibration records to images that exist locally, then sample from that available subset; this works with the configured 1,024-image extraction and skips missing COCO files. They forward each image with its ShareGPT4V user prompt and assistant caption, decoding images one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
 
 ### Reusing components with other models or datasets
 
-Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/huggingface.py` loads a Transformers model and processor, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
+Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/qig_loader.py` loads the original LLaVA checkpoint through QIG, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
 
-The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. To try a different model checkpoint, update `model_id`, `model_dir`, and `model_class` in `configs/model.yaml`. The default `AutoModelForVision2Seq` covers compatible Transformers vision-to-sequence models; `LlavaForConditionalGeneration` is also supported for checkpoints that require the explicit class. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
+The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. This QIG workflow currently targets the original `liuhaotian/llava-v1.5-7b` checkpoint format. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
 
 ### Run QIG quantization
 
-On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against LLaVA 1.5. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, creates a separate Python 3.11 environment, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected QIG method against the original `liuhaotian/llava-v1.5-7b` model. When `--base-model` is omitted, it downloads the model from `configs/model.yaml` into `models/llava-v1.5-7b-qig` if that directory does not already contain a config and weight file. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
 
 ```bash
 bash scripts/quantize_qig.sh \

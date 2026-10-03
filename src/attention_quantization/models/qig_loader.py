@@ -1,4 +1,4 @@
-"""Load checkpoints produced by ``scripts/quantize_qig.sh``."""
+"""Load original and QIG-quantized LLaVA checkpoints."""
 
 from __future__ import annotations
 
@@ -7,6 +7,50 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def load_qig_llava_model(
+    checkpoint_dir: str | Path,
+    *,
+    qig_source_dir: str | Path,
+    device: str = "cuda:0",
+    attn_implementation: str = "eager",
+) -> tuple[Any, Any]:
+    """Load original LLaVA 1.5 weights with QIG's LLaVA implementation.
+
+    Returns the LMMS-Eval model wrapper and QIG's multimodal processing model.
+    This path is needed for ``liuhaotian/llava-v1.5-7b`` checkpoints, whose
+    architecture is not the Transformers ``LlavaForConditionalGeneration``.
+    """
+    from attention_quantization.quantization.qig import load_qig_runtime
+
+    checkpoint = Path(checkpoint_dir).expanduser().resolve()
+    has_weights = any(checkpoint.glob("pytorch_model*.bin")) or any(checkpoint.glob("model*.safetensors"))
+    if not (checkpoint / "config.json").is_file() or not has_weights:
+        raise FileNotFoundError(f"Complete LLaVA checkpoint files were not found under {checkpoint}")
+    model_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    architectures = model_config.get("architectures", [])
+    if model_config.get("model_type") != "llava" or (
+        architectures and not any(name == "LlavaLlamaForCausalLM" for name in architectures)
+    ):
+        raise ValueError(
+            f"{checkpoint} is not the original LLaVA 1.5 checkpoint format expected by QIG; "
+            f"found model_type={model_config.get('model_type')!r}, architectures={architectures!r}"
+        )
+
+    runtime = load_qig_runtime(qig_source_dir)
+    model_class = runtime.get_model("llava")
+    model_args = (
+        f"pretrained={checkpoint},model_name=llava-v1.5-7b,"
+        f"attn_implementation={attn_implementation}"
+    )
+    lm = model_class.create_from_arg_string(
+        model_args,
+        {"batch_size": 1, "device": device, "device_map": device},
+    )
+    process_class = runtime.get_process_model("llava")
+    process_model = process_class(lm._model, lm._tokenizer, lm._image_processor)
+    return lm, process_model
 
 
 def load_qig_quantized_model(

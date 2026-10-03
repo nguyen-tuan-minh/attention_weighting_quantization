@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -16,10 +17,9 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import (  # noqa: E402
     get_data_paths,
-    get_user_assistant_text,
     load_sharegpt4v_dataset,
 )
-from attention_quantization.models import load_huggingface_model  # noqa: E402
+from attention_quantization.models import load_qig_llava_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,8 +90,8 @@ def main() -> int:
         # ==================================================================
         # 2. DOWNLOAD AND LOAD MODEL
         # ==================================================================
-        model_id = model_config.get("model_id", "llava-hf/llava-1.5-7b-hf")
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
+        model_id = model_config.get("model_id", "liuhaotian/llava-v1.5-7b")
+        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b-qig"))
         model_dir.mkdir(parents=True, exist_ok=True)
         print(f"Downloading or updating model {model_id} at {model_dir}")
         snapshot_download(repo_id=model_id, local_dir=str(model_dir))
@@ -99,34 +99,35 @@ def main() -> int:
             print("Dataset preparation and model download complete.")
             return 0
 
-        model, processor = load_huggingface_model(
+        qig_source = Path(os.environ.get("QIG_SOURCE_DIR", REPOSITORY_ROOT / ".third_party" / "QIG"))
+        lm, process_model = load_qig_llava_model(
             model_dir,
-            model_class=model_config.get("model_class", "AutoModelForVision2Seq"),
-            torch_dtype=model_config.get("torch_dtype", "float16"),
-            device_map=model_config.get("device_map", "auto"),
-            attn_implementation=model_config.get("attn_implementation"),
+            qig_source_dir=qig_source,
+            device=model_config.get("device_map", "cuda:0"),
+            attn_implementation=model_config.get("attn_implementation", "eager"),
         )
+        model = lm._model
 
         # ==================================================================
         # 3. FORWARD CALIBRATION SAMPLES
         # ==================================================================
         print(f"Forwarding {len(dataset):,} samples one at a time...")
         for index, sample in enumerate(dataset, start=1):
-            user_text, assistant_text = get_user_assistant_text(sample)
-            prompt = f"USER: <image>\n{user_text}\nASSISTANT: {assistant_text}"
-            encoded = processor(
-                text=prompt,
-                images=sample["image"],
-                return_tensors="pt",
-            )
-            inputs = {key: value.to(model.device) for key, value in encoded.items()}
-            if "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
+            row = {"conversations": sample["conversations"], "id": sample.get("id", str(index)), "image": "local"}
+            prepared = process_model.preprocess_data([sample["image"]], row)
+            batch = process_model.data_collator([prepared])
+            prompt_inputs, prompt_kwargs = process_model.generate_input(batch)
 
             with torch.inference_mode():
-                outputs = model(**inputs, use_cache=False)
+                outputs = process_model(
+                    inputs_embeds=prompt_inputs["inputs_embeds"],
+                    attention_mask=prompt_kwargs["attention_mask"],
+                    labels=prompt_kwargs["labels"],
+                    use_cache=False,
+                    return_dict=True,
+                )
             print(f"[{index}/{len(dataset)}] logits shape: {tuple(outputs.logits.shape)}")
-            del outputs, inputs, encoded, sample
+            del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
 
         print("Calibration forward passes complete.")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:

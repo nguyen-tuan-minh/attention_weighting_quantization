@@ -9,6 +9,16 @@ QIG_VENV_DIR="${QIG_VENV_DIR:-${REPOSITORY_ROOT}/.venv-qig}"
 PYTHON311="${PYTHON311:-python3.11}"
 LLAVA_SOURCE_DIR="${QIG_SOURCE_DIR}/3rdparty/LLaVA-NeXT"
 LMMS_EVAL_SOURCE_DIR="${QIG_SOURCE_DIR}/3rdparty/lmms-eval"
+SETUP_ONLY=false
+FORWARD_ARGS=()
+
+for arg in "$@"; do
+    if [[ "${arg}" == "--setup-only" ]]; then
+        SETUP_ONLY=true
+    else
+        FORWARD_ARGS+=("${arg}")
+    fi
+done
 
 if [[ ! -d "${QIG_SOURCE_DIR}/.git" ]]; then
     if [[ -e "${QIG_SOURCE_DIR}" ]]; then
@@ -56,7 +66,7 @@ if [[ ! -x "${QIG_VENV_DIR}/bin/python" ]]; then
 fi
 
 QIG_PYTHON="${QIG_VENV_DIR}/bin/python"
-QIG_SETUP_MARKER="${QIG_VENV_DIR}/.qig-dependencies-source-selected-v3"
+QIG_SETUP_MARKER="${QIG_VENV_DIR}/.qig-dependencies-source-selected-v4"
 if [[ ! -f "${QIG_SETUP_MARKER}" ]]; then
     "${QIG_PYTHON}" -m pip install --upgrade pip
     "${QIG_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements-qig.txt"
@@ -70,6 +80,11 @@ else
     echo "Using installed QIG environment: ${QIG_VENV_DIR}"
 fi
 
+if [[ "${SETUP_ONLY}" == true ]]; then
+    echo "QIG environment is ready: ${QIG_VENV_DIR}"
+    exit 0
+fi
+
 export QIG_SOURCE_DIR
 cd "${QIG_SOURCE_DIR}"
-exec "${QIG_PYTHON}" "${REPOSITORY_ROOT}/scripts/quantize_qig.py" "$@"
+exec "${QIG_PYTHON}" "${REPOSITORY_ROOT}/scripts/quantize_qig.py" "${FORWARD_ARGS[@]}"

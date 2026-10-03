@@ -18,6 +18,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.quantization.qig import load_qig_runtime  # noqa: E402
 
 
@@ -28,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the checkpoint and QIG metadata.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output directory after a successful run.")
     parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
-    parser.add_argument("--base-model", default="liuhaotian/llava-v1.5-7b")
+    parser.add_argument("--model-config", type=Path, default=REPOSITORY_ROOT / "configs" / "model.yaml")
+    parser.add_argument("--base-model", default=None, help="Local checkpoint or Hugging Face model ID; defaults to configs/model.yaml.")
     parser.add_argument("--samples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--w-bit", type=int, default=4)
@@ -76,6 +78,13 @@ def resolve_base_model(model_reference: str) -> str:
         return str(project_model_path)
     # Keep Hub IDs such as ``liuhaotian/llava-v1.5-7b`` unchanged.
     return model_reference
+
+
+def has_local_model_weights(model_dir: Path) -> bool:
+    has_weights = any(model_dir.glob("pytorch_model*.bin")) or any(
+        model_dir.glob("model*.safetensors")
+    )
+    return (model_dir / "config.json").is_file() and has_weights
 
 
 def write_qig_calibration_jsonl(
@@ -229,12 +238,28 @@ def main() -> int:
         # QIG's classic LLaVA adapter does not accept a `dtype` argument.
         # Its upstream LLaVA builder defaults to loading the model in float16.
         # QIG's LLaVA builder infers the model family from the checkpoint's
-        # final path component. The project's local directory name
-        # (llava-1.5-7b) does not match its LLaVA 1.5 detection pattern, so
+        # final path component. The project's local directory name does not
+        # match its LLaVA 1.5 detection pattern, so
         # provide the recognized architecture name explicitly while loading
         # weights from the requested local path.
-        base_model = resolve_base_model(args.base_model)
-        model_args = f"pretrained={base_model},model_name=llava-v1.5-7b"
+        model_config = read_yaml(args.model_config)
+        if args.base_model is None:
+            model_id = model_config.get("model_id", "liuhaotian/llava-v1.5-7b")
+            model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b-qig"))
+            if not has_local_model_weights(model_dir):
+                from huggingface_hub import snapshot_download
+
+                model_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Downloading original LLaVA checkpoint {model_id} to {model_dir}")
+                snapshot_download(repo_id=model_id, local_dir=str(model_dir))
+            base_model = str(model_dir.resolve())
+        else:
+            base_model = resolve_base_model(args.base_model)
+        attn_implementation = model_config.get("attn_implementation", "eager")
+        model_args = (
+            f"pretrained={base_model},model_name=llava-v1.5-7b,"
+            f"attn_implementation={attn_implementation}"
+        )
         lm = model_class.create_from_arg_string(
             model_args,
             {"batch_size": 1, "device": "cuda"},
@@ -298,7 +323,7 @@ def main() -> int:
             "method": args.method,
             "model_type": "llava",
             "base_model": base_model,
-            "model_dtype": "float16",
+            "model_dtype": model_config.get("torch_dtype", "float16"),
             "weight_bits": args.w_bit,
             "activation_bits": args.a_bit,
             "group_size": args.w_group,
