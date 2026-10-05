@@ -240,6 +240,13 @@ def auto_scale_block(
             dtype = torch.float32
             B, T, _ = x.shape
 
+            if ans_mask is None and vis_mask is None:
+                return torch.ones((B, T), device=device, dtype=dtype) / max(T, 1)
+            if ans_mask is None:
+                ans_mask = torch.zeros((B, T), device=device, dtype=dtype)
+            if vis_mask is None:
+                vis_mask = torch.zeros((B, T), device=device, dtype=dtype)
+
             # Ensure masks are on the same device
             ans_mask = ans_mask.to(device=device, dtype=dtype)
             vis_mask = vis_mask.to(device=device, dtype=dtype)
