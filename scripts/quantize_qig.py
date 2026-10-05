@@ -83,7 +83,12 @@ def report_model_transfer(process_model: Any, method_name: str, torch: Any) -> N
     action = "CPU" if method_name == "to_cpu" else "CUDA"
 
     def wrapped_method() -> Any:
-        progress(f"Moving model to {action}")
+        keep_on_cuda = method_name == "to_cpu" and getattr(process_model, "keep_model_on_cuda", False)
+        progress(
+            "Keeping model weights on CUDA; skipping full-model CPU transfer"
+            if keep_on_cuda
+            else f"Moving model to {action}"
+        )
         stage_started = time.perf_counter()
         try:
             return original_method()
@@ -117,6 +122,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--a-bit", type=int, default=16)
     parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--model-placement",
+        choices=("cuda", "cpu"),
+        default="cuda",
+        help="Keep model weights on CUDA to reduce host RAM use, or allow QIG to offload them to CPU.",
+    )
     parser.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant scaling parameter.")
     parser.add_argument("--percdamp", type=float, default=0.01, help="GPTQ damping parameter.")
     parser.add_argument("--loss-mode", choices=("mae", "mse"), default="mae")
@@ -370,6 +381,11 @@ def main() -> int:
             lm._tokenizer,
             getattr(lm, "processor", None),
         )
+        process_model.keep_model_on_cuda = args.model_placement == "cuda"
+        progress(
+            "Model placement: "
+            + ("CUDA-resident (lower host RAM use; higher VRAM demand)" if process_model.keep_model_on_cuda else "QIG CPU offload")
+        )
         progress("Model adapter ready", stage_started)
 
         if calibration_path is None:
@@ -455,6 +471,7 @@ def main() -> int:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "method": args.method,
             "model_type": "llava",
+            "model_placement": args.model_placement,
             "base_model": base_model,
             "model_dtype": model_config.get("torch_dtype", "float16"),
             "weight_bits": args.w_bit,

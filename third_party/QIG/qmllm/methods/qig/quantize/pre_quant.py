@@ -4,6 +4,7 @@ import tqdm
 import copy
 import gc
 import functools
+import time
 from collections import defaultdict
 from typing import List
 
@@ -224,8 +225,11 @@ def run_qig(
     inps = []
     layer_kwargs = {}
 
+    keep_model_on_cuda = getattr(model, "keep_model_on_cuda", False)
+    placement = "CUDA-resident" if keep_model_on_cuda else "CPU-offloaded"
+    print(f"[QIG] Layerwise calibration placement: {placement}.", flush=True)
     layers[0] = layers[0].cuda()
-    move_embed(model.model, 'cpu')
+    move_embed(model.model, 'cuda' if keep_model_on_cuda else 'cpu')
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -248,7 +252,7 @@ def run_qig(
 
     # model.to_cuda()
     try:
-        if torch.cuda.device_count() > 1:
+        if torch.cuda.device_count() > 1 and not keep_model_on_cuda:
             model.to_cpu()
             for k, v in inputs.items():
                 if torch.is_tensor(v):
@@ -266,8 +270,9 @@ def run_qig(
     inps = inps[0]
     layer_kwargs["use_cache"] = False
 
-    layers[0] = layers[0].cpu()
-    move_embed(model.model, "cpu")
+    if not keep_model_on_cuda:
+        layers[0] = layers[0].cpu()
+        move_embed(model.model, "cpu")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -329,7 +334,9 @@ def run_qig(
 
     model.to_cpu()
     # solve layer by layer
-    for i in tqdm.tqdm(range(len(layers)), desc="Running QIG..."):
+    for i in tqdm.tqdm(range(len(layers)), desc=f"Running QIG ({placement})"):
+        layer_started = time.perf_counter()
+        print(f"[QIG] Layer {i + 1}/{len(layers)}: capturing activations.", flush=True)
         layer = layers[i]
         layer = layer.cuda()
         named_linears = get_named_linears(layer)
@@ -384,6 +391,8 @@ def run_qig(
         if (
             auto_scale
         ):  # if it applies, we should also modify the input_feat with scales
+            scale_started = time.perf_counter()
+            print(f"[QIG] Layer {i + 1}/{len(layers)}: searching for scales.", flush=True)
             if not reweight:
                 ans_mask = None
                 vis_mask = None
@@ -420,6 +429,11 @@ def run_qig(
 
             # apply_scale(layer, scales_list, input_feat_dict=input_feat)
             apply_scale(layers[i], scales_list, input_feat_dict=input_feat)
+            print(
+                f"[QIG] Layer {i + 1}/{len(layers)}: scale search and application complete "
+                f"({time.perf_counter() - scale_started:.1f}s).",
+                flush=True,
+            )
 
             if distort:
                 # get distort output as next layer's input
@@ -446,7 +460,13 @@ def run_qig(
         # Clear GPU memory
         torch.cuda.empty_cache()
 
-        layer = layer.cpu()
+        if not keep_model_on_cuda:
+            layer = layer.cpu()
+        print(
+            f"[QIG] Layer {i + 1}/{len(layers)} complete "
+            f"({time.perf_counter() - layer_started:.1f}s; placement={placement}).",
+            flush=True,
+        )
         # Haotian: check activation replacement
         del input_feat
         gc.collect()

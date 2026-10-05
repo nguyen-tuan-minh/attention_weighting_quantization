@@ -868,14 +868,23 @@ def apply_scale(module, scales_list, input_feat_dict=None):
     Apply computed scales to `module` in-place.
     This matches the interface/behavior you used elsewhere.
     """
+    def module_device(value, fallback):
+        tensor = next(value.parameters(), None)
+        if tensor is None:
+            tensor = next(value.buffers(), None)
+        return tensor.device if tensor is not None else fallback
+
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
+        layer_devices = [module_device(layer, scales.device) for layer in layers]
+        prev_device = module_device(prev_op, layer_devices[0] if layer_devices else scales.device)
+        scales_device = scales.device
 
         prev_op.cuda()
         for layer in layers:
             layer.cuda()
-        scales.cuda()
+        scales = scales.cuda()
 
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1
@@ -898,7 +907,8 @@ def apply_scale(module, scales_list, input_feat_dict=None):
                 inp = input_feat_dict[layer_name]
                 inp.div_(scales.view(1, -1).to(inp.device))
 
-        prev_op.cpu()
-        for layer in layers:
-            layer.cpu()
-        scales.cpu()
+        replacement = get_op_by_name(module, prev_op_name)
+        replacement.to(prev_device)
+        for layer, device in zip(layers, layer_devices):
+            layer.to(device)
+        scales = scales.to(scales_device)

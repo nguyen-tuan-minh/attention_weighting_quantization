@@ -112,6 +112,9 @@ class LLaVA_v15(BaseModel):
             self.model = self.model.cuda()
 
     def to_cpu(self):
+        if getattr(self, "keep_model_on_cuda", False):
+            print("[QIG] CUDA-resident mode: skipped full-model CPU transfer.", flush=True)
+            return
         if self.num_params > 20 * 10 ** 9: # 20B model
             remove_hook_from_submodules(self.model)
         self.model = self.model.cpu()
