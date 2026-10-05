@@ -180,9 +180,10 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Downloaded models, datasets, quantization outputs, and the external QIG source.
+# Downloaded models, datasets, quantization outputs, and external environments.
 /data/
 /models/
-/.third_party/QIG/
+/third_party/QIG/3rdparty/LLaVA-NeXT/
+/third_party/QIG/3rdparty/lmms-eval/
 # Legacy environment path from the previous setup; current scripts use .venv.
 /.venv-qig/

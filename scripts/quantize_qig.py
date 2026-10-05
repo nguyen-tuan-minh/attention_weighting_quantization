@@ -126,12 +126,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def qig_source_path() -> Path:
-    value = os.environ.get("QIG_SOURCE_DIR", str(REPOSITORY_ROOT / ".third_party" / "QIG"))
+    value = os.environ.get("QIG_SOURCE_DIR", str(REPOSITORY_ROOT / "third_party" / "QIG"))
     return Path(value).expanduser().resolve()
 
 
 def qig_git_revision(path: Path) -> str | None:
     try:
+        repository_root = Path(
+            subprocess.check_output(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        ).resolve()
+        if repository_root != path.resolve():
+            return None
         return subprocess.check_output(
             ["git", "-C", str(path), "rev-parse", "HEAD"],
             text=True,

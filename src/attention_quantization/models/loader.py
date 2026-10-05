@@ -26,7 +26,7 @@ def load_model(
 
     source_dir = model_config.get("implementation_source_dir") or os.environ.get("QIG_SOURCE_DIR")
     if source_dir is None:
-        source_dir = Path(repository_root) / ".third_party" / "QIG"
+        source_dir = Path(repository_root) / "third_party" / "QIG"
     elif not Path(source_dir).is_absolute():
         source_dir = Path(repository_root) / source_dir
 
