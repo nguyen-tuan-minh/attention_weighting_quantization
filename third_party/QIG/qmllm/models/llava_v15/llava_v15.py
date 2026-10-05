@@ -1,6 +1,8 @@
 import re
 import math
 import copy
+import os
+import shutil
 import torch
 import transformers
 
@@ -106,18 +108,91 @@ class LLaVA_v15(BaseModel):
 
 
     def to_cuda(self):
+        if getattr(self, "disk_offload_dir", None) and getattr(self, "disk_offload_initialized", False):
+            print("[QIG] Disk layer cache is active; restoring layers on demand.", flush=True)
+            return
         if self.num_params > 20 * 10 ** 9: # 20B model
             self.model = dispatch_model(self.model, device_map=self.device_map)
         else:
             self.model = self.model.cuda()
 
     def to_cpu(self):
+        if getattr(self, "disk_offload_dir", None):
+            if not getattr(self, "disk_offload_initialized", False):
+                self.initialize_disk_offload()
+            else:
+                print("[QIG] Disk layer cache is active; skipped full-model CPU transfer.", flush=True)
+            return
         if getattr(self, "keep_model_on_cuda", False):
             print("[QIG] CUDA-resident mode: skipped full-model CPU transfer.", flush=True)
             return
         if self.num_params > 20 * 10 ** 9: # 20B model
             remove_hook_from_submodules(self.model)
         self.model = self.model.cpu()
+
+    def _decoder_layers(self):
+        layers = getattr(getattr(self.model, "model", None), "layers", None)
+        if layers is None:
+            raise RuntimeError("Disk layer offload currently supports LLaVA models with model.layers")
+        return layers
+
+    def initialize_disk_offload(self):
+        """Write decoder layers individually, then release their device storage."""
+        offload_dir = self.disk_offload_dir
+        os.makedirs(offload_dir, exist_ok=True)
+        layers = self._decoder_layers()
+        required_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for layer in layers
+            for parameter in layer.parameters()
+        )
+        free_bytes = shutil.disk_usage(offload_dir).free
+        if free_bytes < required_bytes * 1.1:
+            raise OSError(
+                f"Disk layer cache needs about {required_bytes / (1024 ** 3):.1f} GiB; "
+                f"only {free_bytes / (1024 ** 3):.1f} GiB is free at {offload_dir}"
+            )
+
+        print(
+            f"[QIG] Caching {len(layers)} decoder layers on disk "
+            f"(about {required_bytes / (1024 ** 3):.1f} GiB).",
+            flush=True,
+        )
+        for index, layer in enumerate(layers):
+            self._save_layer_state(index, layer)
+            layer.to_empty(device="meta")
+            print(f"[QIG] Cached layer {index + 1}/{len(layers)}.", flush=True)
+        self.disk_offload_initialized = True
+
+    def _layer_cache_path(self, index):
+        return os.path.join(self.disk_offload_dir, f"decoder-layer-{index:03d}.pt")
+
+    def _save_layer_state(self, index, layer):
+        destination = self._layer_cache_path(index)
+        temporary = destination + ".tmp"
+        torch.save(layer.state_dict(), temporary)
+        os.replace(temporary, destination)
+
+    def load_layer_to_device(self, index, device="cuda"):
+        layer = self._decoder_layers()[index]
+        parameter = next(layer.parameters(), None)
+        if parameter is not None and parameter.device.type != "meta":
+            return layer.to(device)
+        state = torch.load(self._layer_cache_path(index), map_location=device, weights_only=True)
+        layer.load_state_dict(state, assign=True)
+        del state
+        return layer
+
+    def save_layer_to_disk(self, index):
+        layer = self._decoder_layers()[index]
+        self._save_layer_state(index, layer)
+        layer.to_empty(device="meta")
+
+    def restore_all_layers_to_device(self, device="cuda"):
+        layers = self._decoder_layers()
+        for index in range(len(layers)):
+            self.load_layer_to_device(index, device)
+            print(f"[QIG] Restored layer {index + 1}/{len(layers)} for export.", flush=True)
 
 
     def preprocess_multimodal(self, sources: Sequence[str]) -> Dict:

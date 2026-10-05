@@ -84,9 +84,16 @@ def report_model_transfer(process_model: Any, method_name: str, torch: Any) -> N
 
     def wrapped_method() -> Any:
         keep_on_cuda = method_name == "to_cpu" and getattr(process_model, "keep_model_on_cuda", False)
+        use_disk_cache = bool(getattr(process_model, "disk_offload_dir", None))
         progress(
             "Keeping model weights on CUDA; skipping full-model CPU transfer"
             if keep_on_cuda
+            else "Keeping layers in the temporary disk cache for on-demand loading"
+            if use_disk_cache and method_name == "to_cuda"
+            else f"Caching decoder layers to temporary disk directory {process_model.disk_offload_dir}"
+            if use_disk_cache and method_name == "to_cpu" and not getattr(process_model, "disk_offload_initialized", False)
+            else "Using temporary disk layer cache; skipping full-model CPU transfer"
+            if use_disk_cache and method_name == "to_cpu"
             else f"Moving model to {action}"
         )
         stage_started = time.perf_counter()
@@ -124,9 +131,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument(
         "--model-placement",
-        choices=("cuda", "cpu"),
+        choices=("cuda", "cpu", "disk"),
         default="cuda",
-        help="Keep model weights on CUDA to reduce host RAM use, or allow QIG to offload them to CPU.",
+        help="Keep weights on CUDA, offload them to CPU, or use a temporary disk cache for QIG layers.",
+    )
+    parser.add_argument(
+        "--offload-dir",
+        type=Path,
+        default=None,
+        help="Parent directory for the temporary disk layer cache (defaults to the system temporary directory).",
     )
     parser.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant scaling parameter.")
     parser.add_argument("--percdamp", type=float, default=0.01, help="GPTQ damping parameter.")
@@ -290,8 +303,30 @@ def publish_directory(staging_dir: Path, output_dir: Path, overwrite: bool) -> N
         shutil.rmtree(backup_dir)
 
 
+def remove_stale_layer_caches(parent_dir: Path) -> None:
+    """Remove this script's abandoned temporary caches after interrupted runs."""
+    for candidate in parent_dir.glob("qig-layer-offload-*"):
+        try:
+            owner_pid = int((candidate / ".owner_pid").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            shutil.rmtree(candidate, ignore_errors=True)
+            progress(f"Removed stale temporary layer cache: {candidate}")
+        except PermissionError:
+            continue
+
+
 def main() -> int:
     args = parse_args()
+    if args.model_placement == "disk" and args.method != "qig":
+        raise ValueError("--model-placement disk is currently supported only with --method qig")
+    if args.model_placement == "disk" and args.reweight:
+        raise ValueError("--reweight needs all model layers resident for its gradient pass and cannot use disk placement")
+    if args.offload_dir is not None and args.model_placement != "disk":
+        raise ValueError("--offload-dir can only be used with --model-placement disk")
     if (args.reweight or args.distort) and args.method not in {"qig", "mbq"}:
         raise ValueError("--reweight and --distort are supported only by the qig and mbq methods")
     output_dir = args.output_dir.expanduser()
@@ -311,6 +346,7 @@ def main() -> int:
         raise RuntimeError("CUDA is unavailable. Check the NVIDIA driver and PyTorch CUDA installation first.")
 
     staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=output_dir.parent))
+    offload_dir: Path | None = None
     try:
         progress("Preparing calibration data")
         calibration_path: Path | None = None
@@ -382,9 +418,22 @@ def main() -> int:
             getattr(lm, "processor", None),
         )
         process_model.keep_model_on_cuda = args.model_placement == "cuda"
+        if args.model_placement == "disk":
+            offload_parent = args.offload_dir.expanduser().resolve() if args.offload_dir else Path(tempfile.gettempdir())
+            offload_parent.mkdir(parents=True, exist_ok=True)
+            remove_stale_layer_caches(offload_parent)
+            offload_dir = Path(tempfile.mkdtemp(prefix="qig-layer-offload-", dir=offload_parent))
+            (offload_dir / ".owner_pid").write_text(str(os.getpid()), encoding="utf-8")
+            process_model.disk_offload_dir = str(offload_dir)
         progress(
             "Model placement: "
-            + ("CUDA-resident (lower host RAM use; higher VRAM demand)" if process_model.keep_model_on_cuda else "QIG CPU offload")
+            + (
+                "CUDA-resident (lower host RAM use; higher VRAM demand)"
+                if process_model.keep_model_on_cuda
+                else f"temporary disk layer cache ({offload_dir})"
+                if args.model_placement == "disk"
+                else "QIG CPU offload"
+            )
         )
         progress("Model adapter ready", stage_started)
 
@@ -452,6 +501,10 @@ def main() -> int:
             monitor.join(timeout=1.0)
         progress("Quantization complete", stage_started)
 
+        if args.model_placement == "disk":
+            progress("Restoring disk-cached layers for checkpoint export")
+            process_model.restore_all_layers_to_device("cuda")
+
         # QIG uses pseudo quantization: the weights are rounded onto the
         # requested grid but stored here in their normal floating-point dtype.
         progress("Saving model and tokenizer")
@@ -513,6 +566,10 @@ def main() -> int:
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
+    finally:
+        if offload_dir is not None:
+            shutil.rmtree(offload_dir, ignore_errors=True)
+            progress(f"Removed temporary layer cache: {offload_dir}")
     return 0
 
 

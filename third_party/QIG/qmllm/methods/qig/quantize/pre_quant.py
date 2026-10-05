@@ -226,10 +226,14 @@ def run_qig(
     layer_kwargs = {}
 
     keep_model_on_cuda = getattr(model, "keep_model_on_cuda", False)
-    placement = "CUDA-resident" if keep_model_on_cuda else "CPU-offloaded"
+    disk_offload = bool(getattr(model, "disk_offload_dir", None))
+    placement = "temporary disk cache" if disk_offload else "CUDA-resident" if keep_model_on_cuda else "CPU-offloaded"
     print(f"[QIG] Layerwise calibration placement: {placement}.", flush=True)
-    layers[0] = layers[0].cuda()
-    move_embed(model.model, 'cuda' if keep_model_on_cuda else 'cpu')
+    if disk_offload:
+        layers[0] = model.load_layer_to_device(0, "cuda")
+    else:
+        layers[0] = layers[0].cuda()
+    move_embed(model.model, 'cuda' if keep_model_on_cuda or disk_offload else 'cpu')
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -252,7 +256,7 @@ def run_qig(
 
     # model.to_cuda()
     try:
-        if torch.cuda.device_count() > 1 and not keep_model_on_cuda:
+        if torch.cuda.device_count() > 1 and not keep_model_on_cuda and not disk_offload:
             model.to_cpu()
             for k, v in inputs.items():
                 if torch.is_tensor(v):
@@ -270,7 +274,9 @@ def run_qig(
     inps = inps[0]
     layer_kwargs["use_cache"] = False
 
-    if not keep_model_on_cuda:
+    if disk_offload:
+        model.save_layer_to_disk(0)
+    elif not keep_model_on_cuda:
         layers[0] = layers[0].cpu()
         move_embed(model.model, "cpu")
 
@@ -337,8 +343,7 @@ def run_qig(
     for i in tqdm.tqdm(range(len(layers)), desc=f"Running QIG ({placement})"):
         layer_started = time.perf_counter()
         print(f"[QIG] Layer {i + 1}/{len(layers)}: capturing activations.", flush=True)
-        layer = layers[i]
-        layer = layer.cuda()
+        layer = model.load_layer_to_device(i, "cuda") if disk_offload else layers[i].cuda()
         named_linears = get_named_linears(layer)
 
         # firstly, get input features of all linear layers
@@ -460,7 +465,9 @@ def run_qig(
         # Clear GPU memory
         torch.cuda.empty_cache()
 
-        if not keep_model_on_cuda:
+        if disk_offload:
+            model.save_layer_to_disk(i)
+        elif not keep_model_on_cuda:
             layer = layer.cpu()
         print(
             f"[QIG] Layer {i + 1}/{len(layers)} complete "
