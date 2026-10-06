@@ -507,6 +507,13 @@ def main() -> int:
         if args.model_placement == "disk":
             progress("Restoring disk-cached layers for checkpoint export")
             process_model.restore_all_layers_to_device("cuda")
+            # The full model is resident again, so release the temporary
+            # decoder-layer copy before writing another full checkpoint.
+            if offload_dir is not None:
+                shutil.rmtree(offload_dir)
+                process_model.disk_offload_dir = None
+                progress(f"Removed temporary layer cache before checkpoint export: {offload_dir}")
+                offload_dir = None
 
         # QIG uses pseudo quantization: the weights are rounded onto the
         # requested grid but stored here in their normal floating-point dtype.
