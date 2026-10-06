@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-config", type=Path, default=REPOSITORY_ROOT / "configs" / "model.yaml")
     parser.add_argument("--dataset-config", type=Path, default=REPOSITORY_ROOT / "configs" / "dataset.yaml")
     parser.add_argument("--samples", type=int, default=None, help="Use the first N records from the quantization calibration JSONL.")
+    parser.add_argument("--batch-size", type=int, default=2, help="Number of calibration samples per forward pass.")
     parser.add_argument("--output", type=Path, default=None, help="Metrics JSON path (default: <quantized-model>/evaluation_metrics.json).")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--kl-token-chunk-size", type=int, default=8, help="Limit temporary memory while computing KL over vocabulary logits.")
@@ -65,8 +66,8 @@ def capture_forward(
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
-) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Forward one sample, retaining each decoder output and final logits on CPU."""
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor]]:
+    """Forward a batch, retaining each sample's decoder outputs and logits on CPU."""
     model = process_model.model
     captured: dict[int, torch.Tensor] = {}
     handles = []
@@ -74,7 +75,7 @@ def capture_forward(
         def save_output(_module: Any, _inputs: Any, output: Any, *, layer_index: int = index) -> None:
             hidden = output[0] if isinstance(output, tuple) else output
             if torch.is_tensor(hidden):
-                captured[layer_index] = hidden.detach().to(device="cpu", dtype=torch.float16)[0]
+                captured[layer_index] = hidden.detach().to(device="cpu", dtype=torch.float16)
 
         handles.append(layer.register_forward_hook(save_output))
 
@@ -88,26 +89,39 @@ def capture_forward(
                 use_cache=False,
                 return_dict=True,
             )
-        activations = [captured[i] for i in range(len(handles))]
-        logits = output.logits.detach().to(device="cpu", dtype=torch.float16)[0]
+        batch_size = inputs_embeds.shape[0]
+        activations = [
+            [captured[layer_index][sample_index] for layer_index in range(len(handles))]
+            for sample_index in range(batch_size)
+        ]
+        logits = [
+            output.logits.detach().to(device="cpu", dtype=torch.float16)[sample_index]
+            for sample_index in range(batch_size)
+        ]
     finally:
         for handle in handles:
             handle.remove()
     return activations, logits
 
 
-def prepare_one_input(process_model: Any, record: dict[str, Any], raw_dir: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    image_path = (raw_dir / record["image"]).resolve()
-    try:
-        image_path.relative_to(raw_dir.resolve())
-    except ValueError as error:
-        raise ValueError(f"Calibration image path escapes configured raw directory: {image_path}") from error
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Calibration image is missing: {image_path}")
-    with Image.open(image_path) as source_image:
-        image = source_image.convert("RGB")
-    prepared = process_model.preprocess_data([image], record)
-    batch = process_model.data_collator([prepared])
+def prepare_batch_inputs(
+    process_model: Any,
+    records: list[dict[str, Any]],
+    raw_dir: Path,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prepared_records = []
+    for record in records:
+        image_path = (raw_dir / record["image"]).resolve()
+        try:
+            image_path.relative_to(raw_dir.resolve())
+        except ValueError as error:
+            raise ValueError(f"Calibration image path escapes configured raw directory: {image_path}") from error
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Calibration image is missing: {image_path}")
+        with Image.open(image_path) as source_image:
+            image = source_image.convert("RGB")
+        prepared_records.append(process_model.preprocess_data([image], record))
+    batch = process_model.data_collator(prepared_records)
     prompt_inputs, prompt_kwargs = process_model.generate_input(batch)
     return (
         prompt_inputs["inputs_embeds"].detach().cpu(),
@@ -197,6 +211,8 @@ def main() -> int:
         records = records[:sample_count]
         if args.kl_token_chunk_size < 1:
             raise ValueError("--kl-token-chunk-size must be positive")
+        if args.batch_size < 1:
+            raise ValueError("--batch-size must be positive")
 
         model_config = read_yaml(args.model_config)
         dataset_paths = get_data_paths(args.dataset_config)
@@ -212,7 +228,7 @@ def main() -> int:
 
         baseline_activations: list[list[torch.Tensor]] = []
         baseline_logits: list[torch.Tensor] = []
-        input_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        input_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         attention_masks: list[torch.Tensor] = []
         target_labels: list[torch.Tensor] = []
 
@@ -225,16 +241,21 @@ def main() -> int:
         )
         started = time.perf_counter()
         print(f"Evaluating base model on {sample_count} saved calibration samples", flush=True)
-        for index, record in enumerate(records, start=1):
-            sample_input = prepare_one_input(baseline_adapter, record, dataset_paths["raw_dir"])
-            activations, logits = capture_forward(baseline_adapter, *sample_input)
-            input_samples.append(sample_input)
-            attention_masks.append(sample_input[1])
-            target_labels.append(sample_input[2])
-            baseline_activations.append(activations)
-            baseline_logits.append(logits)
-            print(f"Base forward {index}/{sample_count} complete", flush=True)
-        layer_count = len(baseline_activations[0])
+        batches = [records[start : start + args.batch_size] for start in range(0, sample_count, args.batch_size)]
+        for batch_index, record_batch in enumerate(batches, start=1):
+            batch_input = prepare_batch_inputs(baseline_adapter, record_batch, dataset_paths["raw_dir"])
+            input_batches.append(batch_input)
+            batch_activations, batch_logits = capture_forward(baseline_adapter, *batch_input)
+            if not baseline_activations:
+                baseline_activations = [[] for _ in batch_activations[0]]
+            for sample_activations in batch_activations:
+                for layer_index, activation in enumerate(sample_activations):
+                    baseline_activations[layer_index].append(activation)
+            baseline_logits.extend(batch_logits)
+            attention_masks.extend(batch_input[1][i : i + 1] for i in range(len(record_batch)))
+            target_labels.extend(batch_input[2][i : i + 1] for i in range(len(record_batch)))
+            print(f"Base batch {batch_index}/{len(batches)} complete ({len(record_batch)} samples)", flush=True)
+        layer_count = len(baseline_activations)
         del baseline_adapter, baseline_lm
         gc.collect()
         if torch.cuda.is_available():
@@ -247,15 +268,17 @@ def main() -> int:
             qig_source_dir=qig_source,
         )
         quantized_adapter = make_process_model(runtime, quantized_lm)
-        quantized_activations: list[list[torch.Tensor]] = []
+        quantized_activations: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
         quantized_logits: list[torch.Tensor] = []
-        for index, sample_input in enumerate(input_samples, start=1):
-            activations, logits = capture_forward(quantized_adapter, *sample_input)
-            if len(activations) != layer_count:
-                raise ValueError(f"Decoder layer count differs: base={layer_count}, quantized={len(activations)}")
-            quantized_activations.append(activations)
-            quantized_logits.append(logits)
-            print(f"Quantized forward {index}/{sample_count} complete", flush=True)
+        for batch_index, batch_input in enumerate(input_batches, start=1):
+            batch_activations, batch_logits = capture_forward(quantized_adapter, *batch_input)
+            if batch_activations and len(batch_activations[0]) != layer_count:
+                raise ValueError(f"Decoder layer count differs: base={layer_count}, quantized={len(batch_activations[0])}")
+            for sample_activations in batch_activations:
+                for layer_index, activation in enumerate(sample_activations):
+                    quantized_activations[layer_index].append(activation)
+            quantized_logits.extend(batch_logits)
+            print(f"Quantized batch {batch_index}/{len(input_batches)} complete", flush=True)
 
         layer_errors = compute_layer_errors(baseline_activations, quantized_activations, attention_masks)
         mean_kl, kl_tokens = compute_final_kl(

@@ -130,7 +130,7 @@ Compare a saved QIG checkpoint with its base model on the exact calibration reco
   --quantized-model models/quantized/llava-1.5-7b-qig-w4g128
 ```
 
-The script reports per-decoder-layer relative L2 error and RMSE over non-padding activations, plus mean KL divergence from the base model to the quantized model over assistant-answer next-token positions. It reads `calibration.jsonl` from the quantized artifact and writes `evaluation_metrics.json` there. Use `--samples N` to evaluate a prefix of those saved records.
+The script reports per-decoder-layer relative L2 error and RMSE over non-padding activations, plus mean KL divergence from the base model to the quantized model over assistant-answer next-token positions. It reads `calibration.jsonl` from the quantized artifact and writes `evaluation_metrics.json` there. Use `--samples N` to evaluate a prefix of those saved records. For faster forwards, it batches two samples by default; set `--batch-size` higher if GPU memory permits, or lower if you run out of memory.
 
 ## Documentation
 
