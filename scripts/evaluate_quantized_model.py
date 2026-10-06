@@ -282,7 +282,6 @@ def evaluate_sequential_batches(
 
         del quantized_adapter, quantized_lm
         del baseline_activations, baseline_logits, quantized_activations, quantized_logits, batch_input
-        del baseline_adapter, baseline_lm
         release_model()
 
     if layer_stats is None:
