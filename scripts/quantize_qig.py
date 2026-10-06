@@ -321,6 +321,8 @@ def remove_stale_layer_caches(parent_dir: Path) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.micro_batch_size < 1:
+        raise ValueError("--micro-batch-size must be a positive integer")
     if args.model_placement == "disk" and args.method != "qig":
         raise ValueError("--model-placement disk is currently supported only with --method qig")
     if args.model_placement == "disk" and args.reweight:
@@ -418,6 +420,7 @@ def main() -> int:
             getattr(lm, "processor", None),
         )
         process_model.keep_model_on_cuda = args.model_placement == "cuda"
+        process_model.micro_batch_size = args.micro_batch_size
         if args.model_placement == "disk":
             offload_parent = args.offload_dir.expanduser().resolve() if args.offload_dir else Path(tempfile.gettempdir())
             offload_parent.mkdir(parents=True, exist_ok=True)

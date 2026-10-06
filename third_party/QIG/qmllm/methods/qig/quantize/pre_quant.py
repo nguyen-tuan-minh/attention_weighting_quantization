@@ -202,6 +202,20 @@ def process_input(prompt_inputs, prompt_kwargs):
     return inputs, vision_mask, caption_mask
 
 
+def _tree_to_device(value, device, batch_start=None, batch_end=None, batch_size=None):
+    if torch.is_tensor(value):
+        if batch_start is not None and value.ndim > 0 and value.shape[0] == batch_size:
+            value = value[batch_start:batch_end]
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_tree_to_device(item, device, batch_start, batch_end, batch_size) for item in value)
+    if isinstance(value, list):
+        if batch_start is not None and len(value) == batch_size:
+            value = value[batch_start:batch_end]
+        return [_tree_to_device(item, device, batch_start, batch_end, batch_size) for item in value]
+    return value
+
+
 @torch.no_grad()
 def run_qig(
     model,
@@ -228,6 +242,7 @@ def run_qig(
     keep_model_on_cuda = getattr(model, "keep_model_on_cuda", False)
     disk_offload = bool(getattr(model, "disk_offload_dir", None))
     placement = "temporary disk cache" if disk_offload else "CUDA-resident" if keep_model_on_cuda else "CPU-offloaded"
+    micro_batch_size = max(1, int(getattr(model, "micro_batch_size", 1)))
     print(f"[QIG] Layerwise calibration placement: {placement}.", flush=True)
     if disk_offload:
         layers[0] = model.load_layer_to_device(0, "cuda")
@@ -271,7 +286,8 @@ def run_qig(
 
     model.to_cpu()
     layers[0] = layers[0].module  # restore
-    inps = inps[0]
+    inps = inps[0].detach().cpu()
+    layer_kwargs = {key: _tree_to_device(value, "cpu") for key, value in layer_kwargs.items()}
     layer_kwargs["use_cache"] = False
 
     if disk_offload:
@@ -360,16 +376,26 @@ def run_qig(
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
-        inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
-        # get output as next layer's input
-
-        for k in layer_kwargs:
-            if isinstance(layer_kwargs[k], torch.Tensor):
-                layer_kwargs[k] = layer_kwargs[k].to(next(layer.parameters()).device)
-            if isinstance(layer_kwargs[k], tuple) or isinstance(layer_kwargs[k], list):
-                layer_kwargs[k] = [item.to(next(layer.parameters()).device) if torch.is_tensor(item) else item for item in layer_kwargs[k]]
-
-        inps = layer(inps, **layer_kwargs)[0]
+        # Forward small chunks and keep accumulated hidden states on CPU.
+        batch_count = inps.shape[0]
+        layer_device = next(layer.parameters()).device
+        output_chunks = []
+        print(
+            f"[QIG] Layer {i + 1}/{len(layers)}: forwarding {batch_count} samples "
+            f"in batches of {micro_batch_size}.",
+            flush=True,
+        )
+        for batch_start in range(0, batch_count, micro_batch_size):
+            batch_end = min(batch_start + micro_batch_size, batch_count)
+            batch_input = inps[batch_start:batch_end].to(layer_device)
+            batch_kwargs = {
+                key: _tree_to_device(value, layer_device, batch_start, batch_end, batch_count)
+                for key, value in layer_kwargs.items()
+            }
+            batch_output = layer(batch_input, **batch_kwargs)[0]
+            output_chunks.append(batch_output.detach().cpu())
+            del batch_input, batch_kwargs, batch_output
+        inps = torch.cat(output_chunks, dim=0)
         for h in handles:
             h.remove()
         # now solve for scaling
@@ -429,7 +455,8 @@ def run_qig(
                     ans_mask=ans_mask,
                     vis_mask=vis_mask,
                     reweight_ratio_dict=scale_reweight_ratio_dict,
-                    loss_mode=loss_mode
+                    loss_mode=loss_mode,
+                    micro_batch_size=micro_batch_size,
                 )
 
             # apply_scale(layer, scales_list, input_feat_dict=input_feat)

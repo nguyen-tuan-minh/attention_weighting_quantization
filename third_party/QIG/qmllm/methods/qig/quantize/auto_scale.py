@@ -22,6 +22,39 @@ def get_act_scale(x: torch.Tensor):
     return x.abs().view(-1, x.shape[-1]).mean(0)
 
 
+def _batch_kwargs(kwargs, start, end, batch_size, device):
+    def move(value):
+        if torch.is_tensor(value):
+            if value.ndim > 0 and value.shape[0] == batch_size:
+                value = value[start:end]
+            return value.to(device)
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        if isinstance(value, list):
+            if len(value) == batch_size:
+                value = value[start:end]
+            return [move(item) for item in value]
+        return value
+
+    return {key: move(value) for key, value in kwargs.items()}
+
+
+def _forward_in_batches(block, x, kwargs, micro_batch_size):
+    device = next(block.parameters()).device
+    outputs = []
+    batch_size = x.shape[0]
+    for start in range(0, batch_size, micro_batch_size):
+        end = min(start + micro_batch_size, batch_size)
+        batch_x = x[start:end].to(device)
+        batch_kwargs = _batch_kwargs(kwargs, start, end, batch_size, device)
+        output = block(batch_x, **batch_kwargs)
+        if isinstance(output, tuple):
+            output = output[0]
+        outputs.append(output.detach().cpu())
+        del batch_x, batch_kwargs, output
+    return torch.cat(outputs, dim=0)
+
+
 @torch.no_grad()
 def scale_ln_fcs(ln: nn.Module, fcs, scales: torch.Tensor):
     """
@@ -94,6 +127,7 @@ def auto_scale_block(
     vis_mask,
     reweight_ratio_dict,
     loss_mode="mae",
+    micro_batch_size=1,
 ):
     """
     Run adaptive scale search for a single Transformer block under weight-only quantization.
@@ -125,13 +159,11 @@ def auto_scale_block(
         compute_token_importance=False,
     ):
         # x: [B, T, C]
-        x = x.to(next(block.parameters()).device)
+        micro_batch_size = max(1, int(micro_batch_size))
 
         # Compute full-precision output baseline
         with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
+            org_out = _forward_in_batches(block, x, kwargs, micro_batch_size)
 
         def _compute_token_importance_weights(block, x, x_q, kwargs):  # noqa: keep signature
             """
@@ -142,12 +174,6 @@ def auto_scale_block(
             """
             device = next(block.parameters()).device
             param_dtype = next(block.parameters()).dtype
-            x = x.to(device, dtype=param_dtype)
-            B, T, H = x.shape
-
-            # === Baseline input ===
-            x0 = torch.zeros_like(x)
-
             # === Build a quantized copy of the block ===
             block_q = copy.deepcopy(block).to(device)
             for m in block_q.modules():
@@ -165,59 +191,55 @@ def auto_scale_block(
             alphas = torch.linspace(0.0, 1.0, steps, device=device, dtype=torch.float32)
             weights = torch.ones_like(alphas) / steps
 
-            total_grad = torch.zeros_like(x, dtype=torch.float32, device=device)
+            token_weights = []
+            raw_weights = []
+            lower_bounds = []
+            upper_bounds = []
+            for start in range(0, x.shape[0], micro_batch_size):
+                end = min(start + micro_batch_size, x.shape[0])
+                x_batch = x[start:end].to(device=device, dtype=param_dtype)
+                batch_kwargs = _batch_kwargs(kwargs, start, end, x.shape[0], device)
+                x0 = torch.zeros_like(x_batch)
+                total_grad = torch.zeros_like(x_batch, dtype=torch.float32, device=device)
+                for i, alpha in enumerate(alphas):
+                    x_interp = (x0 + alpha * (x_batch - x0)).detach().clone().requires_grad_(True)
+                    with torch.enable_grad():
+                        y_fp = block(x_interp, **batch_kwargs)
+                        y_q = block_q(x_interp, **batch_kwargs)
+                        if isinstance(y_fp, tuple):
+                            y_fp = y_fp[0]
+                        if isinstance(y_q, tuple):
+                            y_q = y_q[0]
+                        f_token = (y_fp - y_q).abs().mean(dim=-1)
+                        grad = torch.autograd.grad(
+                            outputs=f_token,
+                            inputs=x_interp,
+                            grad_outputs=torch.ones_like(f_token),
+                            retain_graph=False,
+                            create_graph=False,
+                        )[0]
+                    total_grad += grad.detach().float() * weights[i]
 
-            for i, alpha in enumerate(alphas):
-                x_interp = (x0 + alpha * (x - x0)).detach().clone().requires_grad_(True)
-
-                with torch.enable_grad():
-                    y_fp = block(x_interp, **kwargs)
-                    y_q = block_q(x_interp, **kwargs)
-                    if isinstance(y_fp, tuple):
-                        y_fp = y_fp[0]
-                    if isinstance(y_q, tuple):
-                        y_q = y_q[0]
-
-                    # diff: [B, T, H]
-                    diff = y_fp - y_q
-                    F_tok = diff.abs().mean(dim=-1)  # [B, T]
-
-                    grad_outputs = torch.ones_like(F_tok, device=F_tok.device, dtype=F_tok.dtype)
-                    grad = torch.autograd.grad(
-                        outputs=F_tok,
-                        inputs=x_interp,
-                        grad_outputs=grad_outputs,
-                        retain_graph=False,
-                        create_graph=False,
-                    )[0]  # [B, T, H]
-
-                if grad is None:
-                    grad = torch.zeros_like(x_interp)
-
-                total_grad += grad.detach().to(torch.float32) * weights[i]
-
-            # === Integrated gradients & token importance ===
-            ig = (x - x0).to(torch.float32) * total_grad
-            token_imp = ig.abs().mean(dim=-1)  # [B, T]
-
-            # === IQR clipping ===
-            eps = 1e-8
-            token_imp = token_imp / token_imp.sum(dim=1, keepdim=True).clamp_min(eps)
-
-            q1 = torch.quantile(token_imp, 0.25, dim=1, keepdim=True)
-            q3 = torch.quantile(token_imp, 0.75, dim=1, keepdim=True)
-            iqr = q3 - q1
-            lo = q1 - 1.5 * iqr
-            hi = q3 + 1.5 * iqr
-
-            clipped = torch.minimum(torch.maximum(token_imp, lo), hi)
-            token_w = clipped / clipped.sum(dim=1, keepdim=True).clamp_min(eps)
-
+                token_imp = (x_batch.float() * total_grad).abs().mean(dim=-1)
+                eps = 1e-8
+                token_imp = token_imp / token_imp.sum(dim=1, keepdim=True).clamp_min(eps)
+                q1 = torch.quantile(token_imp, 0.25, dim=1, keepdim=True)
+                q3 = torch.quantile(token_imp, 0.75, dim=1, keepdim=True)
+                iqr = q3 - q1
+                lo = q1 - 1.5 * iqr
+                hi = q3 + 1.5 * iqr
+                clipped = torch.minimum(torch.maximum(token_imp, lo), hi)
+                token_weights.append((clipped / clipped.sum(dim=1, keepdim=True).clamp_min(eps)).cpu())
+                raw_weights.append(token_imp.detach().cpu())
+                lower_bounds.append(lo.detach().cpu())
+                upper_bounds.append(hi.detach().cpu())
+                del x_batch, x0, total_grad, batch_kwargs
+            token_w = torch.cat(token_weights, dim=0)
             iqr_vis = {
-                "weights_raw": token_imp.detach(),
-                "weights_clipped": token_w.detach(),
-                "lower_bound": lo.detach(),
-                "upper_bound": hi.detach(),
+                "weights_raw": torch.cat(raw_weights, dim=0),
+                "weights_clipped": token_w,
+                "lower_bound": torch.cat(lower_bounds, dim=0),
+                "upper_bound": torch.cat(upper_bounds, dim=0),
                 "iqr_alpha": 1.5,
             }
 
@@ -294,12 +316,11 @@ def auto_scale_block(
             scales = scales / (scales.max() * scales.min()).sqrt()
 
             for fc in linears2scale:
-                fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+                device_scales = scales.to(fc.weight.device)
+                fc.weight.mul_(device_scales.view(1, -1))
+                fc.weight.data = w_quantize_func(fc.weight.data) / device_scales.view(1, -1)
 
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
+            out = _forward_in_batches(block, x, kwargs, micro_batch_size)
 
             # Per-token error aggregated over the last dimension.
             # Per user request: ignore ans_mask/vis_mask here; rely only on IGQ weights.
