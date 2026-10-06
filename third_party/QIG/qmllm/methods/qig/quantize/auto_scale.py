@@ -148,6 +148,7 @@ def auto_scale_block(
 
     if "use_cache" in module_kwargs:
         module_kwargs.pop("use_cache")
+    micro_batch_size = max(1, int(micro_batch_size))
 
     # === Search scales for a single module (with token-importance reweighting) ===
     def _search_module_scale(
@@ -159,8 +160,6 @@ def auto_scale_block(
         compute_token_importance=False,
     ):
         # x: [B, T, C]
-        micro_batch_size = max(1, int(micro_batch_size))
-
         # Compute full-precision output baseline
         with torch.no_grad():
             org_out = _forward_in_batches(block, x, kwargs, micro_batch_size)
