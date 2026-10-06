@@ -123,6 +123,15 @@ tokenizer = wrapper._tokenizer
 
 The loader uses QIG's LMMS-Eval `llava` adapter, so call it from `.venv` after running setup.
 
+Compare a saved QIG checkpoint with its base model on the exact calibration records used for quantization:
+
+```bash
+.venv/bin/python scripts/evaluate_quantized_model.py \
+  --quantized-model models/quantized/llava-1.5-7b-qig-w4g128
+```
+
+The script reports per-decoder-layer relative L2 error and RMSE over non-padding activations, plus mean KL divergence from the base model to the quantized model over assistant-answer next-token positions. It reads `calibration.jsonl` from the quantized artifact and writes `evaluation_metrics.json` there. Use `--samples N` to evaluate a prefix of those saved records.
+
 ## Documentation
 
 Planning notes and supporting project documentation are in [`docs/`](docs/). The [project structure reference](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation scripts and packages.
