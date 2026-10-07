@@ -73,12 +73,17 @@ def select_samples(config_path: Path, count: int, seed: int | None) -> Dataset:
 def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     prepared_samples = []
     for index, sample in enumerate(samples):
+        image = sample["image"]
+        # The LLaVA pad preprocessor creates a canvas using an RGB background
+        # color. Normalize grayscale/palette/RGBA inputs to RGB first.
+        if hasattr(image, "convert"):
+            image = image.convert("RGB")
         row = {
             "conversations": sample["conversations"],
             "id": str(sample.get("id", index)),
             "image": "local",
         }
-        prepared_samples.append(adapter.preprocess_data([sample["image"]], row))
+        prepared_samples.append(adapter.preprocess_data([image], row))
     batch = adapter.data_collator(prepared_samples)
     prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
     tensors = {
