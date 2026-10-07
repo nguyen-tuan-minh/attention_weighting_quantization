@@ -230,6 +230,26 @@ def sample_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return float(token_losses[valid].mean())
 
 
+def sample_kl_divergence(
+    base_logits: torch.Tensor,
+    quant_logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> float:
+    """Average KL(base || quantized) over assistant answer tokens."""
+    base_log_probs = F.log_softmax(base_logits[:-1].float(), dim=-1)
+    quant_log_probs = F.log_softmax(quant_logits[:-1].float(), dim=-1)
+    answer_labels = labels[1:].long()
+    valid = answer_labels != -100
+    if not valid.any():
+        raise ValueError("Sample has no assistant answer tokens for KL divergence")
+    token_kl = F.kl_div(
+        quant_log_probs,
+        base_log_probs.exp(),
+        reduction="none",
+    ).sum(dim=-1)
+    return float(token_kl[valid].mean())
+
+
 def pearson_correlation(x: list[float], y: list[float]) -> float | None:
     left = torch.tensor(x, dtype=torch.float64)
     right = torch.tensor(y, dtype=torch.float64)
@@ -328,11 +348,15 @@ def main() -> int:
                     args.top_percent,
                 )
                 ce = sample_cross_entropy(quant_logits[sample_index], labels[sample_index])
+                kl = sample_kl_divergence(
+                    _base_logits[sample_index], quant_logits[sample_index], labels[sample_index]
+                )
                 per_sample.append(
                     {
                         "sample_index": len(per_sample),
                         "sample_id": str(sample.get("id", len(per_sample))),
                         "cross_entropy": ce,
+                        "kl_base_to_quantized": kl,
                         "top_iga_mse": top_errors,
                         "full_mse": full_errors,
                     }
@@ -346,13 +370,13 @@ def main() -> int:
 
         if layer_count is None:
             raise RuntimeError("No model outputs were captured")
-        losses = [row["cross_entropy"] for row in per_sample]
+        divergences = [row["kl_base_to_quantized"] for row in per_sample]
         layer_results = []
         for layer_index in range(layer_count):
             top_errors = [row["top_iga_mse"][layer_index] for row in per_sample]
             full_errors = [row["full_mse"][layer_index] for row in per_sample]
-            corr_top = pearson_correlation(top_errors, losses)
-            corr_full = pearson_correlation(full_errors, losses)
+            corr_top = pearson_correlation(top_errors, divergences)
+            corr_full = pearson_correlation(full_errors, divergences)
             layer_results.append(
                 {
                     "layer": layer_index,
@@ -381,16 +405,17 @@ def main() -> int:
             "top_percent": args.top_percent,
             "selection": "per sample and layer: highest IGA image tokens, IGA averaged over heads and text-query tokens",
             "output_mse_definition": "mean squared hidden-feature error at decoder block outputs; full uses all non-padding tokens, top uses selected image tokens",
-            "loss_definition": "quantized model causal cross-entropy averaged over assistant answer tokens",
+            "correlation_target": "KL divergence from base to quantized model, averaged over assistant answer tokens",
+            "kl_definition": "per answer token: sum_vocab p_base * (log p_base - log p_quantized), averaged over assistant answer tokens",
             "layers": layer_results,
             "elapsed_seconds": time.perf_counter() - model_started,
         }
         (output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         with (output_dir / "per_sample.csv").open("w", newline="", encoding="utf-8") as destination:
             writer = csv.writer(destination)
-            writer.writerow(["sample_index", "sample_id", "cross_entropy", *[f"layer_{i}_top_iga_mse" for i in range(layer_count)], *[f"layer_{i}_full_mse" for i in range(layer_count)]])
+            writer.writerow(["sample_index", "sample_id", "cross_entropy", "kl_base_to_quantized", *[f"layer_{i}_top_iga_mse" for i in range(layer_count)], *[f"layer_{i}_full_mse" for i in range(layer_count)]])
             for row in per_sample:
-                writer.writerow([row["sample_index"], row["sample_id"], row["cross_entropy"], *row["top_iga_mse"], *row["full_mse"]])
+                writer.writerow([row["sample_index"], row["sample_id"], row["cross_entropy"], row["kl_base_to_quantized"], *row["top_iga_mse"], *row["full_mse"]])
         with (output_dir / "layer_correlations.csv").open("w", newline="", encoding="utf-8") as destination:
             writer = csv.DictWriter(destination, fieldnames=list(layer_results[0]))
             writer.writeheader()
