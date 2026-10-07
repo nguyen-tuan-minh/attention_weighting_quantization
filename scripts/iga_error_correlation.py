@@ -149,6 +149,10 @@ def capture_layer_outputs_and_iga(
                     text_to_image = weights[sample_index][:, query_mask, :][:, :, key_mask]
                     layer_scores.append(text_to_image.float().mean(dim=(0, 1)).cpu())
                 active["iga"][index] = layer_scores
+                # The model's output_attentions collection otherwise keeps a
+                # full [batch, heads, sequence, sequence] matrix for every
+                # decoder layer. IGA is already computed, so don't retain it.
+                return (output[0], None, *output[2:])
 
             handles.append(attention_module.register_forward_hook(save_attention))
 

@@ -141,7 +141,7 @@ To compare layer-output error on the top 10% image tokens ranked by IGA against 
   --batch-size 1
 ```
 
-This experiment samples 128 ShareGPT4V COCO records that have local images. IGA is averaged across attention heads and text-query positions for each image token, separately for each sample and layer. The script compares base and quantized decoder-block outputs, calculates per-sample MSE over (a) the highest-IGA 10% of image tokens and (b) all non-padding sequence tokens, then reports Pearson correlations with quantized-model answer-token cross-entropy. It alternates model loads per batch to limit memory; checkpoint reloads make larger runs slower. The results are written under `<quantized-model>/iga_error_correlation/`.
+This experiment samples 128 ShareGPT4V COCO records that have local images. IGA is averaged across attention heads and text-query positions for each image token, separately for each sample and layer. The script compares base and quantized decoder-block outputs, calculates per-sample MSE over (a) the highest-IGA 10% of image tokens and (b) all non-padding sequence tokens, then reports Pearson correlations with quantized-model answer-token cross-entropy. It alternates model loads per batch to limit memory and discards each attention matrix after computing IGA; checkpoint reloads make larger runs slower. Start with `--batch-size 1` on a 24 GiB GPU and increase only if memory allows. The results are written under `<quantized-model>/iga_error_correlation/`.
 
 ## Documentation
 
