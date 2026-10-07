@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-QIG_SOURCE_DIR="${QIG_SOURCE_DIR:-${REPOSITORY_ROOT}/third_party/QIG}"
+QIG_SOURCE_DIR="${QIG_SOURCE_DIR:-${REPOSITORY_ROOT}/.third_party/QIG}"
 VENV_DIR="${VENV_DIR:-${REPOSITORY_ROOT}/.venv}"
 PYTHON_BIN="${PYTHON:-python3.11}"
 LLAVA_SOURCE_DIR="${QIG_SOURCE_DIR}/3rdparty/LLaVA-NeXT"
@@ -24,16 +24,16 @@ for arg in "$@"; do
     fi
 done
 
-if [[ ! -f "${QIG_SOURCE_DIR}/main_quant.py" ]]; then
+if [[ ! -d "${QIG_SOURCE_DIR}/.git" ]]; then
     if [[ -e "${QIG_SOURCE_DIR}" ]]; then
-        echo "QIG source path exists but is incomplete: ${QIG_SOURCE_DIR}" >&2
+        echo "QIG source path exists but is not a git checkout: ${QIG_SOURCE_DIR}" >&2
         exit 1
     fi
     mkdir -p "$(dirname -- "${QIG_SOURCE_DIR}")"
     echo "Cloning QIG source into ${QIG_SOURCE_DIR}"
     git clone https://github.com/ucas-xiang/QIG.git "${QIG_SOURCE_DIR}"
 else
-    echo "Using QIG source: ${QIG_SOURCE_DIR}"
+    echo "Using existing QIG checkout: ${QIG_SOURCE_DIR}"
 fi
 
 if [[ ! -f "${QIG_SOURCE_DIR}/main_quant.py" ]]; then
@@ -77,7 +77,7 @@ if [[ "${PYTHON_VERSION}" != "3.11" ]]; then
     exit 1
 fi
 
-SETUP_MARKER="${VENV_DIR}/.project-dependencies-source-selected-v6"
+SETUP_MARKER="${VENV_DIR}/.project-dependencies-source-selected-v5"
 if [[ ! -f "${SETUP_MARKER}" ]]; then
     "${PROJECT_PYTHON}" -m pip install --upgrade pip
     "${PROJECT_PYTHON}" -m pip install -r "${REPOSITORY_ROOT}/requirements.txt"

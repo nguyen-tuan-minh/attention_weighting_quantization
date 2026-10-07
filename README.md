@@ -91,7 +91,7 @@ The scripts keep calibration selection and forwarding local to the workflow. Att
 
 ### Run QIG quantization
 
-The QIG source is kept under `third_party/QIG` so its code can be maintained with this project. The LLaVA-NeXT and LMMS-Eval companion checkouts are ignored by Git and cloned there by the setup script. The script uses the shared Python 3.11 `.venv`, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected method against the original `liuhaotian/llava-v1.5-7b` model. When `--base-model` is omitted, it downloads the model from `configs/model.yaml` into `models/llava-v1.5-7b` if that directory does not already contain a config and weight file. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
+On the QIG branch, this script clones QIG and the two companion repositories named by QIG (LLaVA-NeXT and its LMMS-Eval fork) into `.third_party/QIG`, uses the shared Python 3.11 `.venv`, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected method against the original `liuhaotian/llava-v1.5-7b` model. When `--base-model` is omitted, it downloads the model from `configs/model.yaml` into `models/llava-v1.5-7b` if that directory does not already contain a config and weight file. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
 
 ```bash
 bash scripts/quantize_qig.sh \
@@ -103,9 +103,9 @@ bash scripts/quantize_qig.sh \
   --w-group 128
 ```
 
-The output directory must not already exist unless `--overwrite` is passed. Supported `--method` values are `qig`, `mbq`, `awq`, `smoothquant`, `rtn`, and `gptq`, matching the methods exposed by QIG's quantization wrapper. Add `--reweight` or `--distort` for methods that support those options (`qig` and `mbq`). Use `--a-bit`, `--alpha`, and `--percdamp` to set activation precision, SmoothQuant scaling, and GPTQ damping. RTN does not need calibration data; the other methods sample ShareGPT4V COCO. The script uses micro batches of one by default to limit GPU memory use; change this with `--micro-batch-size` if needed. By default, `--model-placement cuda` keeps the model weights on the GPU during layerwise quantization to avoid copying the full model into host RAM. This needs enough VRAM for the model and quantization workspace; use `--model-placement cpu` to select QIG's original CPU offload behavior if VRAM is limited. For QIG, `--model-placement disk` stores decoder layers in a temporary disk cache and loads them one at a time. After quantization, the full model is restored and this cache is removed before checkpoint export to free disk space; it is also removed on ordinary failures. The cache needs free disk space roughly equal to the decoder weights; choose its parent directory with `--offload-dir`. A cache left by a forced process kill is removed on the next disk-mode run using the same parent directory. Disk mode currently does not support `--reweight` and restores the full model to CUDA for export. Timestamped stage and resource logs, plus per-layer activation/scale timings, are printed during the run.
+The output directory must not already exist unless `--overwrite` is passed. Supported `--method` values are `qig`, `mbq`, `awq`, `smoothquant`, `rtn`, and `gptq`, matching the methods exposed by QIG's quantization wrapper. Add `--reweight` or `--distort` for methods that support those options (`qig` and `mbq`). Use `--a-bit`, `--alpha`, and `--percdamp` to set activation precision, SmoothQuant scaling, and GPTQ damping. RTN does not need calibration data; the other methods sample ShareGPT4V COCO. The script uses micro batches of one by default to limit GPU memory use; change this with `--micro-batch-size` if needed.
 
-The QIG integration is in `src/attention_quantization/quantization/qig/`. The shared `requirements.txt` pins PyTorch 2.5.1 with CUDA 12.1 and includes the dependencies used by QIG, LLaVA, and the project scripts. Setup installs the QIG, LLaVA-NeXT, and LMMS-Eval packages editable with dependency resolution disabled, so QIG's broader requirements cannot replace the selected PyTorch build. All Python packages use `.venv`.
+The QIG integration is in `src/attention_quantization/quantization/qig/`. The shared `requirements.txt` pins PyTorch 2.5.1 with CUDA 12.1 and includes the dependencies used by QIG, LLaVA, and the project scripts. Setup installs the three source checkouts editable with dependency resolution disabled, so QIG's broader requirements cannot replace the selected PyTorch build. Source checkouts stay under `.third_party/QIG`; all Python packages use `.venv`.
 
 There is one upstream caveat: QIG's README model list does not advertise classic `llava`, but the checked-in QIG package contains an `llava_v15` processor and its companion LMMS-Eval fork registers a `llava` model adapter. This integration connects those two source paths directly for LLaVA 1.5. The source and dependency versions are recorded in each artifact; the combination still needs a run on the target CUDA machine to confirm runtime compatibility.
 
@@ -122,15 +122,6 @@ tokenizer = wrapper._tokenizer
 ```
 
 The loader uses QIG's LMMS-Eval `llava` adapter, so call it from `.venv` after running setup.
-
-Compare a saved QIG checkpoint with its base model on the exact calibration records used for quantization:
-
-```bash
-.venv/bin/python scripts/evaluate_quantized_model.py \
-  --quantized-model models/quantized/llava-1.5-7b-qig-w4g128
-```
-
-The script reports per-decoder-layer relative L2 error and RMSE over non-padding activations, plus mean KL divergence from the base model to the quantized model over assistant-answer next-token positions. It reads `calibration.jsonl` from the quantized artifact and writes `evaluation_metrics.json` there. Use `--samples N` to evaluate a prefix of those saved records. For faster forwards, it batches two samples by default; set `--batch-size` higher if GPU memory permits, or lower if you run out of memory. `--sequential-model-loading` reloads the base and quantized model for every batch and compares immediately, reducing retained activation/input memory at the cost of repeated checkpoint loading time. It releases each model from GPU memory before loading the next; it does not move model weights to CPU.
 
 ## Documentation
 
