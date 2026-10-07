@@ -132,6 +132,17 @@ Compare a saved QIG checkpoint with its base model on the exact calibration reco
 
 The script reports per-decoder-layer relative L2 error and RMSE over non-padding activations, plus mean KL divergence from the base model to the quantized model over assistant-answer next-token positions. It reads `calibration.jsonl` from the quantized artifact and writes `evaluation_metrics.json` there. Use `--samples N` to evaluate a prefix of those saved records. For faster forwards, it batches two samples by default; set `--batch-size` higher if GPU memory permits, or lower if you run out of memory. `--sequential-model-loading` reloads the base and quantized model for every batch and compares immediately, reducing retained activation/input memory at the cost of repeated checkpoint loading time. It releases each model from GPU memory before loading the next; it does not move model weights to CPU.
 
+To compare layer-output error on the top 10% image tokens ranked by IGA against error over all valid tokens, and correlate both errors with quantized-model cross-entropy, run:
+
+```bash
+.venv/bin/python scripts/iga_error_correlation.py \
+  --quantized-model models/quantized/llava-1.5-7b-qig-w4g128 \
+  --samples 128 \
+  --batch-size 1
+```
+
+This experiment samples 128 ShareGPT4V COCO records that have local images. IGA is averaged across attention heads and text-query positions for each image token, separately for each sample and layer. The script compares base and quantized decoder-block outputs, calculates per-sample MSE over (a) the highest-IGA 10% of image tokens and (b) all non-padding sequence tokens, then reports Pearson correlations with quantized-model answer-token cross-entropy. It alternates model loads per batch to limit memory; checkpoint reloads make larger runs slower. The results are written under `<quantized-model>/iga_error_correlation/`.
+
 ## Documentation
 
 Planning notes and supporting project documentation are in [`docs/`](docs/). The [project structure reference](docs/project_structure.md) describes the planned organization of the download, quantization, and evaluation scripts and packages.
