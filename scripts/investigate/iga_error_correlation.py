@@ -9,7 +9,6 @@ import json
 import math
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +26,7 @@ from attention_quantization.models.qig_loader import (  # noqa: E402
     load_qig_quantized_model,
 )
 from attention_quantization.quantization.qig import load_qig_runtime  # noqa: E402
+from investigation_logging import configure_logging, log  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,10 +51,17 @@ def parse_args() -> argparse.Namespace:
         help="Per-sample target: KL(base || quantized), or CE change (quantized CE - base CE).",
     )
     parser.add_argument(
+        "--log-level",
+        choices=("none", "normal", "extensive"),
+        default="normal",
+        help="Output detail: none, concise progress, or detailed progress and timings.",
+    )
+    parser.add_argument(
         "--quiet-warnings",
         action="store_true",
         help="Suppress Python and Hugging Face warning messages.",
     )
+    parser.add_argument("--timing", action="store_true", help="Print elapsed times for data, model, and batch stages.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for result CSV and JSON files.")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -275,26 +282,10 @@ def pearson_correlation(x: list[float], y: list[float]) -> float | None:
     return float(torch.corrcoef(torch.stack((left, right)))[0, 1])
 
 
-def silence_warnings() -> None:
-    warnings.filterwarnings("ignore")
-    try:
-        from transformers.utils import logging as transformers_logging
-
-        transformers_logging.set_verbosity_error()
-    except ImportError:
-        pass
-    try:
-        from datasets.utils import logging as datasets_logging
-
-        datasets_logging.set_verbosity_error()
-    except ImportError:
-        pass
-
-
 def main() -> int:
     args = parse_args()
-    if args.quiet_warnings:
-        silence_warnings()
+    configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
+    args.timing = args.timing or args.log_level == "extensive"
     try:
         if args.samples < 2:
             raise ValueError("--samples must be at least 2 to calculate correlations")
@@ -302,6 +293,7 @@ def main() -> int:
             raise ValueError("--batch-size must be positive")
         if not 0 < args.top_percent <= 100:
             raise ValueError("--top-percent must be in (0, 100]")
+        run_started = time.perf_counter()
 
         quantized_dir = args.quantized_model.expanduser().resolve()
         metadata_path = quantized_dir / "qig_metadata.json"
@@ -318,28 +310,52 @@ def main() -> int:
         if not qig_source.is_absolute():
             qig_source = (REPOSITORY_ROOT / qig_source).resolve()
         runtime = load_qig_runtime(qig_source)
+        log(
+            f"Analysis config: base_model={base_model}, quantized_model={quantized_dir}, "
+            f"device={args.device}, samples={args.samples}, batch_size={args.batch_size}, "
+            f"top_percent={args.top_percent}, correlation_target={args.correlation_target}",
+            level="extensive",
+        )
 
-        print("Loading ShareGPT4V COCO records with local images", flush=True)
+        data_started = time.perf_counter()
+        log("Loading ShareGPT4V COCO records with local images", flush=True)
         dataset = select_samples(args.dataset_config, args.samples, args.seed)
-        print(f"Selected {len(dataset)} samples (seed={args.seed})", flush=True)
+        log(f"Selected {len(dataset)} samples (seed={args.seed})", flush=True)
+        if args.timing:
+            log(f"[timing] Prepare dataset: {time.perf_counter() - data_started:.2f} s", flush=True)
         batches = [
             [dataset[index] for index in range(start, min(start + args.batch_size, len(dataset)))]
             for start in range(0, len(dataset), args.batch_size)
         ]
+        log(
+            f"Prepared {len(batches)} batches; batch_sizes="
+            f"{[len(batch) for batch in batches]}",
+            level="extensive",
+        )
         per_sample: list[dict[str, Any]] = []
         layer_count: int | None = None
         model_started = time.perf_counter()
 
         # Alternate checkpoint loads per batch to cap retained host/GPU memory.
         for batch_index, samples in enumerate(batches, start=1):
-            print(f"Loading base model for batch {batch_index}/{len(batches)}", flush=True)
+            batch_started = time.perf_counter()
+            log(
+                f"Batch {batch_index}/{len(batches)} sample_ids="
+                f"{[str(sample.get('id', '')) for sample in samples]}",
+                level="extensive",
+            )
+            base_load_started = time.perf_counter()
+            log(f"Loading base model for batch {batch_index}/{len(batches)}", flush=True)
             base_lm, base_adapter = load_qig_llava_model(
                 base_model,
                 qig_source_dir=qig_source,
                 device=args.device,
                 attn_implementation=model_config.get("attn_implementation", "eager"),
             )
+            if args.timing:
+                log(f"[timing] Base model load: {time.perf_counter() - base_load_started:.2f} s", flush=True)
             base_adapter.model.config.output_attentions = True
+            base_forward_started = time.perf_counter()
             inputs_embeds, batch_kwargs = prepare_batch(base_adapter, samples)
             base_outputs, iga_by_sample, _base_logits = capture_layer_outputs_and_iga(
                 base_adapter,
@@ -347,28 +363,50 @@ def main() -> int:
                 batch_kwargs,
                 capture_iga=True,
             )
+            if args.timing:
+                log(f"[timing] Base preprocessing and forward: {time.perf_counter() - base_forward_started:.2f} s", flush=True)
             assert iga_by_sample is not None
             layer_count = len(base_outputs[0])
+            log(
+                f"Base capture: layers={layer_count}, inputs_embeds={tuple(inputs_embeds.shape)}, "
+                f"attention_mask={tuple(batch_kwargs['attention_mask'].shape)}, "
+                f"labels={tuple(batch_kwargs['labels'].shape)}, "
+                f"vision_mask={tuple(batch_kwargs['vision_mask'].shape)}",
+                level="extensive",
+            )
             del base_adapter, base_lm
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            print(f"Loading quantized model for batch {batch_index}/{len(batches)}", flush=True)
+            quant_load_started = time.perf_counter()
+            log(f"Loading quantized model for batch {batch_index}/{len(batches)}", flush=True)
             quant_lm = load_qig_quantized_model(
                 quantized_dir,
                 device=args.device,
                 qig_source_dir=qig_source,
             )
+            if args.timing:
+                log(f"[timing] Quantized model load: {time.perf_counter() - quant_load_started:.2f} s", flush=True)
             quant_adapter = make_process_model(runtime, quant_lm)
+            quant_forward_started = time.perf_counter()
             quant_outputs, _unused_iga, quant_logits = capture_layer_outputs_and_iga(
                 quant_adapter,
                 inputs_embeds,
                 batch_kwargs,
                 capture_iga=False,
             )
+            if args.timing:
+                log(f"[timing] Quantized forward: {time.perf_counter() - quant_forward_started:.2f} s", flush=True)
             if len(quant_outputs[0]) != layer_count:
                 raise ValueError("Base and quantized models have different decoder layer counts")
+            log(
+                f"Quantized capture: layers={len(quant_outputs[0])}, "
+                f"logits={tuple(quant_logits.shape)}, "
+                f"base_layer0={tuple(base_outputs[0][0].shape)}, "
+                f"quant_layer0={tuple(quant_outputs[0][0].shape)}",
+                level="extensive",
+            )
 
             image_mask = batch_kwargs["vision_mask"].bool()
             attention_mask = batch_kwargs["attention_mask"].bool()
@@ -400,7 +438,18 @@ def main() -> int:
                         "full_mse": full_errors,
                     }
                 )
-            print(f"Compared batch {batch_index}/{len(batches)}", flush=True)
+                log(
+                    f"Analyzed sample {len(per_sample)}/{len(dataset)}: "
+                    f"KL={kl:.6g}, base_CE={base_ce:.6g}, quantized_CE={ce:.6g}, "
+                    f"CE_delta={ce_delta:.6g}, top_IGA_MSE_mean="
+                    f"{sum(top_errors) / len(top_errors):.6g}, full_MSE_mean="
+                    f"{sum(full_errors) / len(full_errors):.6g}",
+                    level="extensive",
+                    flush=True,
+                )
+            log(f"Compared batch {batch_index}/{len(batches)}", flush=True)
+            if args.timing:
+                log(f"[timing] Batch total: {time.perf_counter() - batch_started:.2f} s", flush=True)
             del quant_adapter, quant_lm, inputs_embeds, batch_kwargs
             del base_outputs, quant_outputs, iga_by_sample, quant_logits, _base_logits
             gc.collect()
@@ -466,13 +515,15 @@ def main() -> int:
             writer.writeheader()
             writer.writerows(layer_results)
 
-        print("Layer | corr_10% | corr_full | difference", flush=True)
+        log("Layer | corr_10% | corr_full | difference", flush=True)
         for row in layer_results:
-            print(
+            log(
                 f"{row['layer']:>5} | {row['corr_top_iga']!s:>8} | "
                 f"{row['corr_full']!s:>9} | {row['corr_difference']!s:>10}"
             )
-        print(f"Saved result files to {output_dir}")
+        log(f"Saved result files to {output_dir}")
+        if args.timing:
+            log(f"[timing] Total: {time.perf_counter() - run_started:.2f} s", flush=True)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, IndexError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

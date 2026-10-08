@@ -6,31 +6,33 @@ they are easy to run, compare, and maintain.
 
 ## The five phases
 
-Keep `main()` organized into these five visible phases, using numbered section
-comments where the workflow is long:
+Use these numbered section headings in `main()` so the workflow is easy to scan
+and familiar across investigation scripts:
 
-1. **Read options and configuration.** Parse CLI arguments, load the model and
-   dataset YAML files, apply CLI overrides, resolve repository-relative paths,
-   and validate values before loading large resources.
-2. **Select and prepare data.** Load the intended dataset split, select a
-   reproducible sample subset, and use locally available images where possible.
-   Print the selected count and seed. Keep preprocessing consistent across
-   models being compared.
-3. **Load model(s).** Load the base LLaVA model using the configured QIG
-   implementation. If the investigation concerns quantization, also load the
-   requested quantized model. The base model is the reference for hidden-state
-   error, logits, or other comparisons; the quantized model is the model under
-   investigation. Do not require a quantized checkpoint for an analysis that
-   only examines the base model.
-4. **Capture and compute.** Attach only the hooks needed for the investigation,
-   run inference with gradients disabled, and move retained measurements to CPU
-   promptly. Remove hooks after the forward pass and release model/batch memory
-   when practical. Keep sample and token masks explicit, especially assistant
-   answer masks and image-token masks.
-5. **Analyze and save results.** Compute summary statistics after data capture.
-   Write machine-readable results (CSV/JSON or tensor files) and figures to a
-   documented output directory. Print a concise progress summary and the output
-   path.
+1. **PREPARE CALIBRATION DATASET** — load the intended data source, select the
+   requested reproducible subset, check that required local images exist, and
+   report the sample count and seed. For quantized comparisons, prepare one
+   shared set of inputs for both models.
+2. **LOAD MODEL** — load the configured base LLaVA model. When the analysis
+   compares quantization, also load the quantized checkpoint and make its role
+   explicit. The base model is the reference; the quantized model is the model
+   under investigation. Do not require a quantized checkpoint for base-only
+   analysis.
+3. **REGISTER HOOKS** — register only the hooks needed to capture the
+   investigation's measurements (for example, attention weights or activations)
+   and report how many hooks were attached. Remove hooks in a `finally` block.
+4. **FORWARD CALIBRATION SAMPLES** — preprocess and run the selected examples
+   with gradients disabled. Use consistent inputs, sample order, labels, and
+   masks across compared models. Move retained measurements to CPU promptly
+   and release per-sample/model memory when practical.
+5. **ANALYSE CAPTURED DATA** — compute the investigation-specific statistics,
+   plots, or comparisons; save outputs in documented formats and locations; and
+   print a concise completion message and output path. The existing attention
+   script calls this phase `ANALYSE CAPTURED ATTENTION`, and the PCA script calls
+   it `ANALYSE ACTIVATIONS`; use a specific noun where it improves clarity.
+
+Read CLI arguments and configs before phase 1, and validate them before loading
+large resources. These setup steps do not replace or renumber the five phases.
 
 ## Configuration files
 
@@ -62,7 +64,16 @@ Unless an investigation has a clear reason to differ, provide:
 - `--device` or the configured device setting when device selection is needed.
 - An output path option such as `--output-dir` or `--save-dir` when results are
   written. Default outputs should be predictable and reported at completion.
-- `--timing` when the script has expensive setup or per-sample work.
+- `--log-level` with three levels: `none` suppresses routine progress and
+  timing output, `normal` prints concise phase/sample milestones, and
+  `extensive` prints resolved model/data settings, input and mask shapes, hook
+  and capture counts, per-sample metrics, and timing output. Use `normal` as the
+  default.
+- `--quiet-warnings` to silence warning messages from Python and dependencies
+  when they overwhelm useful output. It must not suppress errors or exceptions.
+- `--timing` to show timing lines while keeping normal verbosity. It is enabled
+  automatically by `--log-level extensive`; `--log-level none` suppresses the
+  timing lines as well.
 - `--quantized-model` when a quantized checkpoint is an actual input. Require
   it for comparisons that cannot run without it, validate its metadata before
   model loading, and use `--base-model` as an optional reference override when
@@ -73,16 +84,6 @@ size, layer/token selection, plot scope, or the metric being correlated). Give
 each option a useful help string and validate numeric ranges before starting
 inference. Avoid hiding the purpose of a run behind hard-coded sample counts,
 model paths, or output locations.
-
-## Quantized-model comparisons
-
-For a base-versus-quantized analysis, make the roles and metric direction
-explicit in the CLI help, output metadata, and README/example command. Use the
-same inputs, labels, token masks, and sample order for both models. Record both
-model identities and the metric definition in the summary output. For example,
-`iga_error_correlation.py` supports a required quantized checkpoint and a base
-reference, then lets the user choose `KL(base || quantized)` or the CE change
-`quantized CE - base CE` with `--correlation-target`.
 
 ## Current scripts
 

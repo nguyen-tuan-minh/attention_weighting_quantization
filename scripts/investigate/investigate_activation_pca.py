@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
+from investigation_logging import configure_logging, log  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 
 
@@ -206,7 +207,7 @@ def show_activation_pca(
         save_dir.mkdir(parents=True, exist_ok=True)
         output_path = save_dir / output_name
         figure.savefig(output_path, dpi=160, bbox_inches="tight")
-        print(f"Saved PCA figure to {output_path}")
+        log(f"Saved PCA figure to {output_path}")
     plt.show()
     plt.close(figure)
 
@@ -227,6 +228,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured seed.")
+    parser.add_argument(
+        "--log-level",
+        choices=("none", "normal", "extensive"),
+        default="normal",
+        help="Output detail: none, concise progress, or detailed progress and timings.",
+    )
+    parser.add_argument("--quiet-warnings", action="store_true", help="Suppress Python and dependency warnings.")
     parser.add_argument(
         "--save-dir",
         type=Path,
@@ -250,6 +258,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
+    args.timing = args.timing or args.log_level == "extensive"
     try:
         dataset_config = read_yaml(args.dataset_config)
         model_config = read_yaml(args.model_config)
@@ -282,9 +292,14 @@ def main() -> int:
                 "with local images are available"
             )
         dataset = dataset.shuffle(seed=seed).select(range(sample_count))
-        print(f"Selected {len(dataset):,} COCO samples with local images")
+        log(f"Selected {len(dataset):,} COCO samples with local images")
+        log(
+            f"Dataset source=COCO, available={len(dataset):,}, seed={seed}, "
+            f"dataset_config={args.dataset_config}",
+            level="extensive",
+        )
         if dataset_started is not None:
-            print(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
+            log(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
 
         # =====================================================================
         # 2. LOAD MODEL
@@ -297,7 +312,7 @@ def main() -> int:
         )
         if not (model_dir / "config.json").is_file() or not has_weights:
             model_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Downloading LLaVA checkpoint {model_id} to {model_dir}")
+            log(f"Downloading LLaVA checkpoint {model_id} to {model_dir}")
             snapshot_download(repo_id=model_id, local_dir=str(model_dir))
 
         model, input_adapter = load_model(
@@ -306,8 +321,14 @@ def main() -> int:
             repository_root=REPOSITORY_ROOT,
         )
         model.eval()
+        model_parameter = next(model.parameters())
+        log(
+            f"Loaded model_id={model_id}, model_dir={model_dir}, "
+            f"device={model_parameter.device}, dtype={model_parameter.dtype}",
+            level="extensive",
+        )
         if model_started is not None:
-            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
+            log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
         # 3. REGISTER HOOKS
@@ -315,14 +336,14 @@ def main() -> int:
         hooks_started = time.perf_counter() if args.timing else None
         active_sample: dict[str, Any] = {"activations": {}}
         hook_handles = register_layernorm_hooks(model, active_sample)
-        print(f"Registered hooks on {len(hook_handles)} decoder input LayerNorm modules")
+        log(f"Registered hooks on {len(hook_handles)} decoder input LayerNorm modules")
         if hooks_started is not None:
-            print(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
+            log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
 
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
-        print(f"Forwarding {len(dataset):,} samples one at a time...")
+        log(f"Forwarding {len(dataset):,} samples one at a time...")
         activation_samples: list[dict[int, torch.Tensor]] = []
         token_masks: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
@@ -343,6 +364,12 @@ def main() -> int:
                 text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify image and text token positions")
+                log(
+                    f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
+                    f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
+                    f"text_tokens={int(text_mask.sum())}",
+                    level="extensive",
+                )
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
@@ -354,9 +381,16 @@ def main() -> int:
                         return_dict=True,
                     )
                 if forward_started is not None:
-                    print(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
+                    log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if not active_sample["activations"]:
                     raise RuntimeError("No layernorm hooks captured activations")
+                first_activation = active_sample["activations"][min(active_sample["activations"])]
+                log(
+                    f"Sample {index}: logits={tuple(outputs.logits.shape)}, "
+                    f"captured_layers={len(active_sample['activations'])}, "
+                    f"activation_shape={tuple(first_activation.shape)}",
+                    level="extensive",
+                )
 
                 if args.plot_scope == "all":
                     activation_samples.append(active_sample["activations"])
@@ -369,7 +403,7 @@ def main() -> int:
                         balance_pca=args.balance_pca,
                         seed=seed,
                     )
-                    print(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers")
+                    log(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers", level="extensive")
                     show_activation_pca(
                         projected,
                         f"Sample {index}: post-input-LayerNorm activations",
@@ -377,9 +411,9 @@ def main() -> int:
                         output_name=f"sample_{index:04d}_activation_pca.png",
                     )
                     if analyse_started is not None:
-                        print(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
+                        log(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
                 if sample_started is not None:
-                    print(f"[timing] Sample {index} total: {time.perf_counter() - sample_started:.2f} s")
+                    log(f"[timing] Sample {index} total: {time.perf_counter() - sample_started:.2f} s")
                 del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
         finally:
             for handle in hook_handles:
@@ -397,7 +431,7 @@ def main() -> int:
                 seed=seed,
             )
             balance_label = " with balanced PCA fitting" if args.balance_pca else ""
-            print(
+            log(
                 f"PCA calculated for {len(projected)} layers using "
                 f"{len(activation_samples)} samples{balance_label}"
             )
@@ -409,10 +443,10 @@ def main() -> int:
                 contributing_samples=len(activation_samples),
             )
             if analyse_started is not None:
-                print(f"[timing] Pooled PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
-        print("Layer-wise image/text activation PCA complete.")
+                log(f"[timing] Pooled PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
+        log("Layer-wise image/text activation PCA complete.")
         if total_started is not None:
-            print(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
+            log(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

@@ -28,6 +28,7 @@ from attention_quantization.data import (  # noqa: E402
     load_sharegpt4v_dataset,
 )
 from attention_quantization.models import load_model  # noqa: E402
+from investigation_logging import configure_logging, log  # noqa: E402
 
 
 def register_attention_hooks(
@@ -187,6 +188,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured seed.")
     parser.add_argument(
+        "--log-level",
+        choices=("none", "normal", "extensive"),
+        default="normal",
+        help="Output detail: none, concise progress, or detailed progress and timings.",
+    )
+    parser.add_argument("--quiet-warnings", action="store_true", help="Suppress Python and dependency warnings.")
+    parser.add_argument(
         "--mode",
         choices=("online", "save"),
         default="online",
@@ -207,6 +215,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
+    args.timing = args.timing or args.log_level == "extensive"
     try:
         dataset_config = read_yaml(args.dataset_config)
         model_config = read_yaml(args.model_config)
@@ -236,6 +246,11 @@ def main() -> int:
             )
         if seed is not None or sample_count < len(dataset):
             dataset = dataset.shuffle(seed=seed).select(range(sample_count))
+        log(
+            f"Dataset source=COCO, selected={len(dataset):,}, requested={sample_count}, "
+            f"seed={seed}, dataset_config={args.dataset_config}",
+            level="extensive",
+        )
 
         calibration_dir = repository_path(
             dataset_config.get(
@@ -245,9 +260,9 @@ def main() -> int:
         )
         calibration_dir.parent.mkdir(parents=True, exist_ok=True)
         dataset.save_to_disk(str(calibration_dir))
-        print(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
+        log(f"Saved {len(dataset):,} calibration records to {calibration_dir}")
         if dataset_started is not None:
-            print(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
+            log(f"[timing] Prepare calibration dataset: {time.perf_counter() - dataset_started:.2f} s")
 
         # =====================================================================
         # 2. LOAD MODEL
@@ -256,7 +271,7 @@ def main() -> int:
         model_id = model_config["model_id"]
         model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
         model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading or updating model {model_id} at {model_dir}")
+        log(f"Downloading or updating model {model_id} at {model_dir}")
         snapshot_download(repo_id=model_id, local_dir=str(model_dir))
 
         model, input_adapter = load_model(
@@ -265,8 +280,15 @@ def main() -> int:
             repository_root=REPOSITORY_ROOT,
         )
         model.config.output_attentions = True
+        model_parameter = next(model.parameters())
+        log(
+            f"Loaded model_id={model_id}, model_dir={model_dir}, "
+            f"device={model_parameter.device}, dtype={model_parameter.dtype}, "
+            f"attn_implementation={model_config.get('attn_implementation', 'eager')}",
+            level="extensive",
+        )
         if model_started is not None:
-            print(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
+            log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
         # 3. REGISTER ATTENTION HOOKS
@@ -288,14 +310,14 @@ def main() -> int:
             "iga": {},
         }
         hook_handles = register_attention_hooks(model, args.mode, active_sample)
-        print(f"Registered hooks on {len(hook_handles)} self-attention layers")
+        log(f"Registered hooks on {len(hook_handles)} self-attention layers")
         if hooks_started is not None:
-            print(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
+            log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
 
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
-        print(f"Forwarding {len(dataset):,} samples one at a time...")
+        log(f"Forwarding {len(dataset):,} samples one at a time...")
         try:
             for index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
@@ -331,12 +353,18 @@ def main() -> int:
                 text_mask &= torch.arange(text_mask.numel(), device=text_mask.device) > image_end
                 if not text_mask.any():
                     raise ValueError("No text query tokens occur after the image tokens")
+                log(
+                    f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
+                    f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
+                    f"text_query_tokens={int(text_mask.sum())}",
+                    level="extensive",
+                )
                 active_sample["image_mask"] = image_mask
                 active_sample["text_mask"] = text_mask
                 if sample_started is not None:
-                    print(
+                    log(
                         f"[timing] Sample {index} preprocessing: "
-                        f"{time.perf_counter() - sample_started:.2f} s"
+                        f"{time.perf_counter() - sample_started:.2f} s",
                     )
 
                 forward_started = time.perf_counter() if args.timing else None
@@ -349,20 +377,31 @@ def main() -> int:
                         return_dict=True,
                     )
                 if forward_started is not None:
-                    print(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
+                    log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if active_sample["captured"] == 0:
                     raise RuntimeError(
                         "Attention hooks captured no weights; check the Transformers attention implementation"
                     )
-                print(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}")
+                log(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}", level="extensive")
+                log(
+                    f"[{index}/{len(dataset)}] captured_attention_layers={active_sample['captured']}",
+                    level="extensive",
+                )
                 if args.mode == "online":
                     layer_scores = active_sample["iga"]
                     if not layer_scores:
                         raise RuntimeError("No per-layer IGA scores were captured")
+                    score_values = torch.cat(list(layer_scores.values()))
+                    log(
+                        f"[{index}/{len(dataset)}] IGA layers={len(layer_scores)}, "
+                        f"image-token scores min={score_values.min():.6g}, "
+                        f"mean={score_values.mean():.6g}, max={score_values.max():.6g}",
+                        level="extensive",
+                    )
                     # Print the conversation before showing the image and every layer's map.
-                    print(f"[{index}/{len(dataset)}] Conversation:")
-                    print(f"  USER: {user_text}")
-                    print(f"  ASSISTANT: {assistant_text}")
+                    log(f"[{index}/{len(dataset)}] Conversation:", level="extensive")
+                    log(f"  USER: {user_text}", level="extensive")
+                    log(f"  ASSISTANT: {assistant_text}", level="extensive")
                     plot_started = time.perf_counter() if args.timing else None
                     show_iga_heatmap(
                         sample["image"],
@@ -371,13 +410,14 @@ def main() -> int:
                         heatmap_only=args.heatmap_only,
                     )
                     if plot_started is not None:
-                        print(
+                        log(
                             f"[timing] Sample {index} heatmap display: "
-                            f"{time.perf_counter() - plot_started:.2f} s"
+                            f"{time.perf_counter() - plot_started:.2f} s",
                         )
                 else:
-                    print(
-                        f"  Saved {active_sample['captured']} attention matrices to {sample_dir}"
+                    log(
+                        f"  Saved {active_sample['captured']} attention matrices to {sample_dir}",
+                        level="extensive",
                     )
                 del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
         finally:
@@ -391,11 +431,11 @@ def main() -> int:
         # forward loop. Add further saved-map analysis here.
 
         if args.mode == "online":
-            print("Online IGA heatmap display complete; no attention maps were saved.")
+            log("Online IGA heatmap display complete; no attention maps were saved.")
         else:
-            print(f"Attention maps saved under: {attention_dir}")
+            log(f"Attention maps saved under: {attention_dir}")
         if total_started is not None:
-            print(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
+            log(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
