@@ -361,13 +361,15 @@ def main() -> int:
                 prepared = input_adapter.preprocess_data([sample["image"]], row)
                 batch = input_adapter.data_collator([prepared])
                 prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
-                attention_mask = prompt_kwargs["attention_mask"][0].bool()
-                image_mask = prompt_kwargs["vision_mask"][0].bool()
+                # Adapter masks may arrive on different devices. Keep all
+                # mask arithmetic on CPU; hooks move masks to attention-device.
+                attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+                image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
                 text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify text-query and image-key token positions")
                 image_end = image_mask.nonzero(as_tuple=True)[0][-1]
-                text_mask &= torch.arange(text_mask.numel(), device=text_mask.device) > image_end
+                text_mask &= torch.arange(text_mask.numel()) > image_end
                 if not text_mask.any():
                     raise ValueError("No text query tokens occur after the image tokens")
                 log(

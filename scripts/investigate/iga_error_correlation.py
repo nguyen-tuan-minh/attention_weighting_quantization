@@ -114,20 +114,20 @@ def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Te
 
 
 def image_and_text_masks(kwargs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    attention_mask = kwargs["attention_mask"].bool()
+    # Normalize adapter masks before boolean operations: some preprocessors
+    # return attention_mask and vision_mask on different devices.
+    attention_mask = kwargs["attention_mask"].bool().detach().cpu()
     image_mask = kwargs.get("vision_mask")
     if image_mask is None:
         raise ValueError("QIG input adapter did not provide a vision_mask for image-token selection")
-    image_mask = image_mask.bool() & attention_mask
+    image_mask = image_mask.bool().detach().cpu() & attention_mask
     text_mask = attention_mask & ~image_mask
     for sample_index in range(image_mask.shape[0]):
         image_positions = image_mask[sample_index].nonzero(as_tuple=True)[0]
         if image_positions.numel() == 0:
             raise ValueError(f"Sample {sample_index} has no image tokens")
         # As in investigate/investigate_attention.py, use text query tokens following the image.
-        text_mask[sample_index] &= torch.arange(
-            text_mask.shape[1], device=text_mask.device
-        ) > image_positions[-1]
+        text_mask[sample_index] &= torch.arange(text_mask.shape[1]) > image_positions[-1]
         if not text_mask[sample_index].any():
             raise ValueError(f"Sample {sample_index} has no text tokens after the image")
     return image_mask, text_mask
@@ -228,9 +228,9 @@ def layer_mse(
         if base_y.shape != quant_y.shape:
             raise ValueError(f"Layer {layer_index} output shapes differ: {base_y.shape} and {quant_y.shape}")
         difference = (base_y.float() - quant_y.float()).square().mean(dim=-1)
-        valid = attention_mask.bool()
+        valid = attention_mask.to(difference.device).bool()
         full_errors.append(float(difference[valid].mean()))
-        image_positions = image_mask.bool().nonzero(as_tuple=True)[0]
+        image_positions = image_mask.to(difference.device).bool().nonzero(as_tuple=True)[0]
         scores = iga_scores[layer_index]
         token_count = max(1, math.ceil(image_positions.numel() * top_percent / 100.0))
         chosen_local = torch.topk(scores, k=token_count).indices
