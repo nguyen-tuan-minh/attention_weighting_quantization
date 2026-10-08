@@ -75,10 +75,10 @@ The forward-only script prepares and saves the calibration dataset first. Its do
 The attention investigation script has two modes. The default `online` mode computes a separate IGA map for every layer, using non-padding text queries after the image tokens. It opens one Matplotlib figure per sample with the processor image and all per-layer overlays together, using a logarithmic color scale. It does not save attention maps. The `save` mode writes each captured language attention matrix under `attention_output_dir` for later analysis. It prepares the dataset and removes the COCO ZIP before downloading or loading LLaVA. Its five sections are: prepare calibration, load model, register hooks, forward, and analyse.
 
 ```bash
-.venv/bin/python scripts/investigate_attention.py                 # online analysis
-.venv/bin/python scripts/investigate_attention.py --mode save     # save attention maps
-.venv/bin/python scripts/investigate_attention.py --timing        # print step durations
-.venv/bin/python scripts/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
+.venv/bin/python scripts/investigate/investigate_attention.py                 # online analysis
+.venv/bin/python scripts/investigate/investigate_attention.py --mode save     # save attention maps
+.venv/bin/python scripts/investigate/investigate_attention.py --timing        # print step durations
+.venv/bin/python scripts/investigate/investigate_attention.py --heatmap-only  # standalone maps, no image overlay
 ```
 
 Both scripts first filter calibration records to images that exist locally, then sample from that available subset; this works with the configured 1,024-image extraction and skips missing COCO files. They forward each image with its ShareGPT4V user prompt and assistant caption, decoding images one at a time. Override the configured sample count or seed with `--samples` and `--seed`.
@@ -87,7 +87,7 @@ Both scripts first filter calibration records to images that exist locally, then
 
 Task-independent helpers live in `src/attention_quantization/`: `config.py` reads YAML and resolves repository paths, `models/loader.py` selects the configured model loader, and `data/conversation.py` reads user/assistant turns from a sample. Dataset-specific loading remains in `data/sharegpt4v.py`.
 
-The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `investigate_attention.py`; these are analysis-specific rather than shared infrastructure. This QIG workflow currently targets the original `liuhaotian/llava-v1.5-7b` checkpoint format. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
+The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `scripts/investigate/investigate_attention.py`; these are analysis-specific rather than shared infrastructure. This QIG workflow currently targets the original `liuhaotian/llava-v1.5-7b` checkpoint format. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
 
 ### Run QIG quantization
 
@@ -135,7 +135,7 @@ The script reports per-decoder-layer relative L2 error and RMSE over non-padding
 To compare layer-output error on the top 10% image tokens ranked by IGA against error over all valid tokens, and correlate both errors with quantized-model cross-entropy, run:
 
 ```bash
-.venv/bin/python scripts/iga_error_correlation.py \
+.venv/bin/python scripts/investigate/iga_error_correlation.py \
   --quantized-model models/quantized/llava-1.5-7b-qig-w4g128 \
   --samples 128 \
   --batch-size 1

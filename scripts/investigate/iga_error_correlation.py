@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from datasets import Dataset
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
@@ -117,7 +117,7 @@ def image_and_text_masks(kwargs: dict[str, torch.Tensor]) -> tuple[torch.Tensor,
         image_positions = image_mask[sample_index].nonzero(as_tuple=True)[0]
         if image_positions.numel() == 0:
             raise ValueError(f"Sample {sample_index} has no image tokens")
-        # As in investigate_attention.py, use text query tokens following the image.
+        # As in investigate/investigate_attention.py, use text query tokens following the image.
         text_mask[sample_index] &= torch.arange(
             text_mask.shape[1], device=text_mask.device
         ) > image_positions[-1]

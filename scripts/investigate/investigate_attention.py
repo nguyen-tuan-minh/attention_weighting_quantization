@@ -19,7 +19,7 @@ from datasets import Dataset
 from huggingface_hub import snapshot_download
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
