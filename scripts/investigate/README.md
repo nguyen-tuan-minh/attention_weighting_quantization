@@ -54,6 +54,17 @@ Use the shared config/path helpers from `attention_quantization.config` and
 config values. A CLI value takes precedence over YAML; otherwise use the
 configured value and document any script-specific fallback.
 
+## Tensor device safety
+
+Do not assume masks returned by the multimodal adapter share a device. In
+particular, `attention_mask`, `vision_mask`, and `labels` may be split between
+CPU and GPU. Before combining masks with boolean operations, detach and move
+them to one common device (CPU is convenient for bookkeeping). Before using a
+mask to index activations or attention weights, move that mask to the indexed
+tensor's device. Keep the original adapter tensors on their expected devices
+when passing inputs to the model. This avoids errors such as `Expected all
+tensors to be on the same device`.
+
 ## Common command-line options
 
 Unless an investigation has a clear reason to differ, provide:
@@ -89,7 +100,10 @@ model paths, or output locations.
 
 - `investigate_attention.py`: captures attention/IGA information and can display
   or save attention maps. Use `--true-attention-percent` to label image-key
-  softmax weights as percentages of attention over all valid keys.
+  softmax weights as percentages of attention over all valid keys. Use
+  `--top-token-percent 0.1` for a binary map retaining the top 10% of image
+  tokens independently in each layer; this mode uses nearest-neighbor resizing
+  and a discrete colorbar instead of the logarithmic attention scale.
 - `investigate_activation_pca.py`: captures layer activations and plots
   image-token versus text-token PCA.
 - `investigate_assistant_attention.py`: measures assistant answer-token attention
