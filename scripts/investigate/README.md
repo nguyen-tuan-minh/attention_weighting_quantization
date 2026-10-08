@@ -91,8 +91,27 @@ model paths, or output locations.
   or save attention maps.
 - `investigate_activation_pca.py`: captures layer activations and plots
   image-token versus text-token PCA.
+- `investigate_assistant_attention.py`: measures assistant answer-token attention
+  to image and non-image text keys, then saves per-layer percentages as a
+  stacked graph and CSV.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
+
+For `investigate_assistant_attention.py`, assistant query positions come from
+the non-ignored answer labels. Image keys come from `vision_mask`; text keys are
+all valid non-image positions. The graph reports each group's share of the
+combined image-plus-text attention mass, averaged over heads, answer queries,
+and samples. The CSV also records the number of head/query rows contributing to
+each layer.
+
+Example:
+
+```bash
+python scripts/investigate/investigate_assistant_attention.py \
+  --samples 128 \
+  --log-level extensive \
+  --quiet-warnings
+```
 
 All scripts should be runnable from the repository root, derive the root from
 `Path(__file__)` (two parent levels from this directory), and keep analysis code
