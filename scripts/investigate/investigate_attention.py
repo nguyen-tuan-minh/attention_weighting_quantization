@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm
 from PIL import Image
 import torch.nn.functional as F
 import torch
@@ -88,6 +88,7 @@ def show_iga_heatmap(
     sample_number: int,
     heatmap_only: bool = False,
     attention_percent: bool = False,
+    top_token_percent: float | None = None,
 ) -> None:
     """Display image-key attention maps for every language layer."""
     if not layer_iga_scores:
@@ -112,17 +113,30 @@ def show_iga_heatmap(
     image_height, image_width = image.shape[:2]
     # Use a shared logarithmic scale so small IGA differences remain visible
     # while keeping layer magnitudes comparable within this sample.
-    scale = 100.0 if attention_percent else 1.0
-    layer_scores = [scores * scale for scores in layer_iga_scores.values()]
-    positive_scores = torch.cat([scores.reshape(-1) for scores in layer_scores])
-    positive_scores = positive_scores[positive_scores > 0]
-    if positive_scores.numel() == 0:
-        raise ValueError("IGA scores are all zero; cannot draw a logarithmic heatmap")
-    color_min = float(torch.quantile(positive_scores, 0.01))
-    color_max = float(positive_scores.max())
-    if color_min >= color_max:
-        color_min = color_max * 1e-6
-    color_norm = LogNorm(vmin=color_min, vmax=color_max, clip=True)
+    binary_mode = top_token_percent is not None
+    if binary_mode:
+        layer_scores = []
+        for scores in layer_iga_scores.values():
+            retain_count = max(1, math.ceil(scores.numel() * top_token_percent))
+            selected = torch.topk(scores.flatten(), k=retain_count).indices
+            binary_scores = torch.zeros_like(scores).flatten()
+            binary_scores[selected] = 1.0
+            layer_scores.append(binary_scores.reshape_as(scores))
+        color_map = ListedColormap(["#202020", "#FFD400"])
+        color_norm = BoundaryNorm([-0.5, 0.5, 1.5], color_map.N)
+    else:
+        scale = 100.0 if attention_percent else 1.0
+        layer_scores = [scores * scale for scores in layer_iga_scores.values()]
+        positive_scores = torch.cat([scores.reshape(-1) for scores in layer_scores])
+        positive_scores = positive_scores[positive_scores > 0]
+        if positive_scores.numel() == 0:
+            raise ValueError("IGA scores are all zero; cannot draw a logarithmic heatmap")
+        color_min = float(torch.quantile(positive_scores, 0.01))
+        color_max = float(positive_scores.max())
+        if color_min >= color_max:
+            color_min = color_max * 1e-6
+        color_norm = LogNorm(vmin=color_min, vmax=color_max, clip=True)
+        color_map = "inferno"
 
     # Display the image and all layer overlays together in one figure per sample.
     panel_count = len(layer_iga_scores) + 1
@@ -142,15 +156,23 @@ def show_iga_heatmap(
     heatmap_view = None
     for axis, (layer_name, scores) in zip(flat_axes[1:], zip(layer_iga_scores, layer_scores)):
         # Expand this layer's image-token scores to the processed image size.
-        heatmap = F.interpolate(
-            scores.reshape(1, 1, grid_size, grid_size),
-            size=(image_height, image_width),
-            mode="bilinear",
-            align_corners=False,
-        )[0, 0].numpy()
+        interpolation_input = scores.reshape(1, 1, grid_size, grid_size)
+        if binary_mode:
+            heatmap = F.interpolate(
+                interpolation_input,
+                size=(image_height, image_width),
+                mode="nearest",
+            )[0, 0].numpy()
+        else:
+            heatmap = F.interpolate(
+                interpolation_input,
+                size=(image_height, image_width),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0].numpy()
         if not heatmap_only:
             axis.imshow(image)
-        heatmap_view = axis.imshow(heatmap, cmap="inferno", norm=color_norm)
+        heatmap_view = axis.imshow(heatmap, cmap=color_map, norm=color_norm)
         if not heatmap_only:
             heatmap_view.set_alpha(0.5)
         layer_index = layer_name.split("_layers_")[-1].split("_", 1)[0]
@@ -161,20 +183,32 @@ def show_iga_heatmap(
     for axis in flat_axes[:panel_count]:
         axis.axis("off")
     if heatmap_view is not None:
-        figure.colorbar(
+        colorbar = figure.colorbar(
             heatmap_view,
             ax=flat_axes[:panel_count].tolist(),
             fraction=0.015,
             pad=0.01,
             label=(
-                "Attention over all keys (%) (log scale)"
-                if attention_percent
-                else "Attention weight (log scale)"
+                "Top image-token mask (binary)"
+                if binary_mode
+                else (
+                    "Attention over all keys (%) (log scale)"
+                    if attention_percent
+                    else "Attention weight (log scale)"
+                )
             ),
         )
+        if binary_mode:
+            colorbar.set_ticks([0, 1])
+            colorbar.set_ticklabels(["Other tokens", "Retained top tokens"])
+    if binary_mode:
+        display_title = f"top {top_token_percent:.1%} image tokens per layer"
+    elif attention_percent:
+        display_title = "all-key attention percentage"
+    else:
+        display_title = "image-key attention weight"
     figure.suptitle(
-        f"Calibration sample {sample_number}: "
-        f"{'all-key attention percentage' if attention_percent else 'image-key attention weight'}"
+        f"Calibration sample {sample_number}: {display_title}"
     )
     plt.show()
     plt.close(figure)
@@ -219,13 +253,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show standalone heatmaps instead of overlays on the image.",
     )
-    parser.add_argument(
+    attention_display = parser.add_mutually_exclusive_group()
+    attention_display.add_argument(
         "--true-attention-percent",
         action="store_true",
         help=(
             "Display each image token's softmax attention as a percentage of attention over all valid keys "
             "instead of as a decimal weight."
         ),
+    )
+    attention_display.add_argument(
+        "--top-token-percent",
+        type=float,
+        default=None,
+        help="Show a binary map retaining this fraction of highest-scoring image tokens per layer (0.1 = 10%).",
     )
     return parser.parse_args()
 
@@ -244,6 +285,10 @@ def main() -> int:
             raise ValueError("calibration_samples must be a positive integer")
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
+        if args.top_token_percent is not None and not 0 < args.top_token_percent <= 1:
+            raise ValueError("--top-token-percent must be in (0, 1], for example 0.1 for 10%")
+        if args.top_token_percent is not None and args.mode != "online":
+            raise ValueError("--top-token-percent requires --mode online to display the binary heatmaps")
 
         total_started = time.perf_counter() if args.timing else None
 
@@ -428,6 +473,7 @@ def main() -> int:
                         index,
                         heatmap_only=args.heatmap_only,
                         attention_percent=args.true_attention_percent,
+                        top_token_percent=args.top_token_percent,
                     )
                     if plot_started is not None:
                         log(
