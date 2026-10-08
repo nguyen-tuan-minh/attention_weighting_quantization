@@ -225,10 +225,15 @@ def main() -> int:
                 batch = input_adapter.data_collator([prepared])
                 prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
-                attention_mask = prompt_kwargs["attention_mask"][0].bool()
-                image_mask = prompt_kwargs["vision_mask"][0].bool() & attention_mask
+                # Adapter fields can be split across CPU and GPU. Keep the
+                # masks together on CPU; the attention hook moves them to the
+                # weights' device before indexing.
+                attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+                image_mask = (
+                    prompt_kwargs["vision_mask"][0].bool().detach().cpu() & attention_mask
+                )
                 text_key_mask = attention_mask & ~image_mask
-                labels = prompt_kwargs["labels"][0]
+                labels = prompt_kwargs["labels"][0].detach().cpu()
                 # Labels mark assistant answer-token positions in the input.
                 assistant_query_mask = labels.ne(-100) & attention_mask
                 if not image_mask.any():
