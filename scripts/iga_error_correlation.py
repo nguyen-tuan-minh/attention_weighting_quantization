@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Optional seed for choosing the sample set.")
     parser.add_argument("--batch-size", type=int, default=1, help="Forward batch size; increase if GPU memory permits.")
     parser.add_argument("--top-percent", type=float, default=10.0, help="Image-token percentage selected by IGA.")
+    parser.add_argument(
+        "--correlation-target",
+        choices=("kl", "ce_delta"),
+        default="kl",
+        help="Per-sample target: KL(base || quantized), or CE change (quantized CE - base CE).",
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for result CSV and JSON files.")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -353,6 +359,8 @@ def main() -> int:
                     args.top_percent,
                 )
                 ce = sample_cross_entropy(quant_logits[sample_index], labels[sample_index])
+                base_ce = sample_cross_entropy(_base_logits[sample_index], labels[sample_index])
+                ce_delta = ce - base_ce
                 kl = sample_kl_divergence(
                     _base_logits[sample_index], quant_logits[sample_index], labels[sample_index]
                 )
@@ -361,6 +369,8 @@ def main() -> int:
                         "sample_index": len(per_sample),
                         "sample_id": str(sample.get("id", len(per_sample))),
                         "cross_entropy": ce,
+                        "base_cross_entropy": base_ce,
+                        "ce_delta": ce_delta,
                         "kl_base_to_quantized": kl,
                         "top_iga_mse": top_errors,
                         "full_mse": full_errors,
@@ -375,13 +385,14 @@ def main() -> int:
 
         if layer_count is None:
             raise RuntimeError("No model outputs were captured")
-        divergences = [row["kl_base_to_quantized"] for row in per_sample]
+        target_key = "ce_delta" if args.correlation_target == "ce_delta" else "kl_base_to_quantized"
+        targets = [row[target_key] for row in per_sample]
         layer_results = []
         for layer_index in range(layer_count):
             top_errors = [row["top_iga_mse"][layer_index] for row in per_sample]
             full_errors = [row["full_mse"][layer_index] for row in per_sample]
-            corr_top = pearson_correlation(top_errors, divergences)
-            corr_full = pearson_correlation(full_errors, divergences)
+            corr_top = pearson_correlation(top_errors, targets)
+            corr_full = pearson_correlation(full_errors, targets)
             layer_results.append(
                 {
                     "layer": layer_index,
@@ -408,9 +419,14 @@ def main() -> int:
             "seed": args.seed,
             "batch_size": args.batch_size,
             "top_percent": args.top_percent,
+            "correlation_target": args.correlation_target,
             "selection": "per sample and layer: highest IGA image tokens, IGA averaged over heads and text-query tokens",
             "output_mse_definition": "mean squared hidden-feature error at decoder block outputs; full uses all non-padding tokens, top uses selected image tokens",
-            "correlation_target": "KL divergence from base to quantized model, averaged over assistant answer tokens",
+            "correlation_target_definition": (
+                "quantized model CE minus base model CE; each averaged over assistant answer tokens"
+                if args.correlation_target == "ce_delta"
+                else "KL divergence from base to quantized model, averaged over assistant answer tokens"
+            ),
             "kl_definition": "per answer token: sum_vocab p_base * (log p_base - log p_quantized), averaged over assistant answer tokens",
             "layers": layer_results,
             "elapsed_seconds": time.perf_counter() - model_started,
@@ -418,9 +434,9 @@ def main() -> int:
         (output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         with (output_dir / "per_sample.csv").open("w", newline="", encoding="utf-8") as destination:
             writer = csv.writer(destination)
-            writer.writerow(["sample_index", "sample_id", "cross_entropy", "kl_base_to_quantized", *[f"layer_{i}_top_iga_mse" for i in range(layer_count)], *[f"layer_{i}_full_mse" for i in range(layer_count)]])
+            writer.writerow(["sample_index", "sample_id", "base_cross_entropy", "cross_entropy", "ce_delta", "kl_base_to_quantized", *[f"layer_{i}_top_iga_mse" for i in range(layer_count)], *[f"layer_{i}_full_mse" for i in range(layer_count)]])
             for row in per_sample:
-                writer.writerow([row["sample_index"], row["sample_id"], row["cross_entropy"], row["kl_base_to_quantized"], *row["top_iga_mse"], *row["full_mse"]])
+                writer.writerow([row["sample_index"], row["sample_id"], row["base_cross_entropy"], row["cross_entropy"], row["ce_delta"], row["kl_base_to_quantized"], *row["top_iga_mse"], *row["full_mse"]])
         with (output_dir / "layer_correlations.csv").open("w", newline="", encoding="utf-8") as destination:
             writer = csv.DictWriter(destination, fieldnames=list(layer_results[0]))
             writer.writeheader()
