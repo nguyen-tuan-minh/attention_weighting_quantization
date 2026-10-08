@@ -9,6 +9,7 @@ import json
 import math
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         choices=("kl", "ce_delta"),
         default="kl",
         help="Per-sample target: KL(base || quantized), or CE change (quantized CE - base CE).",
+    )
+    parser.add_argument(
+        "--quiet-warnings",
+        action="store_true",
+        help="Suppress Python and Hugging Face warning messages.",
     )
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory for result CSV and JSON files.")
     parser.add_argument("--device", default="cuda:0")
@@ -269,8 +275,26 @@ def pearson_correlation(x: list[float], y: list[float]) -> float | None:
     return float(torch.corrcoef(torch.stack((left, right)))[0, 1])
 
 
+def silence_warnings() -> None:
+    warnings.filterwarnings("ignore")
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+    except ImportError:
+        pass
+    try:
+        from datasets.utils import logging as datasets_logging
+
+        datasets_logging.set_verbosity_error()
+    except ImportError:
+        pass
+
+
 def main() -> int:
     args = parse_args()
+    if args.quiet_warnings:
+        silence_warnings()
     try:
         if args.samples < 2:
             raise ValueError("--samples must be at least 2 to calculate correlations")
