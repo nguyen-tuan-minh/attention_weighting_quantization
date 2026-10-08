@@ -87,8 +87,9 @@ def show_iga_heatmap(
     layer_iga_scores: dict[str, torch.Tensor],
     sample_number: int,
     heatmap_only: bool = False,
+    attention_percent: bool = False,
 ) -> None:
-    """Display the image and one IGA map for every language layer."""
+    """Display image-key attention maps for every language layer."""
     if not layer_iga_scores:
         raise ValueError("No per-layer IGA scores are available to plot")
 
@@ -111,7 +112,8 @@ def show_iga_heatmap(
     image_height, image_width = image.shape[:2]
     # Use a shared logarithmic scale so small IGA differences remain visible
     # while keeping layer magnitudes comparable within this sample.
-    layer_scores = list(layer_iga_scores.values())
+    scale = 100.0 if attention_percent else 1.0
+    layer_scores = [scores * scale for scores in layer_iga_scores.values()]
     positive_scores = torch.cat([scores.reshape(-1) for scores in layer_scores])
     positive_scores = positive_scores[positive_scores > 0]
     if positive_scores.numel() == 0:
@@ -138,7 +140,7 @@ def show_iga_heatmap(
     flat_axes[0].set_title("Processor image")
 
     heatmap_view = None
-    for axis, (layer_name, scores) in zip(flat_axes[1:], layer_iga_scores.items()):
+    for axis, (layer_name, scores) in zip(flat_axes[1:], zip(layer_iga_scores, layer_scores)):
         # Expand this layer's image-token scores to the processed image size.
         heatmap = F.interpolate(
             scores.reshape(1, 1, grid_size, grid_size),
@@ -164,9 +166,16 @@ def show_iga_heatmap(
             ax=flat_axes[:panel_count].tolist(),
             fraction=0.015,
             pad=0.01,
-            label="IGA (log scale)",
+            label=(
+                "Attention over all keys (%) (log scale)"
+                if attention_percent
+                else "Attention weight (log scale)"
+            ),
         )
-    figure.suptitle(f"Calibration sample {sample_number}")
+    figure.suptitle(
+        f"Calibration sample {sample_number}: "
+        f"{'all-key attention percentage' if attention_percent else 'image-key attention weight'}"
+    )
     plt.show()
     plt.close(figure)
 
@@ -209,6 +218,14 @@ def parse_args() -> argparse.Namespace:
         "--heatmap-only",
         action="store_true",
         help="Show standalone heatmaps instead of overlays on the image.",
+    )
+    parser.add_argument(
+        "--true-attention-percent",
+        action="store_true",
+        help=(
+            "Display each image token's softmax attention as a percentage of attention over all valid keys "
+            "instead of as a decimal weight."
+        ),
     )
     return parser.parse_args()
 
@@ -408,6 +425,7 @@ def main() -> int:
                         layer_scores,
                         index,
                         heatmap_only=args.heatmap_only,
+                        attention_percent=args.true_attention_percent,
                     )
                     if plot_started is not None:
                         log(

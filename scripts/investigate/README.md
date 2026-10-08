@@ -88,7 +88,8 @@ model paths, or output locations.
 ## Current scripts
 
 - `investigate_attention.py`: captures attention/IGA information and can display
-  or save attention maps.
+  or save attention maps. Use `--true-attention-percent` to label image-key
+  softmax weights as percentages of attention over all valid keys.
 - `investigate_activation_pca.py`: captures layer activations and plots
   image-token versus text-token PCA.
 - `investigate_assistant_attention.py`: measures assistant answer-token attention
