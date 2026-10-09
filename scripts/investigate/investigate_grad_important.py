@@ -200,7 +200,8 @@ def show_gradient_heatmaps(
         source_image: Sample image used by the QIG/LLaVA adapter.
         layer_scores: Layer index -> CPU float32 [image_tokens] gradient scores.
         sample_number: One-based index in the selected calibration subset.
-        heatmap_only: Show patch-grid scores without the source image when true.
+        heatmap_only: Show the source image in a separate reference panel and
+            patch-grid scores without image overlays when true.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
 
@@ -253,7 +254,8 @@ def show_gradient_heatmaps(
         color_norm = Normalize(vmin=0.0, vmax=1.0)
 
     layer_indices = sorted(layer_scores)
-    panel_count = len(layer_indices)
+    # panel_count: int, layer heatmap panels plus an image-reference panel in heatmap-only mode.
+    panel_count = len(layer_indices) + int(heatmap_only)
     columns = 6
     rows = math.ceil(panel_count / columns)
     figure, axes = plt.subplots(
@@ -265,8 +267,13 @@ def show_gradient_heatmaps(
     )
     flat_axes = axes.ravel()
     heatmap_view = None
+    # first_heatmap_axis: int, first panel index reserved for per-layer heatmaps.
+    first_heatmap_axis = 1 if heatmap_only else 0
+    if heatmap_only:
+        flat_axes[0].imshow(image)
+        flat_axes[0].set_title("Reference image")
 
-    for axis, layer_index in zip(flat_axes, layer_indices):
+    for axis, layer_index in zip(flat_axes[first_heatmap_axis:], layer_indices):
         # grid_scores: torch.Tensor, float32 [1, 1, grid_size, grid_size], this layer's image-token scores.
         grid_scores = layer_scores[layer_index].float().reshape(1, 1, grid_size, grid_size)
         # heatmap: torch.Tensor, CPU float32 [grid_size, grid_size], image-token scores in patch-grid layout.
@@ -357,7 +364,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--heatmap-only",
         action="store_true",
-        help="Show only the layer heatmaps without the source image underneath.",
+        help="Show the source image as a reference panel and layer heatmaps without overlays.",
     )
     parser.add_argument(
         "--log-level",

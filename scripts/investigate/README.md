@@ -152,9 +152,9 @@ model paths, or output locations.
   at a time, backpropagates each token loss to every decoder block input, sums
   squared gradients over hidden dimensions and answer tokens for each image
   token, and displays per-layer image-token heatmaps for each sample, overlaid
-  on the source image by default. Use `--heatmap-only` to show just the patch
-  grid. It displays by default and saves nothing unless `--save-dir` is
-  supplied.
+  on the source image by default. Use `--heatmap-only` to show the source image
+  in a separate reference panel beside the plain patch-grid heatmaps. It
+  displays by default and saves nothing unless `--save-dir` is supplied.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
