@@ -151,9 +151,10 @@ model paths, or output locations.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
   at a time, backpropagates each token loss to every decoder block input, sums
   squared gradients over hidden dimensions and answer tokens for each image
-  token, and displays a grid containing only the per-layer image-token
-  heatmaps for each sample. It
-  displays by default and saves nothing unless `--save-dir` is supplied.
+  token, and displays per-layer image-token heatmaps for each sample, overlaid
+  on the source image by default. Use `--heatmap-only` to show just the patch
+  grid. It displays by default and saves nothing unless `--save-dir` is
+  supplied.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
@@ -173,10 +174,10 @@ python scripts/investigate/investigate_assistant_attention.py \
   --quiet-warnings
 ```
 
-Display gradient-importance maps for two samples (no files are written):
+Display only the gradient heatmaps for two samples (no files are written):
 
 ```bash
-python scripts/investigate/investigate_grad_important.py --samples 2
+python scripts/investigate/investigate_grad_important.py --samples 2 --heatmap-only
 ```
 
 Save the same per-sample figures without opening windows:

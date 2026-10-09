@@ -11,6 +11,8 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
+import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
@@ -184,17 +186,21 @@ def score_assistant_token_losses(
 # PHASE 5. DISPLAY AND OPTIONALLY SAVE GRADIENT HEATMAPS
 # ============================================================================
 def show_gradient_heatmaps(
+    source_image: Image.Image,
     layer_scores: dict[int, torch.Tensor],
     sample_number: int,
     *,
+    heatmap_only: bool = False,
     display: bool = True,
     save_dir: Path | None = None,
 ) -> Path | None:
-    """Display only the per-layer image-token heatmaps and optionally save them.
+    """Display per-layer image-token heatmaps and optionally save the figure.
 
     Args:
+        source_image: Sample image used by the QIG/LLaVA adapter.
         layer_scores: Layer index -> CPU float32 [image_tokens] gradient scores.
         sample_number: One-based index in the selected calibration subset.
+        heatmap_only: Show patch-grid scores without the source image when true.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
 
@@ -218,6 +224,19 @@ def show_gradient_heatmaps(
         )
     if any(scores.numel() != image_token_count for scores in layer_scores.values()):
         raise ValueError("All layers must have the same number of image-token scores")
+
+    # image: np.ndarray, float32 [square_side, square_side, 3] in [0, 1], square-padded RGB sample.
+    source_image = source_image.convert("RGB")
+    image_width, image_height = source_image.size
+    square_side = max(image_width, image_height)
+    # background: tuple[int, int, int], CLIP mean RGB used to fill the square-padded canvas.
+    background = tuple(round(value * 255) for value in (0.48145466, 0.4578275, 0.40821073))
+    square_image = Image.new("RGB", (square_side, square_side), background)
+    square_image.paste(
+        source_image,
+        ((square_side - image_width) // 2, (square_side - image_height) // 2),
+    )
+    image = np.asarray(square_image).astype(np.float32) / 255.0
 
     # pooled_scores: torch.Tensor, CPU float32 [layers * image_tokens], values for one shared color scale.
     pooled_scores = torch.cat([scores.reshape(-1).float() for scores in layer_scores.values()])
@@ -250,9 +269,26 @@ def show_gradient_heatmaps(
     for axis, layer_index in zip(flat_axes, layer_indices):
         # grid_scores: torch.Tensor, float32 [1, 1, grid_size, grid_size], this layer's image-token scores.
         grid_scores = layer_scores[layer_index].float().reshape(1, 1, grid_size, grid_size)
-        # heatmap: torch.Tensor, CPU float32 [grid_size, grid_size], token scores in patch-grid layout.
+        # heatmap: torch.Tensor, CPU float32 [grid_size, grid_size], image-token scores in patch-grid layout.
         heatmap = grid_scores[0, 0]
-        heatmap_view = axis.imshow(heatmap, cmap="inferno", norm=color_norm)
+        if not heatmap_only:
+            axis.imshow(image)
+            # display_heatmap: np.ndarray, float32 [square_side, square_side], resized scores over source image.
+            display_heatmap = F.interpolate(
+                grid_scores,
+                size=(square_side, square_side),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0].numpy()
+        else:
+            # display_heatmap: np.ndarray, float32 [grid_size, grid_size], raw image-token score grid.
+            display_heatmap = heatmap.numpy()
+        heatmap_view = axis.imshow(
+            display_heatmap,
+            cmap="inferno",
+            norm=color_norm,
+            alpha=0.58 if not heatmap_only else 1.0,
+        )
         axis.set_title(f"Layer {layer_index}")
 
     for axis in flat_axes[panel_count:]:
@@ -317,6 +353,11 @@ def parse_args() -> argparse.Namespace:
         "--no-display",
         action="store_true",
         help="Do not open figures; useful when saving with --save-dir in a headless run.",
+    )
+    parser.add_argument(
+        "--heatmap-only",
+        action="store_true",
+        help="Show only the layer heatmaps without the source image underneath.",
     )
     parser.add_argument(
         "--log-level",
@@ -527,8 +568,10 @@ def main() -> int:
                 del outputs, logits, forward_layer_inputs, inputs_embeds
                 plot_started = time.perf_counter() if args.timing else None
                 output_path = show_gradient_heatmaps(
+                    image,
                     layer_scores,
                     sample_index,
+                    heatmap_only=args.heatmap_only,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )
@@ -546,7 +589,7 @@ def main() -> int:
         # =====================================================================
         # 5. DISPLAY AND OPTIONALLY SAVE RESULTS
         # =====================================================================
-        # Phase 4 displayed one grid of per-layer image-token heatmaps per sample.
+        # Phase 4 displayed one per-layer heatmap grid per sample; --heatmap-only omits source-image backgrounds.
         # PNG files are written only when ``--save-dir`` was supplied.
         log(f"Gradient-importance analysis complete for {len(dataset):,} samples.")
         if save_dir is not None:
