@@ -151,7 +151,8 @@ model paths, or output locations.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
   at a time, backpropagates each token loss to every decoder block input, sums
   squared gradients over hidden dimensions and answer tokens for each image
-  token, and displays one input-image-plus-layer-grid figure per sample. It
+  token, and displays a grid containing only the per-layer image-token
+  heatmaps for each sample. It
   displays by default and saves nothing unless `--save-dir` is supplied.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
