@@ -41,6 +41,7 @@ def register_layernorm_hooks(
     Returns:
         Hook handles. The caller must remove every handle in a ``finally`` block.
     """
+    # handles: list[torch.utils.hooks.RemovableHandle], registered hooks for caller cleanup.
     handles: list[torch.utils.hooks.RemovableHandle] = []
     for name, module in model.named_modules():
         match = re.search(r"(?:^|\.)layers\.(\d+)\.input_layernorm$", name)
@@ -55,12 +56,14 @@ def register_layernorm_hooks(
             *,
             index: int = layer_index,
         ) -> None:
-            activation = output[0] if isinstance(output, tuple) else output  # [batch, sequence, hidden]
+            # activation: torch.Tensor, [batch, sequence, hidden], LayerNorm output.
+            activation = output[0] if isinstance(output, tuple) else output
             if not torch.is_tensor(activation) or activation.ndim != 3:
                 return
             # Keep only one sample on CPU; do not retain the forward graph or
             # accumulate all layer activations on the GPU.
             # Select batch item 0: [batch, sequence, hidden] -> [sequence, hidden].
+            # active_sample["activations"][index]: torch.Tensor, CPU float16 [sequence, hidden], detached sample capture.
             active_sample["activations"][index] = activation[0].detach().to(
                 device="cpu", dtype=torch.float16
             )
@@ -98,12 +101,14 @@ def layerwise_pca(
     if not activation_samples or len(activation_samples) != len(token_masks):
         raise ValueError("Each activation sample must have a matching pair of token masks")
 
-    # Result schema: layer index -> (CPU [selected_tokens, 2] coordinates,
-    # CPU [selected_tokens] boolean labels; True means image token).
+    # projected: dict[int, tuple[torch.Tensor, torch.Tensor]], empty per-layer
+    # result map; values become CPU coordinates [selected_tokens, 2] and bool labels [selected_tokens].
     projected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     layer_indices = sorted(activation_samples[0])
     for layer_index in layer_indices:
+        # token_chunks: list[torch.Tensor], selected float activations [tokens, hidden] by sample.
         token_chunks: list[torch.Tensor] = []
+        # label_chunks: list[torch.Tensor], bool image-token labels [tokens] by sample.
         label_chunks: list[torch.Tensor] = []
         for activations, (image_mask, text_mask) in zip(activation_samples, token_masks):
             activation = activations[layer_index]
@@ -112,51 +117,62 @@ def layerwise_pca(
                     f"Layer {layer_index} has {activation.shape[0]} token positions, "
                     f"but masks have {image_mask.numel()} and {text_mask.numel()}"
                 )
-            # [sequence] masks select image and text rows from [sequence, hidden].
+            # selected_mask: torch.Tensor, bool [sequence], valid image or text positions.
             selected_mask = image_mask | text_mask
-            # Selected activation chunk: [selected_tokens, hidden].
+            # token_chunks entry: torch.Tensor, float [selected_tokens, hidden], selected activation rows.
             token_chunks.append(activation[selected_mask].float())
-            # Corresponding image/text labels: [selected_tokens].
+            # label_chunks entry: torch.Tensor, bool [selected_tokens], True for image tokens.
             label_chunks.append(image_mask[selected_mask])
 
-        # Concatenate samples: values [all_tokens, hidden], labels [all_tokens].
+        # values: torch.Tensor, float [all_tokens, hidden], activations pooled across samples.
         values = torch.cat(token_chunks, dim=0)
+        # labels: torch.Tensor, bool [all_tokens], modality labels aligned with values.
         labels = torch.cat(label_chunks, dim=0)
         if values.shape[0] < 3:
             raise ValueError(f"Layer {layer_index} has too few image/text tokens for 2D PCA")
 
+        # fit_values: torch.Tensor, float [all_tokens, hidden], rows used to fit PCA axes.
         fit_values = values
         if balance_pca:
+            # image_indices: torch.Tensor, long [image_tokens], positions of image rows in values.
             image_indices = labels.nonzero(as_tuple=True)[0]
+            # text_indices: torch.Tensor, long [text_tokens], positions of text rows in values.
             text_indices = (~labels).nonzero(as_tuple=True)[0]
             balanced_count = min(image_indices.numel(), text_indices.numel())
             if balanced_count == 0:
                 raise ValueError(f"Layer {layer_index} does not contain both token types")
+            # generator: torch.Generator | None, optional CPU RNG for repeatable balancing.
             generator = None
             if seed is not None:
                 generator = torch.Generator(device="cpu").manual_seed(seed + layer_index)
+            # image_indices after subsampling: torch.Tensor, long [balanced_count], selected image rows.
             image_indices = image_indices[
                 torch.randperm(image_indices.numel(), generator=generator)[:balanced_count]
             ]
+            # text_indices after subsampling: torch.Tensor, long [balanced_count], selected text rows.
             text_indices = text_indices[
                 torch.randperm(text_indices.numel(), generator=generator)[:balanced_count]
             ]
             # Balanced token indices: [2 * balanced_count].
+            # fit_indices: torch.Tensor, long [2 * balanced_count], balanced token positions.
             fit_indices = torch.cat((image_indices, text_indices))
+            # fit_values: torch.Tensor, float [2 * balanced_count, hidden], balanced PCA fitting rows.
             fit_values = values[fit_indices]
 
         # Randomized low-rank PCA avoids forming a hidden_size x hidden_size
         # covariance matrix for every transformer layer. In balanced mode,
         # fit the axes on an equal number of tokens per modality, then project
         # every token into those same axes for the plot.
-        # PCA components have shape [hidden, 2]; coordinates become [all_tokens, 2].
+        # components: torch.Tensor, float [hidden, 2], two PCA axes learned from fit_values.
         _, _, components = torch.pca_lowrank(
             fit_values,
             q=2,
             center=True,
             niter=2,
         )
+        # coordinates: torch.Tensor, float [all_tokens, 2], every row projected into PCA space.
         coordinates = (values - fit_values.mean(dim=0)) @ components
+        # projected[layer_index]: tuple[torch.Tensor, torch.Tensor], coordinates and aligned modality labels.
         projected[layer_index] = (coordinates, labels)
     return projected
 
@@ -205,7 +221,9 @@ def show_activation_pca(
     for axis, layer_index in zip(axes.ravel(), layer_indices):
         coordinates, is_image = projected[layer_index]
         # Split [tokens, 2] coordinates into image/text arrays [points, 2].
+        # image_points: np.ndarray, [image_tokens, 2], coordinates plotted in blue.
         image_points = coordinates[is_image].numpy()
+        # text_points: np.ndarray, [text_tokens, 2], coordinates plotted in orange.
         text_points = coordinates[~is_image].numpy()
         # Draw image tokens fully opaque first, then let text tokens blend
         # over them so coincident image points remain visible underneath.
@@ -239,6 +257,7 @@ def show_activation_pca(
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
     # Legend lookup schema: displayed label string -> Matplotlib handle.
+    # legend_items: dict[str, Any], displayed label -> Matplotlib legend handle.
     legend_items = dict(zip(labels, handles))
     labels = [image_label, text_label]
     handles = [legend_items[label] for label in labels]
@@ -398,9 +417,8 @@ def main() -> int:
         # model: torch.nn.Module, loaded LLaVA model containing decoder LayerNorms.
         # dataset: datasets.Dataset, rows forwarded one at a time in phase 4.
         hooks_started = time.perf_counter() if args.timing else None
-        # Hook state schema: ``activations`` maps decoder layer index -> one
-        # CPU float16 tensor [sequence, hidden]. Reset it before each sample;
-        # the caller copies completed sample maps into activation_samples.
+        # active_sample: dict[str, Any], mutable hook state reset for each input sample.
+        # active_sample["activations"]: dict[int, torch.Tensor], layer index -> CPU float16 [sequence, hidden].
         active_sample: dict[str, Any] = {"activations": {}}
         hook_handles = register_layernorm_hooks(model, active_sample)
         log(f"Registered hooks on {len(hook_handles)} decoder input LayerNorm modules")
@@ -414,27 +432,36 @@ def main() -> int:
         # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
         # active_sample: dict[str, Any], layer index -> CPU float16 [sequence, hidden] activation.
         log(f"Forwarding {len(dataset):,} samples one at a time...")
+        # activation_samples: list[dict[int, torch.Tensor]], per-sample CPU float16 [sequence, hidden] activations.
         activation_samples: list[dict[int, torch.Tensor]] = []
+        # token_masks: list[tuple[torch.Tensor, torch.Tensor]], per-sample CPU bool [sequence] image/text masks.
         token_masks: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
             for index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
+                # active_sample["activations"]: dict[int, torch.Tensor], reset for this sample's hook captures.
                 active_sample["activations"] = {}
-                # Input row schema consumed by the QIG adapter: conversation
-                # turns, stable sample id, and the local-image sentinel.
+                # row: dict[str, Any], QIG input with conversations, stable sample id, and local-image sentinel.
                 row = {
                     "conversations": sample["conversations"],
                     "id": sample.get("id", str(index)),
                     "image": "local",
                 }
+                # prepared: Any, adapter-preprocessed single-sample row.
                 prepared = input_adapter.preprocess_data([sample["image"]], row)
+                # batch: dict[str, Any], collated multimodal sample consumed by generate_input.
                 batch = input_adapter.data_collator([prepared])
+                # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
+                # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
                 prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
                 # Both token masks are CPU boolean vectors [sequence], so their
                 # combination and later PCA indexing use one consistent device.
+                # attention_mask: torch.Tensor, CPU bool [sequence], valid token positions.
                 attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+                # image_mask: torch.Tensor, CPU bool [sequence], image-token positions.
                 image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+                # text_mask: torch.Tensor, CPU bool [sequence], valid non-image token positions.
                 text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify image and text token positions")
@@ -447,7 +474,8 @@ def main() -> int:
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
-                    outputs = input_adapter(
+                # outputs: ModelOutput, logits [batch, sequence, vocabulary] plus model metadata.
+                outputs = input_adapter(
                         inputs_embeds=prompt_inputs["inputs_embeds"],
                         attention_mask=prompt_kwargs["attention_mask"],
                         labels=prompt_kwargs["labels"],
@@ -459,6 +487,7 @@ def main() -> int:
                     log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if not active_sample["activations"]:
                     raise RuntimeError("No layernorm hooks captured activations")
+                # first_activation: torch.Tensor, CPU float16 [sequence, hidden], example captured layer output.
                 first_activation = active_sample["activations"][min(active_sample["activations"])]
                 log(
                     f"Sample {index}: logits={tuple(outputs.logits.shape)}, "
@@ -468,10 +497,13 @@ def main() -> int:
                 )
 
                 if args.plot_scope == "all":
+                    # activation_samples entry: dict[int, torch.Tensor], CPU float16 [sequence, hidden] per layer.
                     activation_samples.append(active_sample["activations"])
+                    # token_masks entry: tuple[torch.Tensor, torch.Tensor], CPU bool [sequence] image/text masks.
                     token_masks.append((image_mask, text_mask))
                 else:
                     analyse_started = time.perf_counter() if args.timing else None
+                    # projected: dict[int, tuple[torch.Tensor, torch.Tensor]], layer -> coordinates [tokens, 2], labels [tokens].
                     projected = layerwise_pca(
                         [active_sample["activations"]],
                         [(image_mask, text_mask)],
@@ -502,6 +534,7 @@ def main() -> int:
         # token_masks: list[tuple[torch.Tensor, torch.Tensor]], CPU bool [sequence] image/text masks per sample.
         if args.plot_scope == "all":
             analyse_started = time.perf_counter() if args.timing else None
+            # projected: dict[int, tuple[torch.Tensor, torch.Tensor]], pooled per-layer PCA coordinates and labels.
             projected = layerwise_pca(
                 activation_samples,
                 token_masks,

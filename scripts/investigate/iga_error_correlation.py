@@ -133,6 +133,7 @@ def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Te
         tensor kwargs (including ``attention_mask``, ``vision_mask``, and
         ``labels``), also detached on CPU for bookkeeping and later device moves.
     """
+    # prepared_samples: list[Any], adapter-processed rows ready for collation.
     prepared_samples = []
     for index, sample in enumerate(samples):
         image = sample["image"]
@@ -140,8 +141,7 @@ def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Te
         # color. Normalize grayscale/palette/RGBA inputs to RGB first.
         if hasattr(image, "convert"):
             image = image.convert("RGB")
-        # Input row schema consumed by the QIG adapter: conversation turns,
-        # stable sample id, and local-image sentinel.
+        # row: dict[str, Any], QIG adapter conversation/id/local-image input schema.
         row = {
             "conversations": sample["conversations"],
             "id": str(sample.get("id", index)),
@@ -149,19 +149,18 @@ def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Te
         }
         prepared_samples.append(adapter.preprocess_data([image], row))
     batch = adapter.data_collator(prepared_samples)
+    # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
+    # prompt_kwargs: dict[str, Any], adapter metadata and tensors, commonly [batch, sequence].
     prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
-    # Each returned model-input tensor keeps its original trailing dimensions;
-    # for example masks/labels are [batch, sequence].
-    # Tensor kwargs schema preserves adapter names (masks, labels, and other
-    # tensor inputs); values are detached CPU tensors with their batch/sequence axes.
+    # tensors: dict[str, torch.Tensor], adapter tensor fields detached to CPU with batch axes preserved.
     tensors = {
         key: value.detach().cpu()
         for key, value in prompt_kwargs.items()
         if torch.is_tensor(value)
     }
-    # Embedding shape is [batch, sequence, hidden]; model inputs are detached
-    # and staged on CPU between the base and quantized checkpoint passes.
-    return prompt_inputs["inputs_embeds"].detach().cpu(), tensors
+    # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden], detached and staged for both model passes.
+    inputs_embeds = prompt_inputs["inputs_embeds"].detach().cpu()
+    return inputs_embeds, tensors
 
 
 def image_and_text_masks(kwargs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,19 +175,25 @@ def image_and_text_masks(kwargs: dict[str, torch.Tensor]) -> tuple[torch.Tensor,
     """
     # Normalize adapter masks before boolean operations: some preprocessors
     # return attention_mask and vision_mask on different devices.
+    # attention_mask: torch.Tensor, CPU bool [batch, sequence], valid-token mask.
     attention_mask = kwargs["attention_mask"].bool().detach().cpu()
+    # image_mask: torch.Tensor | None, adapter vision mask before normalization.
     image_mask = kwargs.get("vision_mask")
     if image_mask is None:
         raise ValueError("QIG input adapter did not provide a vision_mask for image-token selection")
+    # image_mask after normalization: torch.Tensor, CPU bool [batch, sequence], valid image tokens.
     image_mask = image_mask.bool().detach().cpu() & attention_mask
     # [batch, sequence] boolean masks partition every valid key position.
+    # text_mask: torch.Tensor, CPU bool [batch, sequence], valid non-image positions before query filtering.
     text_mask = attention_mask & ~image_mask
     for sample_index in range(image_mask.shape[0]):
         # Image positions are an index vector [image_tokens] for this sample.
+        # image_positions: torch.Tensor, long [image_tokens], image sequence indices for one sample.
         image_positions = image_mask[sample_index].nonzero(as_tuple=True)[0]
         if image_positions.numel() == 0:
             raise ValueError(f"Sample {sample_index} has no image tokens")
         # As in investigate/investigate_attention.py, use text query tokens following the image.
+        # text_mask[sample_index] after in-place filter: CPU bool [sequence], post-image text query positions.
         text_mask[sample_index] &= torch.arange(text_mask.shape[1]) > image_positions[-1]
         if not text_mask[sample_index].any():
             raise ValueError(f"Sample {sample_index} has no text tokens after the image")
@@ -220,18 +225,21 @@ def capture_layer_outputs_and_iga(
     if layers is None:
         raise RuntimeError("Could not find LLaVA decoder layers at model.model.layers")
 
-    # Hook state schema: outputs maps layer index -> [batch, sequence, hidden]
-    # block output; iga maps layer index -> list of per-sample [image_tokens]
-    # scores. Both maps are reset for each call to this function.
+    # active: dict[str, Any], hook captures reset for this model forward.
+    # active["outputs"]: dict[int, torch.Tensor], layer -> CPU float16 [batch, sequence, hidden].
+    # active["iga"]: dict[int, list[torch.Tensor]], layer -> per-sample CPU float32 [image_tokens].
     active: dict[str, Any] = {"outputs": {}, "iga": {}}
+    # image_mask: torch.Tensor | None, CPU bool [batch, sequence], valid image tokens if IGA is enabled.
+    # text_mask: torch.Tensor | None, CPU bool [batch, sequence], post-image text queries if IGA is enabled.
     image_mask, text_mask = image_and_text_masks(kwargs) if capture_iga else (None, None)
+    # handles: list[torch.utils.hooks.RemovableHandle], hooks removed after the forward in finally.
     handles = []
     for layer_index, layer in enumerate(layers):
         def save_layer(_module: Any, _inputs: Any, output: Any, *, index: int = layer_index) -> None:
+            # hidden: torch.Tensor, [batch, sequence, hidden], decoder block output.
             hidden = output[0] if isinstance(output, tuple) else output
             if torch.is_tensor(hidden):
-                # Hidden output changes from [batch, sequence, hidden] on the
-                # model device to the same shape in CPU float16 storage.
+                # active["outputs"][index]: torch.Tensor, CPU float16 [batch, sequence, hidden], captured block output.
                 active["outputs"][index] = hidden.detach().to(device="cpu", dtype=torch.float16)
 
         handles.append(layer.register_forward_hook(save_layer))
@@ -243,17 +251,24 @@ def capture_layer_outputs_and_iga(
             def save_attention(_module: Any, _inputs: Any, output: Any, *, index: int = layer_index) -> None:
                 if not isinstance(output, tuple) or len(output) < 2 or not torch.is_tensor(output[1]):
                     return
-                weights = output[1]  # [batch, heads, query_sequence, key_sequence]
+                # weights: torch.Tensor, [batch, heads, query_sequence, key_sequence], post-softmax attention.
+                weights = output[1]
                 if weights.ndim != 4:
                     return
+                # layer_scores: list[torch.Tensor], CPU float32 [image_tokens] IGA vector per batch item.
                 layer_scores = []
                 for sample_index in range(weights.shape[0]):
+                    # query_mask: torch.Tensor, bool [sequence] on attention device, text query positions.
                     query_mask = text_mask[sample_index].to(weights.device)
+                    # key_mask: torch.Tensor, bool [sequence] on attention device, image key positions.
                     key_mask = image_mask[sample_index].to(weights.device)
                     # [heads, sequence, sequence] -> [heads, text_queries, image_keys].
+                    # text_to_image: torch.Tensor, [heads, text_queries, image_tokens], selected attention values.
                     text_to_image = weights[sample_index][:, query_mask, :][:, :, key_mask]
                     # Reduce head/query axes -> [image_keys] IGA vector.
+                    # layer_scores entry: torch.Tensor, CPU float32 [image_tokens], mean attention per image key.
                     layer_scores.append(text_to_image.float().mean(dim=(0, 1)).cpu())
+                # active["iga"][index]: list[torch.Tensor], per-sample CPU [image_tokens] scores for this layer.
                 active["iga"][index] = layer_scores
                 # The model's output_attentions collection otherwise keeps a
                 # full [batch, heads, sequence, sequence] matrix for every
@@ -265,8 +280,10 @@ def capture_layer_outputs_and_iga(
     try:
         if capture_iga:
             model.config.output_attentions = True
+        # device: torch.device, model parameter device used for adapter inputs.
         device = next(model.parameters()).device
         with torch.inference_mode():
+            # result: ModelOutput, logits [batch, sequence, vocabulary] plus model metadata.
             result = adapter(
                 inputs_embeds=inputs_embeds.to(device),
                 attention_mask=kwargs["attention_mask"].to(device),
@@ -277,12 +294,15 @@ def capture_layer_outputs_and_iga(
         batch_count = inputs_embeds.shape[0]
         # Split [batch, sequence, hidden] captured tensors into per-sample
         # [sequence, hidden] entries, grouped by sample and layer.
+        # outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample and layer.
         outputs = [
             [active["outputs"][layer_index][sample_index] for layer_index in range(len(layers))]
             for sample_index in range(batch_count)
         ]
+        # iga: list[list[torch.Tensor]] | None, optional CPU [image_tokens] vectors per sample/layer.
         iga = None
         if capture_iga:
+            # missing: list[int], decoder layers for which hooks captured no attention weights.
             missing = [index for index in range(len(layers)) if index not in active["iga"]]
             if missing:
                 raise RuntimeError(
@@ -292,7 +312,7 @@ def capture_layer_outputs_and_iga(
                 [active["iga"][layer_index][sample_index] for layer_index in range(len(layers))]
                 for sample_index in range(batch_count)
             ]
-        # Result logits are [batch, sequence, vocabulary], stored on CPU fp16.
+        # logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary].
         logits = result.logits.detach().to(device="cpu", dtype=torch.float16)
     finally:
         for handle in handles:
@@ -324,19 +344,27 @@ def layer_mse(
     Returns:
         Two per-layer lists: top-IGA image-token MSE and all-valid-token MSE.
     """
+    # full_errors/top_errors: list[float], one scalar MSE per decoder layer.
     full_errors, top_errors = [], []
     for layer_index, (base_y, quant_y) in enumerate(zip(base_outputs, quant_outputs)):
         if base_y.shape != quant_y.shape:
             raise ValueError(f"Layer {layer_index} output shapes differ: {base_y.shape} and {quant_y.shape}")
         # [sequence, hidden] -> [sequence] feature-mean squared error.
+        # difference: torch.Tensor, float [sequence], mean hidden-feature MSE per token.
         difference = (base_y.float() - quant_y.float()).square().mean(dim=-1)
+        # valid: torch.Tensor, bool [sequence] on difference.device, non-padding positions.
         valid = attention_mask.to(difference.device).bool()
         full_errors.append(float(difference[valid].mean()))
+        # image_positions: torch.Tensor, long [image_tokens] on difference.device.
         image_positions = image_mask.to(difference.device).bool().nonzero(as_tuple=True)[0]
+        # scores: torch.Tensor, [image_tokens], per-image-token IGA ranking values.
         scores = iga_scores[layer_index]
+        # token_count: int, number of highest-IGA image tokens selected for MSE.
         token_count = max(1, math.ceil(image_positions.numel() * top_percent / 100.0))
         # Chosen IGA ranks and resulting sequence positions are [top_token_count].
+        # chosen_local: torch.Tensor, long [token_count], indices into scores/image_positions.
         chosen_local = torch.topk(scores, k=token_count).indices
+        # chosen_positions: torch.Tensor, long [token_count], sequence positions of selected image tokens.
         chosen_positions = image_positions[chosen_local]
         top_errors.append(float(difference[chosen_positions].mean()))
     return top_errors, full_errors
@@ -354,12 +382,16 @@ def sample_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     """
     # Shift sequence positions so logits[:-1] predict labels[1:].
     # Shifted logits are [sequence - 1, vocabulary]; shifted labels are [sequence - 1].
+    # shifted_logits: torch.Tensor, float [sequence - 1, vocabulary], predicts next-token labels.
     shifted_logits = logits[:-1].float()
+    # shifted_labels: torch.Tensor, long [sequence - 1], targets aligned with preceding logits.
     shifted_labels = labels[1:].long()
+    # valid: torch.Tensor, bool [sequence - 1], assistant answer positions only.
     valid = shifted_labels != -100
     if not valid.any():
         raise ValueError("Sample has no assistant answer tokens for cross-entropy")
     # Per-position loss vector is [sequence - 1]; valid selects answer positions.
+    # token_losses: torch.Tensor, float [sequence - 1], unreduced causal CE by token.
     token_losses = F.cross_entropy(
         shifted_logits,
         shifted_labels,
@@ -385,13 +417,18 @@ def sample_kl_divergence(
         Mean per-token KL divergence for non-ignored answer labels.
     """
     # Log-probability tensors retain [sequence - 1, vocabulary] after causal shift.
+    # base_log_probs: torch.Tensor, float [sequence - 1, vocabulary], reference next-token log probabilities.
     base_log_probs = F.log_softmax(base_logits[:-1].float(), dim=-1)
+    # quant_log_probs: torch.Tensor, float [sequence - 1, vocabulary], quantized next-token log probabilities.
     quant_log_probs = F.log_softmax(quant_logits[:-1].float(), dim=-1)
+    # answer_labels: torch.Tensor, long [sequence - 1], shifted answer-token labels.
     answer_labels = labels[1:].long()
+    # valid: torch.Tensor, bool [sequence - 1], positions included in answer-only KL.
     valid = answer_labels != -100
     if not valid.any():
         raise ValueError("Sample has no assistant answer tokens for KL divergence")
     # Sum vocabulary contributions to obtain one KL scalar per shifted token.
+    # token_kl: torch.Tensor, float [sequence - 1], vocabulary-summed KL per position.
     token_kl = F.kl_div(
         quant_log_probs,
         base_log_probs.exp(),
@@ -403,12 +440,16 @@ def sample_kl_divergence(
 def pearson_correlation(x: list[float], y: list[float]) -> float | None:
     """Return Pearson correlation for equally sized per-sample metric vectors."""
     # Convert Python lists to matching float64 vectors of shape [samples].
+    # left: torch.Tensor, float64 [samples], first per-sample metric vector.
     left = torch.tensor(x, dtype=torch.float64)
+    # right: torch.Tensor, float64 [samples], second per-sample metric vector.
     right = torch.tensor(y, dtype=torch.float64)
     if left.numel() < 2 or left.std(unbiased=False) == 0 or right.std(unbiased=False) == 0:
         return None
     # Stack two [samples] metrics into [2, samples]; select their correlation.
-    return float(torch.corrcoef(torch.stack((left, right)))[0, 1])
+    # correlation_matrix: torch.Tensor, float64 [2, 2], pairwise correlations of the two metric vectors.
+    correlation_matrix = torch.corrcoef(torch.stack((left, right)))
+    return float(correlation_matrix[0, 1])
 
 
 def main() -> int:
@@ -468,8 +509,8 @@ def main() -> int:
             f"{[len(batch) for batch in batches]}",
             level="extensive",
         )
-        # Per-sample result schema: identity, base/quantized CE and delta, KL,
-        # plus one top-IGA and full-token MSE scalar per layer.
+        # per_sample: list[dict[str, Any]], metric rows with sample identity,
+        # CE/KL scalars, and per-layer top-IGA/full-token MSE lists.
         per_sample: list[dict[str, Any]] = []
         layer_count: int | None = None
         model_started = time.perf_counter()
@@ -506,7 +547,12 @@ def main() -> int:
             # samples: list[dict[str, Any]], this batch's calibration rows.
             base_adapter.model.config.output_attentions = True
             base_forward_started = time.perf_counter()
+            # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden], shared across model passes.
+            # batch_kwargs: dict[str, torch.Tensor], detached CPU adapter tensors for this batch.
             inputs_embeds, batch_kwargs = prepare_batch(base_adapter, samples)
+            # base_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample/layer.
+            # iga_by_sample: list[list[torch.Tensor]] | None, CPU [image_tokens] vectors per sample/layer.
+            # _base_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], reference logits.
             base_outputs, iga_by_sample, _base_logits = capture_layer_outputs_and_iga(
                 base_adapter,
                 inputs_embeds,
@@ -516,11 +562,6 @@ def main() -> int:
             if args.timing:
                 log(f"[timing] Base preprocessing and forward: {time.perf_counter() - base_forward_started:.2f} s", flush=True)
             assert iga_by_sample is not None
-            # Outputs shared with the quantized pass and analysis:
-            # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden].
-            # batch_kwargs: dict[str, torch.Tensor], CPU adapter tensors, masks/labels typically [batch, sequence].
-            # base_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample and layer.
-            # iga_by_sample: list[list[torch.Tensor]], CPU [image_tokens] IGA per sample and layer.
             layer_count = len(base_outputs[0])
             log(
                 f"Base capture: layers={layer_count}, inputs_embeds={tuple(inputs_embeds.shape)}, "
@@ -553,6 +594,9 @@ def main() -> int:
             # quant_adapter: QIG LLaVA adapter wrapping the quantized model.
             # This pass captures block outputs; IGA is only needed from base.
             quant_forward_started = time.perf_counter()
+            # quant_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample/layer.
+            # _unused_iga: None, IGA omitted for the quantized pass.
+            # quant_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], quantized logits.
             quant_outputs, _unused_iga, quant_logits = capture_layer_outputs_and_iga(
                 quant_adapter,
                 inputs_embeds,
@@ -563,10 +607,6 @@ def main() -> int:
                 log(f"[timing] Quantized forward: {time.perf_counter() - quant_forward_started:.2f} s", flush=True)
             if len(quant_outputs[0]) != layer_count:
                 raise ValueError("Base and quantized models have different decoder layer counts")
-            # Outputs for per-sample metric calculation:
-            # quant_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample/layer.
-            # quant_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], quantized model logits.
-            # _base_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], reference model logits.
             log(
                 f"Quantized capture: layers={len(quant_outputs[0])}, "
                 f"logits={tuple(quant_logits.shape)}, "
@@ -575,8 +615,11 @@ def main() -> int:
                 level="extensive",
             )
 
+            # image_mask: torch.Tensor, bool [batch, sequence], positions used for IGA-token MSE.
             image_mask = batch_kwargs["vision_mask"].bool()
+            # attention_mask: torch.Tensor, bool [batch, sequence], valid positions used for full-token MSE.
             attention_mask = batch_kwargs["attention_mask"].bool()
+            # labels: torch.Tensor, [batch, sequence], answer-token ids and -100 ignored positions.
             labels = batch_kwargs["labels"]
             for sample_index, sample in enumerate(samples):
                 top_errors, full_errors = layer_mse(
@@ -593,6 +636,7 @@ def main() -> int:
                 kl = sample_kl_divergence(
                     _base_logits[sample_index], quant_logits[sample_index], labels[sample_index]
                 )
+                # Appended per_sample row: dict[str, Any], IDs, float CE/KL/MSE metrics, and per-layer float lists.
                 per_sample.append(
                     {
                         "sample_index": len(per_sample),
@@ -633,12 +677,14 @@ def main() -> int:
             raise RuntimeError("No model outputs were captured")
         target_key = "ce_delta" if args.correlation_target == "ce_delta" else "kl_base_to_quantized"
         targets = [row[target_key] for row in per_sample]
+        # layer_results: list[dict[str, Any]], one correlation/statistics row per decoder layer.
         layer_results = []
         for layer_index in range(layer_count):
             top_errors = [row["top_iga_mse"][layer_index] for row in per_sample]
             full_errors = [row["full_mse"][layer_index] for row in per_sample]
             corr_top = pearson_correlation(top_errors, targets)
             corr_full = pearson_correlation(full_errors, targets)
+            # Appended layer_results row: dict[str, int | float | None], layer correlations and mean MSEs.
             layer_results.append(
                 {
                     "layer": layer_index,
@@ -660,6 +706,7 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         # Summary schema: run/model metadata, sample-selection settings,
         # metric definitions, one result row per decoder layer, and elapsed time.
+        # result: dict[str, Any], JSON summary with model/run metadata and layer_results.
         result = {
             "base_model": str(base_model),
             "quantized_model": str(quantized_dir),

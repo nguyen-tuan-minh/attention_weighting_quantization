@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Any
 
-# CLI level schema: accepted log-level string -> increasing verbosity threshold.
+# _LEVELS: dict[str, int], accepted log-level string -> increasing verbosity threshold.
 _LEVELS = {"none": 0, "normal": 1, "extensive": 2}
 _CURRENT_LEVEL = _LEVELS["normal"]
 

@@ -61,6 +61,7 @@ def register_attention_hooks(
         to produce one [image_tokens] vector. In save mode, write the raw matrix
         as CPU float16. The attention output is left unchanged.
     """
+    # handles: list[torch.utils.hooks.RemovableHandle], active hooks to return for caller cleanup.
     handles = []
     for name, module in model.named_modules():
         if not name.endswith(".self_attn") or "vision_tower" in name:
@@ -77,6 +78,7 @@ def register_attention_hooks(
         ) -> None:
             if not isinstance(output, tuple) or len(output) < 2:
                 return
+            # attention_weights: torch.Tensor, [batch, heads, sequence, sequence], post-softmax weights.
             attention_weights = output[1]
             if not torch.is_tensor(attention_weights):
                 return
@@ -93,14 +95,19 @@ def register_attention_hooks(
             else:
                 # For each layer, average post-softmax attention over text
                 # query positions and heads to get one score per image token.
+                # text_mask: torch.Tensor, bool [sequence] on attention device, text query positions.
                 text_mask = active_sample["text_mask"].to(attention_weights.device)
+                # image_mask: torch.Tensor, bool [sequence] on attention device, image key positions.
                 image_mask = active_sample["image_mask"].to(attention_weights.device)
                 # Shape after selection: heads x text queries x image keys.
                 # Select one batch item then query/key masks:
                 # [heads, sequence, sequence] -> [heads, text_queries, image_keys].
+                # text_to_image: torch.Tensor, [heads, text_queries, image_tokens], selected attention slice.
                 text_to_image = attention_weights[0][:, text_mask, :][:, :, image_mask]
                 # Average heads and text queries -> one score per image key.
+                # active_sample["iga"][key]: torch.Tensor, CPU [image_tokens], per-layer mean attention scores.
                 active_sample["iga"][key] = text_to_image.float().mean(dim=(0, 1)).cpu()
+            # active_sample["captured"]: int, incremented once for each module capture in this forward.
             active_sample["captured"] += 1
 
         handles.append(module.register_forward_hook(save_attention))
@@ -138,6 +145,7 @@ def show_iga_heatmap(
     if not layer_iga_scores:
         raise ValueError("No per-layer IGA scores are available to plot")
 
+    # token_count: int, number of image patch tokens represented by each layer vector.
     token_count = next(iter(layer_iga_scores.values())).numel()
     grid_size = math.isqrt(token_count)
     if grid_size * grid_size != token_count:
@@ -153,6 +161,7 @@ def show_iga_heatmap(
     square_image = Image.new("RGB", (side, side), background)
     square_image.paste(source_image, ((side - width) // 2, (side - height) // 2))
     # Convert the padded RGB image to a float [height, width, 3] array in [0, 1].
+    # image: np.ndarray, float32 [height, width, 3] in [0, 1], padded RGB background.
     image = np.asarray(square_image).astype(np.float32) / 255.0
 
     image_height, image_width = image.shape[:2]
@@ -160,23 +169,31 @@ def show_iga_heatmap(
     # while keeping layer magnitudes comparable within this sample.
     binary_mode = top_iga_percent is not None
     if binary_mode:
+        # layer_scores: list[torch.Tensor], one CPU binary [image_tokens] selection per layer.
         layer_scores = []
         for scores in layer_iga_scores.values():
             # Rank each layer's image tokens by its IGA score and retain the
             # requested fraction of those scores.
             retain_count = max(1, math.ceil(scores.numel() * top_iga_percent))
             # Flatten [image_tokens] before ranking; indices has [retain_count].
+            # selected: torch.Tensor, long [retain_count], retained flattened IGA indices.
             selected = torch.topk(scores.flatten(), k=retain_count).indices
+            # binary_scores: torch.Tensor, [image_tokens], initialized to zeros before top-token marking.
             binary_scores = torch.zeros_like(scores).flatten()
+            # binary_scores after update: torch.Tensor, [image_tokens], 1 at selected top-IGA positions.
             binary_scores[selected] = 1.0
+            # layer_scores entry: torch.Tensor, [image_tokens], reshaped binary map for this layer.
             layer_scores.append(binary_scores.reshape_as(scores))
         color_map = ListedColormap(["#202020", "#FFD400"])
         color_norm = BoundaryNorm([-0.5, 0.5, 1.5], color_map.N)
     else:
         scale = 100.0 if attention_percent else 1.0
+        # layer_scores: list[torch.Tensor], scaled CPU [image_tokens] maps, one per layer.
         layer_scores = [scores * scale for scores in layer_iga_scores.values()]
         # Pool layer maps as one [layers * image_tokens] vector for shared scaling.
+        # positive_scores: torch.Tensor, [layers * image_tokens], pooled scaled layer scores.
         positive_scores = torch.cat([scores.reshape(-1) for scores in layer_scores])
+        # positive_scores after filter: torch.Tensor, [positive_values], strictly positive scores for LogNorm.
         positive_scores = positive_scores[positive_scores > 0]
         if positive_scores.numel() == 0:
             raise ValueError("IGA scores are all zero; cannot draw a logarithmic heatmap")
@@ -206,9 +223,11 @@ def show_iga_heatmap(
     for axis, (layer_name, scores) in zip(flat_axes[1:], zip(layer_iga_scores, layer_scores)):
         # Expand this layer's image-token scores to the processed image size.
         # Image-token vector [grid_size**2] -> [batch=1, channel=1, grid, grid].
+        # interpolation_input: torch.Tensor, [1, 1, grid_size, grid_size], one layer map for image resizing.
         interpolation_input = scores.reshape(1, 1, grid_size, grid_size)
         if binary_mode:
             # Resize binary token selection [1, 1, grid, grid] to [height, width].
+            # heatmap: np.ndarray, [image_height, image_width], nearest-resized binary token map.
             heatmap = F.interpolate(
                 interpolation_input,
                 size=(image_height, image_width),
@@ -216,6 +235,7 @@ def show_iga_heatmap(
             )[0, 0].numpy()
         else:
             # Resize continuous IGA [1, 1, grid, grid] to [height, width].
+            # heatmap: np.ndarray, [image_height, image_width], bilinear-resized continuous IGA map.
             heatmap = F.interpolate(
                 interpolation_input,
                 size=(image_height, image_width),
@@ -432,10 +452,11 @@ def main() -> int:
         )
         if args.mode == "save":
             attention_dir.mkdir(parents=True, exist_ok=True)
-        # Hook state schema: directory is the current save path or None;
-        # captured counts matrices in the current forward; text_mask and
-        # image_mask are boolean [sequence] masks; iga maps layer name to one
-        # CPU [image_tokens] vector. Reset captured/iga before each sample.
+        # active_sample: dict[str, Any], per-sample state read and mutated by hooks.
+        # active_sample["directory"]: pathlib.Path | None, current raw-map output folder.
+        # active_sample["captured"]: int, number of attention modules run in current forward.
+        # active_sample["text_mask"] / ["image_mask"]: torch.Tensor | None, CPU bool [sequence] token masks.
+        # active_sample["iga"]: dict[str, torch.Tensor], layer name -> CPU [image_tokens] scores.
         active_sample: dict[str, Any] = {
             "directory": None,
             "captured": 0,
@@ -461,8 +482,11 @@ def main() -> int:
                 sample_dir = attention_dir / f"sample_{index:04d}" if args.mode == "save" else None
                 if sample_dir is not None:
                     sample_dir.mkdir(parents=True, exist_ok=True)
+                # active_sample["directory"]: pathlib.Path | None, current sample's raw-map folder.
                 active_sample["directory"] = sample_dir
+                # active_sample["captured"]: int, reset to zero before this sample's forward pass.
                 active_sample["captured"] = 0
+                # active_sample["iga"]: dict[str, torch.Tensor], reset for current layer captures.
                 active_sample["iga"] = {}
 
                 user_text = next(
@@ -475,26 +499,33 @@ def main() -> int:
                 )
                 # Input row schema consumed by the QIG adapter: conversation
                 # turns, stable sample id, and the local-image sentinel.
+                # row: dict[str, Any], QIG adapter input with conversations, sample id, and local-image sentinel.
                 row = {
                     "conversations": sample["conversations"],
                     "id": sample.get("id", str(index)),
                     "image": "local",
                 }
+                # prepared: Any, adapter-preprocessed single-sample row.
                 prepared = input_adapter.preprocess_data([sample["image"]], row)
+                # batch: dict[str, Any], collated multimodal sample for input generation.
                 batch = input_adapter.data_collator([prepared])
+                # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
+                # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
                 prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
-                # Adapter masks may arrive on different devices. Keep all
-                # mask arithmetic on CPU; hooks move masks to attention-device.
-                # Keep bookkeeping masks as CPU boolean [sequence] vectors;
-                # hooks move them to the attention tensor device before indexing.
+                # Adapter masks may arrive on different devices; these CPU masks are moved to attention device by hooks.
+                # attention_mask: torch.Tensor, CPU bool [sequence], valid positions for this sample.
                 attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+                # image_mask: torch.Tensor, CPU bool [sequence], image positions for this sample.
                 image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+                # text_mask: torch.Tensor, CPU bool [sequence], valid non-image positions before query filtering.
                 text_mask = attention_mask & ~image_mask
                 if not image_mask.any() or not text_mask.any():
                     raise ValueError("Could not identify text-query and image-key token positions")
                 # Image positions are [image_tokens]; use the final position to
                 # restrict IGA query rows to text after the image.
+                # image_end: torch.Tensor, scalar index of the final image token in the sequence.
                 image_end = image_mask.nonzero(as_tuple=True)[0][-1]
+                # text_mask after in-place filter: CPU bool [sequence], text query positions after final image token.
                 text_mask &= torch.arange(text_mask.numel()) > image_end
                 if not text_mask.any():
                     raise ValueError("No text query tokens occur after the image tokens")
@@ -504,7 +535,9 @@ def main() -> int:
                     f"text_query_tokens={int(text_mask.sum())}",
                     level="extensive",
                 )
+                # active_sample["image_mask"]: CPU bool [sequence], current sample's image key mask.
                 active_sample["image_mask"] = image_mask
+                # active_sample["text_mask"]: CPU bool [sequence], current sample's post-image text query mask.
                 active_sample["text_mask"] = text_mask
                 if sample_started is not None:
                     log(
@@ -514,6 +547,7 @@ def main() -> int:
 
                 forward_started = time.perf_counter() if args.timing else None
                 with torch.inference_mode():
+                    # outputs: ModelOutput, logits [batch, sequence, vocabulary] plus forward metadata.
                     outputs = input_adapter(
                         inputs_embeds=prompt_inputs["inputs_embeds"],
                         attention_mask=prompt_kwargs["attention_mask"],
@@ -534,11 +568,13 @@ def main() -> int:
                     level="extensive",
                 )
                 if args.mode == "online":
+                    # layer_scores: dict[str, torch.Tensor], CPU [image_tokens] IGA maps for this sample.
                     layer_scores = active_sample["iga"]
                     if not layer_scores:
                         raise RuntimeError("No per-layer IGA scores were captured")
                     # Combine per-layer [image_tokens] vectors into one
                     # [layers * image_tokens] vector for the sample summary.
+                    # score_values: torch.Tensor, [layers * image_tokens], concatenated layer scores.
                     score_values = torch.cat(list(layer_scores.values()))
                     log(
                         f"[{index}/{len(dataset)}] IGA layers={len(layer_scores)}, "
