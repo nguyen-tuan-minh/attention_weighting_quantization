@@ -450,6 +450,9 @@ def main() -> int:
         # =====================================================================
         # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
+        # Inputs from setup:
+        # args: argparse.Namespace, validated CLI options including sample/batch sizes.
+        # dataset_config: dict[str, Any], YAML values used by the shared loader.
         data_started = time.perf_counter()
         log("Loading ShareGPT4V COCO records with local images", flush=True)
         dataset = select_samples(args.dataset_config, args.samples, args.seed)
@@ -474,6 +477,10 @@ def main() -> int:
         # =====================================================================
         # 2. LOAD MODELS (ALTERNATING CHECKPOINTS PER BATCH)
         # =====================================================================
+        # Inputs from phase 1:
+        # dataset: datasets.Dataset, selected rows with local images.
+        # batches: list[list[dict[str, Any]]], Python row dictionaries grouped for forwarding.
+        # per_sample: list[dict[str, Any]], initialized metric rows filled in phases 3–4.
         # Alternate checkpoint loads per batch to cap retained host/GPU memory.
         for batch_index, samples in enumerate(batches, start=1):
             batch_started = time.perf_counter()
@@ -494,6 +501,9 @@ def main() -> int:
                 log(f"[timing] Base model load: {time.perf_counter() - base_load_started:.2f} s", flush=True)
             # 3–4. REGISTER BASE HOOKS AND FORWARD THE BATCH.
             # Hook setup, capture, and cleanup are grouped in the helper.
+            # Inputs from phase 2:
+            # base_adapter: Any, QIG LLaVA adapter that preprocesses and forwards this batch.
+            # samples: list[dict[str, Any]], this batch's calibration rows.
             base_adapter.model.config.output_attentions = True
             base_forward_started = time.perf_counter()
             inputs_embeds, batch_kwargs = prepare_batch(base_adapter, samples)
@@ -506,6 +516,11 @@ def main() -> int:
             if args.timing:
                 log(f"[timing] Base preprocessing and forward: {time.perf_counter() - base_forward_started:.2f} s", flush=True)
             assert iga_by_sample is not None
+            # Outputs shared with the quantized pass and analysis:
+            # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden].
+            # batch_kwargs: dict[str, torch.Tensor], CPU adapter tensors, masks/labels typically [batch, sequence].
+            # base_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample and layer.
+            # iga_by_sample: list[list[torch.Tensor]], CPU [image_tokens] IGA per sample and layer.
             layer_count = len(base_outputs[0])
             log(
                 f"Base capture: layers={layer_count}, inputs_embeds={tuple(inputs_embeds.shape)}, "
@@ -532,6 +547,10 @@ def main() -> int:
             # =====================================================================
             # 3–4. REGISTER QUANTIZED HOOKS AND FORWARD THE SAME BATCH
             # =====================================================================
+            # Inputs from the base pass:
+            # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden], shared model input.
+            # batch_kwargs: dict[str, torch.Tensor], CPU masks/labels reused unchanged.
+            # quant_adapter: QIG LLaVA adapter wrapping the quantized model.
             # This pass captures block outputs; IGA is only needed from base.
             quant_forward_started = time.perf_counter()
             quant_outputs, _unused_iga, quant_logits = capture_layer_outputs_and_iga(
@@ -544,6 +563,10 @@ def main() -> int:
                 log(f"[timing] Quantized forward: {time.perf_counter() - quant_forward_started:.2f} s", flush=True)
             if len(quant_outputs[0]) != layer_count:
                 raise ValueError("Base and quantized models have different decoder layer counts")
+            # Outputs for per-sample metric calculation:
+            # quant_outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample/layer.
+            # quant_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], quantized model logits.
+            # _base_logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary], reference model logits.
             log(
                 f"Quantized capture: layers={len(quant_outputs[0])}, "
                 f"logits={tuple(quant_logits.shape)}, "
@@ -603,6 +626,9 @@ def main() -> int:
         # =====================================================================
         # 5. ANALYSE CAPTURED DATA
         # =====================================================================
+        # Inputs from phases 3–4:
+        # per_sample: list[dict[str, Any]], Python scalar metrics and per-layer float lists.
+        # layer_count: int, decoder-layer count shared by base and quantized models.
         if layer_count is None:
             raise RuntimeError("No model outputs were captured")
         target_key = "ce_delta" if args.correlation_target == "ce_delta" else "kl_base_to_quantized"

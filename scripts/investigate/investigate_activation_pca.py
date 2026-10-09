@@ -334,6 +334,9 @@ def main() -> int:
         # =====================================================================
         # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
+        # Inputs from setup:
+        # args: argparse.Namespace, parsed CLI options and overrides.
+        # dataset_config: dict[str, Any], dataset YAML values.
         dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
             source="coco",
@@ -359,6 +362,9 @@ def main() -> int:
         # =====================================================================
         # 2. LOAD MODEL
         # =====================================================================
+        # Inputs from phase 1:
+        # dataset: datasets.Dataset, selected COCO rows with local images.
+        # model_config: dict[str, Any], model YAML values loaded during setup.
         model_started = time.perf_counter() if args.timing else None
         model_id = model_config["model_id"]
         model_dir = repository_path(model_config.get("model_dir", "models/llava-1.5-7b"))
@@ -388,6 +394,9 @@ def main() -> int:
         # =====================================================================
         # 3. REGISTER HOOKS
         # =====================================================================
+        # Inputs from phases 1–2:
+        # model: torch.nn.Module, loaded LLaVA model containing decoder LayerNorms.
+        # dataset: datasets.Dataset, rows forwarded one at a time in phase 4.
         hooks_started = time.perf_counter() if args.timing else None
         # Hook state schema: ``activations`` maps decoder layer index -> one
         # CPU float16 tensor [sequence, hidden]. Reset it before each sample;
@@ -401,6 +410,9 @@ def main() -> int:
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
+        # Inputs from phase 3:
+        # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
+        # active_sample: dict[str, Any], layer index -> CPU float16 [sequence, hidden] activation.
         log(f"Forwarding {len(dataset):,} samples one at a time...")
         activation_samples: list[dict[int, torch.Tensor]] = []
         token_masks: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -485,6 +497,9 @@ def main() -> int:
         # =====================================================================
         # 5. ANALYSE ACTIVATIONS
         # =====================================================================
+        # Inputs from phase 4:
+        # activation_samples: list[dict[int, torch.Tensor]], CPU float16 [sequence, hidden] by layer and sample.
+        # token_masks: list[tuple[torch.Tensor, torch.Tensor]], CPU bool [sequence] image/text masks per sample.
         if args.plot_scope == "all":
             analyse_started = time.perf_counter() if args.timing else None
             projected = layerwise_pca(

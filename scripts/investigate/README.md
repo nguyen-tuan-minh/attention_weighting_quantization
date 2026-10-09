@@ -56,6 +56,12 @@ follow each phase and trace how inputs become saved results:
   forward phases, make preprocessing, mask creation, model forward, capture
   validation, and result storage easy to distinguish, including which work
   happens once per sample.
+- **Comment on phase handoffs.** At the start of a section, list values carried
+  from earlier sections using one consistent form: `variable_name: type,
+  [shape if tensor], description`. For example:
+  `attention_mask: torch.Tensor, [batch, sequence] CPU bool, valid token positions`.
+  Include the concrete type and shape where applicable; do not describe the
+  handoff only in prose.
 - **Comment on tensor shapes at transformation points.** When creating a tensor
   or changing its shape, state the shape and what each dimension represents,
   for example `# [batch, sequence, hidden]`. Update the comment when the shape

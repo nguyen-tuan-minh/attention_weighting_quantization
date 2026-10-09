@@ -269,6 +269,9 @@ def main() -> int:
         # =====================================================================
         # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
+        # Inputs from setup:
+        # args: argparse.Namespace, parsed CLI options and overrides.
+        # dataset_config: dict[str, Any], dataset YAML values.
         dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
             source="coco",
@@ -294,6 +297,9 @@ def main() -> int:
         # =====================================================================
         # 2. LOAD MODEL
         # =====================================================================
+        # Inputs from phase 1:
+        # dataset: datasets.Dataset, selected COCO rows with local images.
+        # model_config: dict[str, Any], model YAML values loaded during setup.
         model_started = time.perf_counter() if args.timing else None
         model_id = model_config["model_id"]
         model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
@@ -325,6 +331,9 @@ def main() -> int:
         # =====================================================================
         # 3. REGISTER HOOKS
         # =====================================================================
+        # Inputs from phases 1–2:
+        # model: torch.nn.Module, loaded LLaVA model with decoder attention layers.
+        # dataset: datasets.Dataset, rows whose assistant queries are analyzed.
         hooks_started = time.perf_counter() if args.timing else None
         # Hook-state schema (reset per sample): three boolean CPU masks with
         # shape [sequence], and layer_mass mapping layer index to scalar image
@@ -343,6 +352,9 @@ def main() -> int:
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
+        # Inputs from phase 3:
+        # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
+        # active_sample: dict[str, Any], CPU bool masks [sequence] and current layer-mass map.
         # Accumulators map layer index -> summed image mass, text mass, and
         # head/query row count across completed samples.
         image_mass_by_layer: dict[int, float] = {}
@@ -434,6 +446,10 @@ def main() -> int:
         # =====================================================================
         # 5. ANALYSE CAPTURED DATA
         # =====================================================================
+        # Inputs from phase 4:
+        # image_mass_by_layer: dict[int, float], summed per-layer mass sent to image keys.
+        # text_mass_by_layer: dict[int, float], summed per-layer mass sent to text keys.
+        # query_rows_by_layer: dict[int, int], assistant head/query rows summed across samples.
         analysis_started = time.perf_counter() if args.timing else None
         layer_indices, image_percentages, text_percentages = calculate_layer_percentages(
             image_mass_by_layer,

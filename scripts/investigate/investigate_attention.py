@@ -354,6 +354,9 @@ def main() -> int:
         # =====================================================================
         # 1. PREPARE CALIBRATION DATASET
         # =====================================================================
+        # Inputs from setup:
+        # args: argparse.Namespace, parsed CLI options and overrides.
+        # dataset_config: dict[str, Any], dataset YAML values.
         dataset_started = time.perf_counter() if args.timing else None
         dataset: Dataset = load_sharegpt4v_dataset(
             source="coco",
@@ -388,6 +391,9 @@ def main() -> int:
         # =====================================================================
         # 2. LOAD MODEL
         # =====================================================================
+        # Inputs from phase 1:
+        # dataset: datasets.Dataset, selected COCO rows with local images.
+        # model_config: dict[str, Any], model YAML values loaded during setup.
         model_started = time.perf_counter() if args.timing else None
         model_id = model_config["model_id"]
         model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
@@ -414,6 +420,9 @@ def main() -> int:
         # =====================================================================
         # 3. REGISTER ATTENTION HOOKS
         # =====================================================================
+        # Inputs from phases 1–2:
+        # model: torch.nn.Module, loaded LLaVA model whose self-attention is hooked.
+        # dataset: datasets.Dataset, selected rows that phase 4 forwards.
         hooks_started = time.perf_counter() if args.timing else None
         attention_dir = repository_path(
             dataset_config.get(
@@ -442,6 +451,9 @@ def main() -> int:
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
+        # Inputs from phase 3:
+        # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
+        # active_sample: dict[str, Any], hook state with CPU masks and per-layer CPU scores.
         log(f"Forwarding {len(dataset):,} samples one at a time...")
         try:
             for index, sample in enumerate(dataset, start=1):
@@ -565,8 +577,9 @@ def main() -> int:
         # =====================================================================
         # 5. ANALYSE CAPTURED ATTENTION
         # =====================================================================
-        # Online mode calculates IGA and displays the per-sample heatmap in the
-        # forward loop. Add further saved-map analysis here.
+        # Inputs from phase 4:
+        # attention_dir: pathlib.Path, save directory for CPU float16 [batch, heads, sequence, sequence] matrices.
+        # dataset: datasets.Dataset, forwarded subset whose online plots were shown per sample in phase 4.
 
         if args.mode == "online":
             log("Online IGA heatmap display complete; no attention maps were saved.")
