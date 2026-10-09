@@ -191,6 +191,7 @@ def show_gradient_heatmaps(
     sample_number: int,
     *,
     heatmap_only: bool = False,
+    scale: str = "log",
     display: bool = True,
     save_dir: Path | None = None,
 ) -> Path | None:
@@ -202,6 +203,7 @@ def show_gradient_heatmaps(
         sample_number: One-based index in the selected calibration subset.
         heatmap_only: Show the source image in a separate reference panel and
             patch-grid scores without image overlays when true.
+        scale: Color normalization, either logarithmic or linear.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
 
@@ -243,7 +245,14 @@ def show_gradient_heatmaps(
     pooled_scores = torch.cat([scores.reshape(-1).float() for scores in layer_scores.values()])
     # positive_scores: torch.Tensor, CPU float32 [positive_values], strictly positive entries for LogNorm.
     positive_scores = pooled_scores[pooled_scores > 0]
-    if positive_scores.numel() > 0:
+    if scale == "linear":
+        # color_min/color_max: float, shared linear scale limits across all layers in this sample.
+        color_min = float(pooled_scores.min())
+        color_max = float(pooled_scores.max())
+        if color_min >= color_max:
+            color_max = color_min + 1.0
+        color_norm = Normalize(vmin=color_min, vmax=color_max, clip=True)
+    elif positive_scores.numel() > 0:
         color_max = float(positive_scores.max())
         color_min = float(torch.quantile(positive_scores, 0.01))
         if color_min >= color_max:
@@ -365,6 +374,12 @@ def parse_args() -> argparse.Namespace:
         "--heatmap-only",
         action="store_true",
         help="Show the source image as a reference panel and layer heatmaps without overlays.",
+    )
+    parser.add_argument(
+        "--scale",
+        choices=("log", "linear"),
+        default="log",
+        help="Heatmap color scale: logarithmic (default) or linear.",
     )
     parser.add_argument(
         "--log-level",
@@ -579,6 +594,7 @@ def main() -> int:
                     layer_scores,
                     sample_index,
                     heatmap_only=args.heatmap_only,
+                    scale=args.scale,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )

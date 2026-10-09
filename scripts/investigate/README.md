@@ -153,8 +153,10 @@ model paths, or output locations.
   squared gradients over hidden dimensions and answer tokens for each image
   token, and displays per-layer image-token heatmaps for each sample, overlaid
   on the source image by default. Use `--heatmap-only` to show the source image
-  in a separate reference panel beside the plain patch-grid heatmaps. It
-  displays by default and saves nothing unless `--save-dir` is supplied.
+  in a separate reference panel beside the plain patch-grid heatmaps. The
+  default color scale is logarithmic; use `--scale linear` for a normal linear
+  scale. It displays by default and saves nothing unless `--save-dir` is
+  supplied.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
@@ -177,7 +179,10 @@ python scripts/investigate/investigate_assistant_attention.py \
 Display only the gradient heatmaps for two samples (no files are written):
 
 ```bash
-python scripts/investigate/investigate_grad_important.py --samples 2 --heatmap-only
+python scripts/investigate/investigate_grad_important.py \
+  --samples 2 \
+  --heatmap-only \
+  --scale linear
 ```
 
 Save the same per-sample figures without opening windows:
