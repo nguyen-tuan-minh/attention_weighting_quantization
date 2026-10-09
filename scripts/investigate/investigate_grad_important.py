@@ -518,6 +518,9 @@ def main() -> int:
                     outputs = input_adapter(
                         inputs_embeds=inputs_embeds,
                         attention_mask=prompt_kwargs["attention_mask"],
+                        # QIG's LLaVA adapter requires labels and uses them only to populate its output loss;
+                        # assistant-token gradients below still use the individual logits-derived CEs.
+                        labels=prompt_kwargs["labels"],
                         use_cache=False,
                         return_dict=True,
                     )
