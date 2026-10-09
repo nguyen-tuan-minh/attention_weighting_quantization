@@ -23,7 +23,11 @@ from attention_quantization.models import load_model  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
 
 
+# ============================================================================
+# CLI AND CONFIGURATION
+# ============================================================================
 def parse_args() -> argparse.Namespace:
+    """Parse shared config, sampling, output, and logging options."""
     parser = argparse.ArgumentParser(
         description=(
             "Measure, by decoder layer, assistant answer-token attention to image tokens "
@@ -60,11 +64,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ============================================================================
+# PHASE 3. REGISTER HOOKS
+# ============================================================================
 def register_attention_hooks(
     model: torch.nn.Module,
     active_sample: dict[str, Any],
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture answer-query attention mass without retaining full matrices."""
+    """Capture per-layer attention mass to image and text keys.
+
+    Args:
+        model: Loaded LLaVA model with decoder self-attention layers.
+        active_sample: State schema with boolean CPU masks
+            ``assistant_query_mask``, ``image_mask``, and ``text_key_mask``,
+            each [sequence], plus ``layer_mass``. For each layer, layer_mass
+            stores scalar image/text mass sums and a head-query row count for
+            the current sample; reset it before every forward.
+
+    Returns:
+        Hook handles. The caller removes them in a ``finally`` block.
+
+    Hook contract:
+        Read post-softmax attention [batch, heads, query, key], select assistant
+        answer queries and image/text keys, then store scalar mass sums. Return
+        the original attention output with its full matrix replaced by None so
+        the model does not retain the matrices.
+    """
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         raise RuntimeError("Could not find LLaVA decoder layers at model.model.layers")
@@ -83,7 +108,7 @@ def register_attention_hooks(
         ) -> Any:
             if not isinstance(output, tuple) or len(output) < 2:
                 return output
-            weights = output[1]
+            weights = output[1]  # [batch, heads, query_sequence, key_sequence]
             if not torch.is_tensor(weights) or weights.ndim != 4:
                 return output
 
@@ -95,9 +120,12 @@ def register_attention_hooks(
                     f"Layer {index} attention shape {tuple(weights.shape)} does not match token masks"
                 )
 
+            # Select batch item 0 and assistant queries: [heads, answer_queries, keys].
             selected = weights[0][:, query_mask, :].float()
             image_mass = selected[:, :, image_mask].sum()
             text_mass = selected[:, :, text_mask].sum()
+            # Per-layer sample schema: summed scalar attention mass by key type
+            # and the number of head/query rows contributing to those sums.
             active_sample["layer_mass"][index] = {
                 "image": float(image_mass.cpu()),
                 "text": float(text_mass.cpu()),
@@ -112,7 +140,112 @@ def register_attention_hooks(
     return handles
 
 
+# ============================================================================
+# PHASE 5. ANALYSE AND SAVE RESULTS
+# ============================================================================
+def calculate_layer_percentages(
+    image_mass_by_layer: dict[int, float],
+    text_mass_by_layer: dict[int, float],
+) -> tuple[list[int], list[float], list[float]]:
+    """Convert accumulated per-layer attention masses to image/text shares.
+
+    Args:
+        image_mass_by_layer: Layer index -> summed image-key attention mass.
+        text_mass_by_layer: Layer index -> summed text-key attention mass.
+
+    Returns:
+        Sorted layer indices and matching [layers] image and text percentages.
+        Each pair sums to 100 percent.
+    """
+    layer_indices = sorted(image_mass_by_layer)
+    if layer_indices != sorted(text_mass_by_layer):
+        raise ValueError("Image and text attention masses have different layer keys")
+    image_percentages: list[float] = []
+    text_percentages: list[float] = []
+    for layer_index in layer_indices:
+        total_mass = image_mass_by_layer[layer_index] + text_mass_by_layer[layer_index]
+        if total_mass <= 0:
+            raise RuntimeError(f"Layer {layer_index} captured no attention mass")
+        # Each appended value is a scalar share; output vectors are [layers].
+        image_percentages.append(100.0 * image_mass_by_layer[layer_index] / total_mass)
+        text_percentages.append(100.0 * text_mass_by_layer[layer_index] / total_mass)
+    return layer_indices, image_percentages, text_percentages
+
+
+def save_attention_distribution(
+    layer_indices: list[int],
+    image_percentages: list[float],
+    text_percentages: list[float],
+    query_rows_by_layer: dict[int, int],
+    output_path: Path,
+    *,
+    sample_count: int,
+    seed: int | None,
+    show: bool,
+) -> Path:
+    """Save the stacked percentage graph and per-layer CSV.
+
+    Args:
+        layer_indices: Sorted decoder-layer indices [layers].
+        image_percentages: Image-key percentages [layers].
+        text_percentages: Text-key percentages [layers].
+        query_rows_by_layer: Layer index -> contributing head/query row count.
+        output_path: PNG destination; CSV uses the same stem and a ``.csv`` suffix.
+        sample_count: Number of samples represented by the graph.
+        seed: Sample-selection seed shown in the graph title.
+        show: Whether to display the graph after saving it.
+
+    Returns:
+        Path to the written CSV file.
+
+    Side effects:
+        Creates the output directory, writes a PNG and CSV, and optionally
+        displays a Matplotlib figure. The figure is always closed afterward.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = output_path.with_suffix(".csv")
+    figure, axis = plt.subplots(figsize=(max(11, len(layer_indices) * 0.38), 6))
+    # Plot vectors have shape [layers]; stacked segments sum to 100% per layer.
+    axis.bar(layer_indices, text_percentages, label="Text tokens", color="#2878B5")
+    axis.bar(
+        layer_indices,
+        image_percentages,
+        bottom=text_percentages,
+        label="Image tokens",
+        color="#E87500",
+    )
+    axis.set_ylim(0, 100)
+    axis.set_xlabel("Decoder layer")
+    axis.set_ylabel("Assistant attention (%)")
+    axis.set_title(
+        f"Assistant answer-token attention to text and image tokens "
+        f"({sample_count} samples; seed={seed})"
+    )
+    axis.set_xticks(layer_indices)
+    axis.grid(axis="y", alpha=0.25)
+    axis.legend(loc="upper right")
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(figure)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as destination:
+        writer = csv.writer(destination)
+        writer.writerow(
+            ["layer", "text_attention_percent", "image_attention_percent", "assistant_query_head_rows"]
+        )
+        for layer_index, text_percent, image_percent in zip(
+            layer_indices, text_percentages, image_percentages
+        ):
+            writer.writerow(
+                [layer_index, text_percent, image_percent, query_rows_by_layer[layer_index]]
+            )
+    return csv_path
+
+
 def main() -> int:
+    """Run dataset preparation, model loading, hooks, forwards, and analysis."""
     args = parse_args()
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
@@ -193,6 +326,9 @@ def main() -> int:
         # 3. REGISTER HOOKS
         # =====================================================================
         hooks_started = time.perf_counter() if args.timing else None
+        # Hook-state schema (reset per sample): three boolean CPU masks with
+        # shape [sequence], and layer_mass mapping layer index to scalar image
+        # mass, scalar text mass, and integer head-query row count.
         active_sample: dict[str, Any] = {
             "assistant_query_mask": None,
             "image_mask": None,
@@ -207,12 +343,16 @@ def main() -> int:
         # =====================================================================
         # 4. FORWARD CALIBRATION SAMPLES
         # =====================================================================
+        # Accumulators map layer index -> summed image mass, text mass, and
+        # head/query row count across completed samples.
         image_mass_by_layer: dict[int, float] = {}
         text_mass_by_layer: dict[int, float] = {}
         query_rows_by_layer: dict[int, int] = {}
         try:
             for sample_index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
+                # Input row schema consumed by the QIG adapter: conversation
+                # turns, stable sample id, and local-image sentinel.
                 row = {
                     "conversations": sample["conversations"],
                     "id": str(sample.get("id", sample_index)),
@@ -235,6 +375,7 @@ def main() -> int:
                 text_key_mask = attention_mask & ~image_mask
                 labels = prompt_kwargs["labels"][0].detach().cpu()
                 # Labels mark assistant answer-token positions in the input.
+                # All masks below are boolean [sequence] vectors on CPU.
                 assistant_query_mask = labels.ne(-100) & attention_mask
                 if not image_mask.any():
                     raise ValueError(f"Sample {row['id']} has no image tokens")
@@ -263,6 +404,7 @@ def main() -> int:
                     )
                 if forward_started is not None:
                     log(f"[timing] Sample {sample_index} forward: {time.perf_counter() - forward_started:.2f} s")
+                # logits returned by the model have shape [batch, sequence, vocabulary].
                 expected_layers = len(model.model.layers)
                 missing = sorted(set(range(expected_layers)) - set(active_sample["layer_mass"]))
                 if missing:
@@ -293,15 +435,10 @@ def main() -> int:
         # 5. ANALYSE CAPTURED DATA
         # =====================================================================
         analysis_started = time.perf_counter() if args.timing else None
-        layer_indices = sorted(image_mass_by_layer)
-        image_percentages = []
-        text_percentages = []
-        for layer_index in layer_indices:
-            total_mass = image_mass_by_layer[layer_index] + text_mass_by_layer[layer_index]
-            if total_mass <= 0:
-                raise RuntimeError(f"Layer {layer_index} captured no attention mass")
-            image_percentages.append(100.0 * image_mass_by_layer[layer_index] / total_mass)
-            text_percentages.append(100.0 * text_mass_by_layer[layer_index] / total_mass)
+        layer_indices, image_percentages, text_percentages = calculate_layer_percentages(
+            image_mass_by_layer,
+            text_mass_by_layer,
+        )
 
         output_path = args.output.expanduser() if args.output else repository_path(
             dataset_config.get(
@@ -311,45 +448,16 @@ def main() -> int:
         )
         if not output_path.is_absolute():
             output_path = (REPOSITORY_ROOT / output_path).resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_path = output_path.with_suffix(".csv")
-
-        figure, axis = plt.subplots(figsize=(max(11, len(layer_indices) * 0.38), 6))
-        axis.bar(layer_indices, text_percentages, label="Text tokens", color="#2878B5")
-        axis.bar(
+        csv_path = save_attention_distribution(
             layer_indices,
             image_percentages,
-            bottom=text_percentages,
-            label="Image tokens",
-            color="#E87500",
+            text_percentages,
+            query_rows_by_layer,
+            output_path,
+            sample_count=len(dataset),
+            seed=seed,
+            show=args.show,
         )
-        axis.set_ylim(0, 100)
-        axis.set_xlabel("Decoder layer")
-        axis.set_ylabel("Assistant attention (%)")
-        axis.set_title(
-            f"Assistant answer-token attention to text and image tokens "
-            f"({len(dataset)} samples; seed={seed})"
-        )
-        axis.set_xticks(layer_indices)
-        axis.grid(axis="y", alpha=0.25)
-        axis.legend(loc="upper right")
-        figure.tight_layout()
-        figure.savefig(output_path, dpi=180, bbox_inches="tight")
-        if args.show:
-            plt.show()
-        plt.close(figure)
-
-        with csv_path.open("w", newline="", encoding="utf-8") as destination:
-            writer = csv.writer(destination)
-            writer.writerow(
-                ["layer", "text_attention_percent", "image_attention_percent", "assistant_query_head_rows"]
-            )
-            for layer_index, text_percent, image_percent in zip(
-                layer_indices, text_percentages, image_percentages
-            ):
-                writer.writerow(
-                    [layer_index, text_percent, image_percent, query_rows_by_layer[layer_index]]
-                )
 
         log(f"Saved graph to {output_path}")
         log(f"Saved per-layer percentages to {csv_path}")

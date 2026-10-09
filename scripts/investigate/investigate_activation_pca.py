@@ -24,11 +24,23 @@ from investigation_logging import configure_logging, log  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 
 
+# ============================================================================
+# PHASE 3. REGISTER HOOKS
+# ============================================================================
 def register_layernorm_hooks(
     model: torch.nn.Module,
     active_sample: dict[str, Any],
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture each decoder layer's input after its input LayerNorm."""
+    """Register hooks that capture decoder inputs after input LayerNorm.
+
+    Args:
+        model: Loaded LLaVA model containing decoder ``input_layernorm`` modules.
+        active_sample: Mutable state with an ``activations`` mapping. Each
+            layer index maps to one CPU float16 activation tensor [sequence, hidden].
+
+    Returns:
+        Hook handles. The caller must remove every handle in a ``finally`` block.
+    """
     handles: list[torch.utils.hooks.RemovableHandle] = []
     for name, module in model.named_modules():
         match = re.search(r"(?:^|\.)layers\.(\d+)\.input_layernorm$", name)
@@ -43,11 +55,12 @@ def register_layernorm_hooks(
             *,
             index: int = layer_index,
         ) -> None:
-            activation = output[0] if isinstance(output, tuple) else output
+            activation = output[0] if isinstance(output, tuple) else output  # [batch, sequence, hidden]
             if not torch.is_tensor(activation) or activation.ndim != 3:
                 return
             # Keep only one sample on CPU; do not retain the forward graph or
             # accumulate all layer activations on the GPU.
+            # Select batch item 0: [batch, sequence, hidden] -> [sequence, hidden].
             active_sample["activations"][index] = activation[0].detach().to(
                 device="cpu", dtype=torch.float16
             )
@@ -59,6 +72,9 @@ def register_layernorm_hooks(
     return handles
 
 
+# ============================================================================
+# PHASE 5. ANALYSE CAPTURED DATA
+# ============================================================================
 def layerwise_pca(
     activation_samples: list[dict[int, torch.Tensor]],
     token_masks: list[tuple[torch.Tensor, torch.Tensor]],
@@ -66,10 +82,24 @@ def layerwise_pca(
     balance_pca: bool = False,
     seed: int | None = None,
 ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-    """Project pooled image and text tokens to two PCA components per layer."""
+    """Project pooled image/text activations into two components per layer.
+
+    Args:
+        activation_samples: Per-sample mappings from layer index to [sequence, hidden]
+            CPU activations.
+        token_masks: Per-sample pairs of boolean [sequence] image and text masks.
+        balance_pca: Fit PCA axes using equal image and text token counts.
+        seed: Optional seed for selecting balanced-fit tokens.
+
+    Returns:
+        Mapping from layer index to ``(coordinates, is_image)`` where coordinates
+        are [selected_tokens, 2] and ``is_image`` is [selected_tokens].
+    """
     if not activation_samples or len(activation_samples) != len(token_masks):
         raise ValueError("Each activation sample must have a matching pair of token masks")
 
+    # Result schema: layer index -> (CPU [selected_tokens, 2] coordinates,
+    # CPU [selected_tokens] boolean labels; True means image token).
     projected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     layer_indices = sorted(activation_samples[0])
     for layer_index in layer_indices:
@@ -82,10 +112,14 @@ def layerwise_pca(
                     f"Layer {layer_index} has {activation.shape[0]} token positions, "
                     f"but masks have {image_mask.numel()} and {text_mask.numel()}"
                 )
+            # [sequence] masks select image and text rows from [sequence, hidden].
             selected_mask = image_mask | text_mask
+            # Selected activation chunk: [selected_tokens, hidden].
             token_chunks.append(activation[selected_mask].float())
+            # Corresponding image/text labels: [selected_tokens].
             label_chunks.append(image_mask[selected_mask])
 
+        # Concatenate samples: values [all_tokens, hidden], labels [all_tokens].
         values = torch.cat(token_chunks, dim=0)
         labels = torch.cat(label_chunks, dim=0)
         if values.shape[0] < 3:
@@ -107,6 +141,7 @@ def layerwise_pca(
             text_indices = text_indices[
                 torch.randperm(text_indices.numel(), generator=generator)[:balanced_count]
             ]
+            # Balanced token indices: [2 * balanced_count].
             fit_indices = torch.cat((image_indices, text_indices))
             fit_values = values[fit_indices]
 
@@ -114,6 +149,7 @@ def layerwise_pca(
         # covariance matrix for every transformer layer. In balanced mode,
         # fit the axes on an equal number of tokens per modality, then project
         # every token into those same axes for the plot.
+        # PCA components have shape [hidden, 2]; coordinates become [all_tokens, 2].
         _, _, components = torch.pca_lowrank(
             fit_values,
             q=2,
@@ -132,7 +168,19 @@ def show_activation_pca(
     output_name: str = "activation_pca.png",
     contributing_samples: int = 1,
 ) -> None:
-    """Display one image/text PCA scatter plot for every decoder layer."""
+    """Plot the two-component image/text activation projection for each layer.
+
+    Args:
+        projected: Per-layer pairs of [tokens, 2] coordinates and [tokens] labels.
+        figure_title: Figure heading.
+        save_dir: Optional directory for saving the PNG before display.
+        output_name: PNG filename used when ``save_dir`` is set.
+        contributing_samples: Sample count used to tune text-point transparency.
+
+    Side effects:
+        Optionally creates a directory and writes a PNG, displays the figure,
+        and closes the Matplotlib figure afterward.
+    """
     if not projected:
         raise ValueError("No normalized layer activations were captured")
 
@@ -156,6 +204,7 @@ def show_activation_pca(
     text_label = f"Text tokens (n={int((~first_layer_labels).sum()):,})"
     for axis, layer_index in zip(axes.ravel(), layer_indices):
         coordinates, is_image = projected[layer_index]
+        # Split [tokens, 2] coordinates into image/text arrays [points, 2].
         image_points = coordinates[is_image].numpy()
         text_points = coordinates[~is_image].numpy()
         # Draw image tokens fully opaque first, then let text tokens blend
@@ -189,6 +238,7 @@ def show_activation_pca(
         axis.axis("off")
 
     handles, labels = axes.ravel()[0].get_legend_handles_labels()
+    # Legend lookup schema: displayed label string -> Matplotlib handle.
     legend_items = dict(zip(labels, handles))
     labels = [image_label, text_label]
     handles = [legend_items[label] for label in labels]
@@ -212,7 +262,11 @@ def show_activation_pca(
     plt.close(figure)
 
 
+# ============================================================================
+# CLI AND CONFIGURATION
+# ============================================================================
 def parse_args() -> argparse.Namespace:
+    """Parse shared config, sample selection, plot, and logging options."""
     parser = argparse.ArgumentParser(
         description="Compare LLaVA image and text token activations with layer-wise PCA."
     )
@@ -257,6 +311,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Run the five phases: data, model, hooks, forward capture, then PCA plots."""
     args = parse_args()
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
@@ -294,7 +349,7 @@ def main() -> int:
         dataset = dataset.shuffle(seed=seed).select(range(sample_count))
         log(f"Selected {len(dataset):,} COCO samples with local images")
         log(
-            f"Dataset source=COCO, available={len(dataset):,}, seed={seed}, "
+            f"Dataset source=COCO, selected={len(dataset):,}, seed={seed}, "
             f"dataset_config={args.dataset_config}",
             level="extensive",
         )
@@ -334,6 +389,9 @@ def main() -> int:
         # 3. REGISTER HOOKS
         # =====================================================================
         hooks_started = time.perf_counter() if args.timing else None
+        # Hook state schema: ``activations`` maps decoder layer index -> one
+        # CPU float16 tensor [sequence, hidden]. Reset it before each sample;
+        # the caller copies completed sample maps into activation_samples.
         active_sample: dict[str, Any] = {"activations": {}}
         hook_handles = register_layernorm_hooks(model, active_sample)
         log(f"Registered hooks on {len(hook_handles)} decoder input LayerNorm modules")
@@ -350,6 +408,8 @@ def main() -> int:
             for index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
                 active_sample["activations"] = {}
+                # Input row schema consumed by the QIG adapter: conversation
+                # turns, stable sample id, and the local-image sentinel.
                 row = {
                     "conversations": sample["conversations"],
                     "id": sample.get("id", str(index)),
@@ -359,6 +419,8 @@ def main() -> int:
                 batch = input_adapter.data_collator([prepared])
                 prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
+                # Both token masks are CPU boolean vectors [sequence], so their
+                # combination and later PCA indexing use one consistent device.
                 attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
                 image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
                 text_mask = attention_mask & ~image_mask
@@ -380,6 +442,7 @@ def main() -> int:
                         use_cache=False,
                         return_dict=True,
                     )
+                # Model output logits have shape [batch, sequence, vocabulary].
                 if forward_started is not None:
                     log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
                 if not active_sample["activations"]:
