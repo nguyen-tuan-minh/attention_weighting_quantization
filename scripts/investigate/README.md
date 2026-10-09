@@ -101,8 +101,8 @@ model paths, or output locations.
 - `investigate_attention.py`: captures attention/IGA information and can display
   or save attention maps. Use `--true-attention-percent` to label image-key
   softmax weights as percentages of attention over all valid keys. Use
-  `--top-token-percent 0.1` for a binary map retaining the top 10% of image
-  tokens independently in each layer; this mode uses nearest-neighbor resizing
+  `--top-iga-percent 0.1` for a binary map retaining the top 10% of image
+  tokens by IGA score independently in each layer; this mode uses nearest-neighbor resizing
   and a discrete colorbar instead of the logarithmic attention scale.
 - `investigate_activation_pca.py`: captures layer activations and plots
   image-token versus text-token PCA.

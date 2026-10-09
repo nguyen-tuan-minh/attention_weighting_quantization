@@ -88,7 +88,7 @@ def show_iga_heatmap(
     sample_number: int,
     heatmap_only: bool = False,
     attention_percent: bool = False,
-    top_token_percent: float | None = None,
+    top_iga_percent: float | None = None,
 ) -> None:
     """Display image-key attention maps for every language layer."""
     if not layer_iga_scores:
@@ -113,11 +113,13 @@ def show_iga_heatmap(
     image_height, image_width = image.shape[:2]
     # Use a shared logarithmic scale so small IGA differences remain visible
     # while keeping layer magnitudes comparable within this sample.
-    binary_mode = top_token_percent is not None
+    binary_mode = top_iga_percent is not None
     if binary_mode:
         layer_scores = []
         for scores in layer_iga_scores.values():
-            retain_count = max(1, math.ceil(scores.numel() * top_token_percent))
+            # Rank each layer's image tokens by its IGA score and retain the
+            # requested fraction of those scores.
+            retain_count = max(1, math.ceil(scores.numel() * top_iga_percent))
             selected = torch.topk(scores.flatten(), k=retain_count).indices
             binary_scores = torch.zeros_like(scores).flatten()
             binary_scores[selected] = 1.0
@@ -189,7 +191,7 @@ def show_iga_heatmap(
             fraction=0.015,
             pad=0.01,
             label=(
-                "Top image-token mask (binary)"
+                "Top IGA image-token mask (binary)"
                 if binary_mode
                 else (
                     "Attention over all keys (%) (log scale)"
@@ -202,7 +204,7 @@ def show_iga_heatmap(
             colorbar.set_ticks([0, 1])
             colorbar.set_ticklabels(["Other tokens", "Retained top tokens"])
     if binary_mode:
-        display_title = f"top {top_token_percent:.1%} image tokens per layer"
+        display_title = f"top {top_iga_percent:.1%} IGA image tokens per layer"
     elif attention_percent:
         display_title = "all-key attention percentage"
     else:
@@ -263,10 +265,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     attention_display.add_argument(
+        "--top-iga-percent",
         "--top-token-percent",
+        dest="top_iga_percent",
         type=float,
         default=None,
-        help="Show a binary map retaining this fraction of highest-scoring image tokens per layer (0.1 = 10%).",
+        help="Show a binary map retaining this fraction of highest-IGA image tokens per layer (0.1 = 10%).",
     )
     return parser.parse_args()
 
@@ -285,10 +289,10 @@ def main() -> int:
             raise ValueError("calibration_samples must be a positive integer")
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
-        if args.top_token_percent is not None and not 0 < args.top_token_percent <= 1:
-            raise ValueError("--top-token-percent must be in (0, 1], for example 0.1 for 10%")
-        if args.top_token_percent is not None and args.mode != "online":
-            raise ValueError("--top-token-percent requires --mode online to display the binary heatmaps")
+        if args.top_iga_percent is not None and not 0 < args.top_iga_percent <= 1:
+            raise ValueError("--top-iga-percent must be in (0, 1], for example 0.1 for 10%")
+        if args.top_iga_percent is not None and args.mode != "online":
+            raise ValueError("--top-iga-percent requires --mode online to display the binary heatmaps")
 
         total_started = time.perf_counter() if args.timing else None
 
@@ -473,7 +477,7 @@ def main() -> int:
                         index,
                         heatmap_only=args.heatmap_only,
                         attention_percent=args.true_attention_percent,
-                        top_token_percent=args.top_token_percent,
+                        top_iga_percent=args.top_iga_percent,
                     )
                     if plot_started is not None:
                         log(
