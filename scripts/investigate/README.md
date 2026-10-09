@@ -34,6 +34,36 @@ and familiar across investigation scripts:
 Read CLI arguments and configs before phase 1, and validate them before loading
 large resources. These setup steps do not replace or renumber the five phases.
 
+## Readability conventions
+
+Organize functions, tensor transformations, and shared state so readers can
+follow each phase and trace how inputs become saved results:
+
+- **Group phase functions together.** Keep each phase's related function
+  definitions in one area of the file, under a clear, prominent numbered
+  comment such as `# N. PHASE NAME`. Make it easy to find a phase's
+  implementation without searching through unrelated helpers.
+- **Document function contracts.** Give functions clear docstrings describing
+  their inputs, outputs, assumptions, and any state they read or change. State
+  tensor shapes and meanings where they matter.
+- **Document each hook's contract when hooks are used.** Explain which module
+  output it reads, what it captures, how it reduces or transforms the data, and
+  what it returns to the model.
+- **Describe hook state dictionaries at initialization.** When hooks use a
+  state dictionary, document each key's meaning, value type and shape, and
+  whether its value is reset per sample or accumulated across samples.
+- **Keep phase flows explicit.** Show the ordered steps within each phase. For
+  forward phases, make preprocessing, mask creation, model forward, capture
+  validation, and result storage easy to distinguish, including which work
+  happens once per sample.
+- **Comment on tensor shapes at transformation points.** When creating a tensor
+  or changing its shape, state the shape and what each dimension represents,
+  for example `# [batch, sequence, hidden]`. Update the comment when the shape
+  changes.
+- **Clarify side effects and cleanup.** Identify functions that register hooks,
+  mutate shared state, write files, or display plots. Keep cleanup visible,
+  especially hook removal in `finally` blocks.
+
 ## Configuration files
 
 Use these shared configs by default, with CLI paths available to override them:
