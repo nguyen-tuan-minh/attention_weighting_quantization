@@ -466,14 +466,17 @@ def inspect_generated_token_positions(
     while True:
         try:
             position_text = input(
-                f"Token position to inspect (1-{len(token_ids)}), or q to finish: "
+                f"Token position 1-{len(token_ids)}, i for large image, or q to finish: "
             ).strip().lower()
         except EOFError:
             return
+        if position_text == "i":
+            show_large_source_image(image, sample_number)
+            continue
         if position_text == "q":
             return
         if not position_text.isdigit() or not 1 <= int(position_text) <= len(token_ids):
-            print(f"Enter a position from 1 to {len(token_ids)}, or q.")
+            print(f"Enter a position from 1 to {len(token_ids)}, i, or q.")
             continue
 
         # position: int, one-based generated assistant token position selected by the user.
@@ -576,6 +579,27 @@ def inspect_generated_token_positions(
 # ============================================================================
 # PHASE 5. DISPLAY AND OPTIONALLY SAVE GRADIENT HEATMAPS
 # ============================================================================
+def show_large_source_image(source_image: Image.Image, sample_number: int) -> None:
+    """Display a sample image alone in a large figure for visual inspection.
+
+    Args:
+        source_image: PIL image supplied to the multimodal model.
+        sample_number: One-based index in the selected calibration subset.
+
+    Side effects:
+        Opens a large Matplotlib figure and closes it after display.
+    """
+    # image: np.ndarray, [height, width, 3] RGB source image for visual inspection.
+    image = np.asarray(source_image.convert("RGB"))
+    # figure/axis: Matplotlib figure and axis, dedicated large view of this sample image.
+    figure, axis = plt.subplots(figsize=(12, 12), constrained_layout=True)
+    axis.imshow(image)
+    axis.set_title(f"Sample {sample_number}: input image", fontsize=16)
+    axis.axis("off")
+    plt.show()
+    plt.close(figure)
+
+
 def show_gradient_heatmaps(
     source_image: Image.Image,
     layer_scores: dict[int, torch.Tensor],

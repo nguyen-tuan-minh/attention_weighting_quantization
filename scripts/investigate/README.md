@@ -167,8 +167,9 @@ model paths, or output locations.
   first, then inspect the top ten candidates at any numbered token position.
   After viewing a position's candidates, enter a candidate rank to print its
   image-token gradient scores and display its heatmaps; press Enter to inspect
-  another position or `q` to finish. These gradient maps are diagnostic clues,
-  not a standalone hallucination test.
+  another position, type `i` to open the input image in a large window, or `q`
+  to finish. These gradient maps are diagnostic clues, not a standalone
+  hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
