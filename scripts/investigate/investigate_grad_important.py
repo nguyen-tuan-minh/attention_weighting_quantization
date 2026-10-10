@@ -128,7 +128,7 @@ def generate_assistant_reply(
     prompt_row: dict[str, Any],
     max_new_tokens: int,
 ) -> str:
-    """Greedily generate one assistant response from a prompt-only multimodal row.
+    """Greedily decode one assistant response from a prompt-only multimodal row.
 
     Args:
         input_adapter: Loaded QIG LLaVA adapter, providing preprocessing,
@@ -142,8 +142,8 @@ def generate_assistant_reply(
         Decoded assistant response with tokenizer special tokens removed.
 
     Side effects:
-        Runs the model's greedy generation method under inference mode. It does
-        not register hooks, write files, or retain generation activations.
+        Runs repeated model forwards under inference mode, stopping on EOS or
+        the token limit. It does not write files or retain generation activations.
     """
     # prepared_prompt: Any, preprocessed prompt-only multimodal row.
     prepared_prompt = input_adapter.preprocess_data([image], prompt_row)
@@ -152,21 +152,65 @@ def generate_assistant_reply(
     # prompt_inputs: dict[str, torch.Tensor], multimodal prompt embeddings [1, sequence, hidden].
     # prompt_kwargs: dict[str, torch.Tensor], expanded attention mask and all-ignored prompt labels.
     prompt_inputs, prompt_kwargs = input_adapter.generate_input(prompt_batch)
+    # current_embeds: torch.Tensor, prompt [1, sequence, hidden] or one newest token [1, 1, hidden] with KV cache.
+    current_embeds = prompt_inputs["inputs_embeds"]
+    # current_attention_mask: torch.Tensor, device-local bool [1, cached_sequence + current_sequence].
+    current_attention_mask = prompt_kwargs["attention_mask"]
+    # generated_token_ids: list[torch.Tensor], device-local long [1, 1] ids emitted so far.
+    generated_token_ids: list[torch.Tensor] = []
+    # past_key_values: model cache for the prompt and generated prefix, or None when unsupported.
+    past_key_values = None
+    # eos_token_ids: set[int], configured end-of-sequence token ids that stop greedy decoding.
+    eos_token_id = getattr(input_adapter.model.config, "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = input_adapter.tokenizer.eos_token_id
+    eos_token_ids = set(eos_token_id) if isinstance(eos_token_id, (tuple, list)) else (
+        {eos_token_id} if eos_token_id is not None else set()
+    )
+    # embedding_layer: torch.nn.Module, model token embedding table for extending prompt embeddings.
+    embedding_layer = input_adapter.model.get_input_embeddings()
     with torch.inference_mode():
-        # generated_ids: torch.Tensor, [1, generated_tokens], greedy assistant continuation token ids.
-        generated_ids = input_adapter.model.generate(
-            inputs_embeds=prompt_inputs["inputs_embeds"],
-            attention_mask=prompt_kwargs["attention_mask"],
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-        )
-    # assistant_text: str, decoded generated continuation with special tokens removed.
+        for _ in range(max_new_tokens):
+            # outputs: ModelOutput, logits for the current sequence and an optional updated KV cache.
+            outputs = input_adapter.model(
+                inputs_embeds=current_embeds,
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            # next_token_id: torch.Tensor, device-local long [1, 1], greedy next-token choice.
+            next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated_token_ids.append(next_token_id)
+            if int(next_token_id[0, 0]) in eos_token_ids:
+                break
+
+            # next_token_embed: torch.Tensor, [1, 1, hidden], embedding for the next cached forward.
+            next_token_embed = embedding_layer(next_token_id)
+            # next_attention: torch.Tensor, bool [1, 1], marks this generated token as valid.
+            next_attention = torch.ones(
+                (current_attention_mask.shape[0], 1),
+                dtype=current_attention_mask.dtype,
+                device=current_attention_mask.device,
+            )
+            # current_attention_mask: torch.Tensor, bool [1, total cached and current tokens].
+            current_attention_mask = torch.cat((current_attention_mask, next_attention), dim=1)
+            past_key_values = outputs.past_key_values
+            if past_key_values is None:
+                # Without a KV cache, append the new token embedding to the complete prefix for the next forward.
+                current_embeds = torch.cat((current_embeds, next_token_embed), dim=1)
+            else:
+                # With a KV cache, only the newest token embedding is needed for the next forward.
+                current_embeds = next_token_embed
+
+    # generated_ids: torch.Tensor, [1, generated_tokens], all greedy continuation ids, including EOS if emitted.
+    generated_ids = torch.cat(generated_token_ids, dim=1)
+    # assistant_text: str, decoded generated continuation with tokenizer special tokens removed.
     assistant_text = input_adapter.tokenizer.decode(
         generated_ids[0],
         skip_special_tokens=True,
     ).strip()
-    del generated_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
+    del generated_ids, generated_token_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
     return assistant_text
 
 
