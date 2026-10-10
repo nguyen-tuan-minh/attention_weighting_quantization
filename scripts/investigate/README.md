@@ -163,11 +163,12 @@ model paths, or output locations.
   prompt, then score that generated reply; the sentence is printed in both
   normal and extensive logging. Generation stops at the model's EOS token or
   the `--max-new-tokens` cap (default 128); there is no custom semantic stopping
-  criterion. Use `--answer-mode interactive` to review up to ten next-token
-  candidates and choose each token manually. Enter `gN` to inspect candidate
-  N's image-token gradient scores and heatmaps before choosing, or `q` to stop
-  and score the partial reply. These gradient maps are diagnostic clues, not a
-  standalone hallucination test.
+  criterion. Use `--answer-mode interactive` to generate the complete answer
+  first, then inspect the top ten candidates at any numbered token position.
+  After viewing a position's candidates, enter a candidate rank to print its
+  image-token gradient scores and display its heatmaps; press Enter to inspect
+  another position or `q` to finish. These gradient maps are diagnostic clues,
+  not a standalone hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
@@ -215,8 +216,8 @@ python scripts/investigate/investigate_grad_important.py \
   --max-new-tokens 128
 ```
 
-Review and choose generated tokens, inspecting a candidate's image gradient map
-with `gN` when needed:
+Generate a complete answer, then inspect alternatives at selected token
+positions and optionally view a candidate's image gradient map:
 
 ```bash
 python scripts/investigate/investigate_grad_important.py \
