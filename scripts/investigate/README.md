@@ -158,7 +158,12 @@ model paths, or output locations.
   scale. Use `--score-normalization percent` to divide each token score by the
   sum of image-token scores in its layer, so each layer's image-token values sum
   to 100%. It displays by default and saves nothing unless `--save-dir` is
-  supplied.
+  supplied. By default it scores the dataset's assistant answer. Use
+  `--answer-mode generate` to first greedily generate a reply from the user
+  prompt, then score that generated reply; the sentence is printed in both
+  normal and extensive logging. Generation stops at the model's EOS token or
+  the `--max-new-tokens` cap (default 128); there is no custom semantic stopping
+  criterion.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
 
@@ -195,6 +200,15 @@ of its pre-normalization block input:
 python scripts/investigate/investigate_grad_important.py \
   --samples 2 \
   --capture-point after_layer_norm
+```
+
+Generate the assistant answer instead of scoring the dataset example:
+
+```bash
+python scripts/investigate/investigate_grad_important.py \
+  --samples 2 \
+  --answer-mode generate \
+  --max-new-tokens 128
 ```
 
 Save the same per-sample figures without opening windows:

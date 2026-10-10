@@ -89,6 +89,8 @@ def register_decoder_activation_hooks(
                 *,
                 index: int = layer_index,
             ) -> None:
+                if not active_sample.get("capture_enabled", True):
+                    return
                 if not inputs:
                     raise RuntimeError(f"Decoder layer {index} received no hidden-state input")
                 store_activation(inputs[0], index=index)
@@ -106,6 +108,8 @@ def register_decoder_activation_hooks(
                 *,
                 index: int = layer_index,
             ) -> None:
+                if not active_sample.get("capture_enabled", True):
+                    return
                 store_activation(output, index=index)
 
             handles.append(layer_norm.register_forward_hook(capture_after_layer_norm))
@@ -118,6 +122,54 @@ def register_decoder_activation_hooks(
 # ============================================================================
 # PHASE 4. FORWARD SAMPLES AND BACKPROPAGATE ASSISTANT TOKEN LOSSES
 # ============================================================================
+def generate_assistant_reply(
+    input_adapter: Any,
+    image: Any,
+    prompt_row: dict[str, Any],
+    max_new_tokens: int,
+) -> str:
+    """Greedily generate one assistant response from a prompt-only multimodal row.
+
+    Args:
+        input_adapter: Loaded QIG LLaVA adapter, providing preprocessing,
+            collation, multimodal prompt embeddings, model, and tokenizer.
+        image: PIL image for the current calibration example.
+        prompt_row: Adapter row containing conversation turns up to the latest
+            user message, an id, and the local-image sentinel.
+        max_new_tokens: Maximum number of generated assistant tokens.
+
+    Returns:
+        Decoded assistant response with tokenizer special tokens removed.
+
+    Side effects:
+        Runs the model's greedy generation method under inference mode. It does
+        not register hooks, write files, or retain generation activations.
+    """
+    # prepared_prompt: Any, preprocessed prompt-only multimodal row.
+    prepared_prompt = input_adapter.preprocess_data([image], prompt_row)
+    # prompt_batch: dict[str, Any], collated prompt consumed by generate_input.
+    prompt_batch = input_adapter.data_collator([prepared_prompt])
+    # prompt_inputs: dict[str, torch.Tensor], multimodal prompt embeddings [1, sequence, hidden].
+    # prompt_kwargs: dict[str, torch.Tensor], expanded attention mask and all-ignored prompt labels.
+    prompt_inputs, prompt_kwargs = input_adapter.generate_input(prompt_batch)
+    with torch.inference_mode():
+        # generated_ids: torch.Tensor, [1, generated_tokens], greedy assistant continuation token ids.
+        generated_ids = input_adapter.model.generate(
+            inputs_embeds=prompt_inputs["inputs_embeds"],
+            attention_mask=prompt_kwargs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+        )
+    # assistant_text: str, decoded generated continuation with special tokens removed.
+    assistant_text = input_adapter.tokenizer.decode(
+        generated_ids[0],
+        skip_special_tokens=True,
+    ).strip()
+    del generated_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
+    return assistant_text
+
+
 def score_assistant_token_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -414,6 +466,18 @@ def parse_args() -> argparse.Namespace:
         help="Activation to differentiate: pre-norm block input (default) or input-layer-norm output.",
     )
     parser.add_argument(
+        "--answer-mode",
+        choices=("example", "generate"),
+        default="example",
+        help="Score the dataset's assistant answer (default) or a greedily generated reply.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=128,
+        help="Maximum generated assistant tokens when --answer-mode generate is selected.",
+    )
+    parser.add_argument(
         "--save-dir",
         type=Path,
         default=None,
@@ -469,6 +533,8 @@ def main() -> int:
         seed = args.seed if args.seed is not None else dataset_config.get("calibration_seed")
         if not isinstance(sample_count, int) or sample_count < 1:
             raise ValueError("calibration_samples must be a positive integer")
+        if not isinstance(args.max_new_tokens, int) or args.max_new_tokens < 1:
+            raise ValueError("--max-new-tokens must be a positive integer")
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
         if args.save_dir is not None:
@@ -550,9 +616,10 @@ def main() -> int:
         # model: torch.nn.Module, frozen LLaVA model whose selected decoder activations are differentiated.
         # dataset: datasets.Dataset, selected examples processed one at a time.
         hooks_started = time.perf_counter() if args.timing else None
-        # active_sample: dict[str, Any], live decoder input tensors for one current forward.
-        # active_sample["layer_activations"]: dict[int, torch.Tensor], layer -> live [batch, sequence, hidden] selected activation.
-        active_sample: dict[str, Any] = {"layer_activations": {}}
+        # active_sample: dict[str, Any], hook state for the current sample and selected forward.
+        # active_sample["layer_activations"]: dict[int, torch.Tensor], layer -> live [batch, sequence, hidden] activation.
+        # active_sample["capture_enabled"]: bool, false during inference-only answer generation, true for scored forward.
+        active_sample: dict[str, Any] = {"layer_activations": {}, "capture_enabled": True}
         hook_handles = register_decoder_activation_hooks(model, active_sample, args.capture_point)
         log(f"Registered {args.capture_point} hooks on {len(hook_handles)} layers")
         if hooks_started is not None:
@@ -567,17 +634,60 @@ def main() -> int:
         try:
             for sample_index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
-                # active_sample["layer_activations"]: dict[int, torch.Tensor], reset before this sample's forward.
+                # active_sample["layer_activations"]: dict[int, torch.Tensor], reset before this sample's scored forward.
                 active_sample["layer_activations"] = {}
+                # source_conversations: list[dict[str, str]], original user/assistant turns from the dataset.
+                source_conversations = sample["conversations"]
                 # row: dict[str, Any], QIG adapter input with conversation, stable id, and local-image sentinel.
                 row = {
-                    "conversations": sample["conversations"],
+                    "conversations": source_conversations,
                     "id": str(sample.get("id", sample_index)),
                     "image": "local",
                 }
                 image = sample["image"]
                 if hasattr(image, "convert"):
                     image = image.convert("RGB")
+                if args.answer_mode == "generate":
+                    # user_turn_indices: list[int], positions of user turns available as generation context.
+                    user_turn_indices = [
+                        index
+                        for index, turn in enumerate(source_conversations)
+                        if turn.get("from") in {"human", "user"}
+                    ]
+                    if not user_turn_indices:
+                        raise ValueError(f"Sample {row['id']} has no user turn to generate from")
+                    # prompt_conversations: list[dict[str, str]], turns through the latest user message, without its answer.
+                    prompt_conversations = source_conversations[: user_turn_indices[-1] + 1]
+                    # prompt_row: dict[str, Any], user-context row consumed only for assistant generation.
+                    prompt_row = {**row, "conversations": prompt_conversations}
+                    generation_started = time.perf_counter() if args.timing else None
+                    # active_sample["capture_enabled"]: bool, suspend gradient hooks during no-grad generation.
+                    active_sample["capture_enabled"] = False
+                    try:
+                        assistant_text = generate_assistant_reply(
+                            input_adapter,
+                            image,
+                            prompt_row,
+                            args.max_new_tokens,
+                        )
+                    finally:
+                        # active_sample["capture_enabled"]: bool, re-enable hooks for the answer-scoring forward.
+                        active_sample["capture_enabled"] = True
+                    if not assistant_text:
+                        raise ValueError(f"Sample {row['id']} produced an empty assistant response")
+                    log(
+                        f"[{sample_index}/{len(dataset)}] GENERATED ASSISTANT: {assistant_text}",
+                        level="normal",
+                    )
+                    if generation_started is not None:
+                        log(
+                            f"[timing] Sample {sample_index} generation: "
+                            f"{time.perf_counter() - generation_started:.2f} s"
+                        )
+                    # row["conversations"]: list[dict[str, str]], prompt turns plus generated assistant answer for scoring.
+                    row["conversations"] = prompt_conversations + [
+                        {"from": "gpt", "value": assistant_text}
+                    ]
                 # prepared: Any, one adapter-preprocessed multimodal row.
                 prepared = input_adapter.preprocess_data([image], row)
                 # batch: dict[str, Any], collated single-sample input to generate_input.
