@@ -155,7 +155,9 @@ model paths, or output locations.
   on the source image by default. Use `--heatmap-only` to show the source image
   in a separate reference panel beside the plain patch-grid heatmaps. The
   default color scale is logarithmic; use `--scale linear` for a normal linear
-  scale. It displays by default and saves nothing unless `--save-dir` is
+  scale. Use `--score-normalization percent` to divide each token score by the
+  sum of image-token scores in its layer, so each layer's image-token values sum
+  to 100%. It displays by default and saves nothing unless `--save-dir` is
   supplied.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
@@ -182,7 +184,8 @@ Display only the gradient heatmaps for two samples (no files are written):
 python scripts/investigate/investigate_grad_important.py \
   --samples 2 \
   --heatmap-only \
-  --scale linear
+  --scale linear \
+  --score-normalization percent
 ```
 
 Differentiate with respect to each layer's post-normalization activation instead

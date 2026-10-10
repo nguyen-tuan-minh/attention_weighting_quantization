@@ -215,6 +215,7 @@ def show_gradient_heatmaps(
     *,
     heatmap_only: bool = False,
     scale: str = "log",
+    score_normalization: str = "raw",
     display: bool = True,
     save_dir: Path | None = None,
 ) -> Path | None:
@@ -227,6 +228,8 @@ def show_gradient_heatmaps(
         heatmap_only: Show the source image in a separate reference panel and
             patch-grid scores without image overlays when true.
         scale: Color normalization, either logarithmic or linear.
+        score_normalization: ``raw`` preserves score magnitudes; ``percent``
+            makes each image-token score a percentage of that layer's total.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
 
@@ -251,6 +254,24 @@ def show_gradient_heatmaps(
     if any(scores.numel() != image_token_count for scores in layer_scores.values()):
         raise ValueError("All layers must have the same number of image-token scores")
 
+    # display_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens], raw or per-layer percentage values.
+    if score_normalization == "percent":
+        display_scores = {}
+        for layer_index, scores in layer_scores.items():
+            # layer_total: torch.Tensor, CPU float32 scalar, sum of this layer's image-token scores.
+            layer_total = scores.sum()
+            if layer_total > 0:
+                # display_scores[layer_index]: torch.Tensor, CPU float32 [image_tokens], each token's percent of layer total.
+                display_scores[layer_index] = scores.float() / layer_total * 100.0
+            else:
+                # All-zero scores have no defined share; represent every token as 0 percent.
+                display_scores[layer_index] = torch.zeros_like(scores, dtype=torch.float32)
+    elif score_normalization == "raw":
+        # display_scores: dict[int, torch.Tensor], raw CPU scores retained for each layer.
+        display_scores = layer_scores
+    else:
+        raise ValueError(f"Unknown score normalization: {score_normalization}")
+
     # image: np.ndarray, float32 [square_side, square_side, 3] in [0, 1], square-padded RGB sample.
     source_image = source_image.convert("RGB")
     image_width, image_height = source_image.size
@@ -265,7 +286,7 @@ def show_gradient_heatmaps(
     image = np.asarray(square_image).astype(np.float32) / 255.0
 
     # pooled_scores: torch.Tensor, CPU float32 [layers * image_tokens], values for one shared color scale.
-    pooled_scores = torch.cat([scores.reshape(-1).float() for scores in layer_scores.values()])
+    pooled_scores = torch.cat([scores.reshape(-1).float() for scores in display_scores.values()])
     # positive_scores: torch.Tensor, CPU float32 [positive_values], strictly positive entries for LogNorm.
     positive_scores = pooled_scores[pooled_scores > 0]
     if scale == "linear":
@@ -285,7 +306,7 @@ def show_gradient_heatmaps(
         # All scores are zero; linear normalization still produces a valid, legible figure.
         color_norm = Normalize(vmin=0.0, vmax=1.0)
 
-    layer_indices = sorted(layer_scores)
+    layer_indices = sorted(display_scores)
     # panel_count: int, layer heatmap panels plus an image-reference panel in heatmap-only mode.
     panel_count = len(layer_indices) + int(heatmap_only)
     columns = 6
@@ -307,7 +328,7 @@ def show_gradient_heatmaps(
 
     for axis, layer_index in zip(flat_axes[first_heatmap_axis:], layer_indices):
         # grid_scores: torch.Tensor, float32 [1, 1, grid_size, grid_size], this layer's image-token scores.
-        grid_scores = layer_scores[layer_index].float().reshape(1, 1, grid_size, grid_size)
+        grid_scores = display_scores[layer_index].float().reshape(1, 1, grid_size, grid_size)
         # heatmap: torch.Tensor, CPU float32 [grid_size, grid_size], image-token scores in patch-grid layout.
         heatmap = grid_scores[0, 0]
         if not heatmap_only:
@@ -340,7 +361,11 @@ def show_gradient_heatmaps(
             ax=flat_axes[:panel_count].tolist(),
             fraction=0.015,
             pad=0.01,
-            label="Sum of squared assistant-token CE gradients",
+            label=(
+                "Percent of this layer's image-token gradient score"
+                if score_normalization == "percent"
+                else "Sum of squared assistant-token CE gradients"
+            ),
         )
     figure.suptitle(
         f"Sample {sample_number}: selected decoder-activation gradient importance",
@@ -409,6 +434,12 @@ def parse_args() -> argparse.Namespace:
         choices=("log", "linear"),
         default="log",
         help="Heatmap color scale: logarithmic (default) or linear.",
+    )
+    parser.add_argument(
+        "--score-normalization",
+        choices=("raw", "percent"),
+        default="raw",
+        help="Show raw scores or each image token's percentage of its layer's total score.",
     )
     parser.add_argument(
         "--log-level",
@@ -625,6 +656,7 @@ def main() -> int:
                     sample_index,
                     heatmap_only=args.heatmap_only,
                     scale=args.scale,
+                    score_normalization=args.score_normalization,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )
