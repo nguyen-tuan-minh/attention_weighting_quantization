@@ -127,6 +127,13 @@ def generate_assistant_reply(
     image: Any,
     prompt_row: dict[str, Any],
     max_new_tokens: int,
+    *,
+    interactive: bool = False,
+    active_sample: dict[str, Any] | None = None,
+    sample_number: int = 1,
+    heatmap_only: bool = False,
+    scale: str = "log",
+    score_normalization: str = "raw",
 ) -> str:
     """Greedily decode one assistant response from a prompt-only multimodal row.
 
@@ -137,12 +144,18 @@ def generate_assistant_reply(
         prompt_row: Adapter row containing conversation turns up to the latest
             user message, an id, and the local-image sentinel.
         max_new_tokens: Maximum number of generated assistant tokens.
+        interactive: Show top-token choices and wait for a user selection.
+        active_sample: Hook state required to inspect candidate gradient scores.
+        sample_number: One-based calibration sample number for candidate heatmaps.
+        heatmap_only: Use the separate-reference-image heatmap layout.
+        scale: Heatmap color normalization, logarithmic or linear.
+        score_normalization: Raw scores or per-layer image-token percentages.
 
     Returns:
         Decoded assistant response with tokenizer special tokens removed.
 
     Side effects:
-        Runs repeated model forwards under inference mode, stopping on EOS or
+        Runs repeated model forwards under no-grad mode, stopping on EOS or
         the token limit. It does not write files or retain generation activations.
     """
     # prepared_prompt: Any, preprocessed prompt-only multimodal row.
@@ -156,6 +169,12 @@ def generate_assistant_reply(
     current_embeds = prompt_inputs["inputs_embeds"]
     # current_attention_mask: torch.Tensor, device-local bool [1, cached_sequence + current_sequence].
     current_attention_mask = prompt_kwargs["attention_mask"]
+    # full_prefix_embeds: torch.Tensor, device-local [1, prompt_plus_generated_tokens, hidden] full sequence for gradient inspection.
+    full_prefix_embeds = current_embeds
+    # full_prefix_attention_mask: torch.Tensor, bool [1, prompt_plus_generated_tokens] mask for full-prefix inspection.
+    full_prefix_attention_mask = current_attention_mask
+    # full_prefix_image_mask: torch.Tensor, CPU bool [prompt_plus_generated_tokens], image positions followed by false text positions.
+    full_prefix_image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
     # generated_token_ids: list[torch.Tensor], device-local long [1, 1] ids emitted so far.
     generated_token_ids: list[torch.Tensor] = []
     # past_key_values: model cache for the prompt and generated prefix, or None when unsupported.
@@ -169,7 +188,7 @@ def generate_assistant_reply(
     )
     # embedding_layer: torch.nn.Module, model token embedding table for extending prompt embeddings.
     embedding_layer = input_adapter.model.get_input_embeddings()
-    with torch.inference_mode():
+    with torch.no_grad():
         for _ in range(max_new_tokens):
             # outputs: ModelOutput, logits for the current sequence and an optional updated KV cache.
             outputs = input_adapter.model(
@@ -180,13 +199,106 @@ def generate_assistant_reply(
                 return_dict=True,
             )
             # next_token_id: torch.Tensor, device-local long [1, 1], greedy next-token choice.
-            next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            # next_token_logits: torch.Tensor, float [vocabulary], distribution for the next assistant token.
+            next_token_logits = outputs.logits[0, -1].float()
+            if interactive:
+                # top_probabilities: torch.Tensor, float [candidates], probability mass for ranked candidates.
+                # top_token_ids: torch.Tensor, long [candidates], ranked candidate token ids (at most ten).
+                top_probabilities, top_token_ids = torch.topk(
+                    torch.softmax(next_token_logits, dim=-1),
+                    k=min(10, next_token_logits.numel()),
+                )
+                print("\nAssistant token candidates:")
+                for candidate_index, (candidate_probability, candidate_id) in enumerate(
+                    zip(top_probabilities, top_token_ids),
+                    start=1,
+                ):
+                    # candidate_text: str, decoded token piece with whitespace made visible by repr().
+                    candidate_text = input_adapter.tokenizer.decode(
+                        [int(candidate_id)],
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    print(f"[{candidate_index}] {candidate_text!r}  p={float(candidate_probability):.4f}")
+                partial_text = input_adapter.tokenizer.decode(
+                    torch.cat(generated_token_ids, dim=1)[0],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ) if generated_token_ids else ""
+                print(f"Current answer: {partial_text!r}")
+                while True:
+                    try:
+                        selection = input(
+                            "Choose 1-10, gN to inspect candidate gradients, or q to stop: "
+                        ).strip().lower()
+                    except EOFError:
+                        selection = "q"
+                    if selection == "q":
+                        if not generated_token_ids:
+                            print("Choose at least one token before stopping.")
+                            continue
+                        # q ends generation and scores the accepted partial answer so far.
+                        next_token_id = None
+                        break
+                    if selection.startswith("g") and selection[1:].isdigit():
+                        inspect_index = int(selection[1:])
+                        if not 1 <= inspect_index <= top_token_ids.numel():
+                            print(f"Choose a candidate from 1 to {top_token_ids.numel()}.")
+                            continue
+                        if active_sample is None:
+                            print("Candidate gradient inspection is unavailable.")
+                            continue
+                        inspected_id = top_token_ids[inspect_index - 1].reshape(1, 1)
+                        inspected_text = input_adapter.tokenizer.decode(
+                            [int(inspected_id[0, 0])],
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
+                        candidate_scores, candidate_loss = score_candidate_token_gradients(
+                            input_adapter.model,
+                            active_sample,
+                            full_prefix_embeds,
+                            full_prefix_attention_mask,
+                            full_prefix_image_mask,
+                            inspected_id,
+                        )
+                        layer_totals = ", ".join(
+                            f"L{layer_index}={float(scores.sum()):.3g}"
+                            for layer_index, scores in sorted(candidate_scores.items())
+                        )
+                        print(
+                            f"Gradient score for candidate {inspect_index} {inspected_text!r}: "
+                            f"CE={candidate_loss:.5g}; per-layer image-token sums: {layer_totals}"
+                        )
+                        show_gradient_heatmaps(
+                            image,
+                            candidate_scores,
+                            sample_number,
+                            heatmap_only=heatmap_only,
+                            scale=scale,
+                            score_normalization=score_normalization,
+                            title_suffix=f"candidate token {inspected_text!r}",
+                            display=True,
+                            save_dir=None,
+                        )
+                        continue
+                    if selection.isdigit() and 1 <= int(selection) <= top_token_ids.numel():
+                        next_token_id = top_token_ids[int(selection) - 1].reshape(1, 1)
+                        break
+                    print(f"Enter a number from 1 to {top_token_ids.numel()}, gN, or q.")
+                if next_token_id is None:
+                    break
+            else:
+                # next_token_id: torch.Tensor, device-local long [1, 1], greedy next-token choice.
+                next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)
             generated_token_ids.append(next_token_id)
             if int(next_token_id[0, 0]) in eos_token_ids:
                 break
 
             # next_token_embed: torch.Tensor, [1, 1, hidden], embedding for the next cached forward.
             next_token_embed = embedding_layer(next_token_id)
+            # full_prefix_embeds: torch.Tensor, [1, prompt_plus_generated_tokens, hidden], extended for optional gradient inspection.
+            full_prefix_embeds = torch.cat((full_prefix_embeds, next_token_embed), dim=1)
             # next_attention: torch.Tensor, bool [1, 1], marks this generated token as valid.
             next_attention = torch.ones(
                 (current_attention_mask.shape[0], 1),
@@ -195,6 +307,10 @@ def generate_assistant_reply(
             )
             # current_attention_mask: torch.Tensor, bool [1, total cached and current tokens].
             current_attention_mask = torch.cat((current_attention_mask, next_attention), dim=1)
+            # full_prefix_attention_mask: torch.Tensor, bool [1, prompt_plus_generated_tokens], extended for gradient inspection.
+            full_prefix_attention_mask = current_attention_mask
+            # full_prefix_image_mask: torch.Tensor, CPU bool [prompt_plus_generated_tokens], generated answer positions are non-image.
+            full_prefix_image_mask = torch.cat((full_prefix_image_mask, torch.zeros(1, dtype=torch.bool)))
             past_key_values = outputs.past_key_values
             if past_key_values is None:
                 # Without a KV cache, append the new token embedding to the complete prefix for the next forward.
@@ -301,6 +417,78 @@ def score_assistant_token_losses(
     return scores, token_losses
 
 
+def score_candidate_token_gradients(
+    model: torch.nn.Module,
+    active_sample: dict[str, Any],
+    prefix_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    image_mask: torch.Tensor,
+    candidate_token_id: torch.Tensor,
+) -> tuple[dict[int, torch.Tensor], float]:
+    """Score one candidate token's CE gradient over image positions at every layer.
+
+    Args:
+        model: Loaded LLaVA causal language model.
+        active_sample: Hook state populated with live selected activations during
+            this temporary gradient-enabled forward.
+        prefix_embeds: Full prompt and accepted-token embeddings [1, sequence, hidden].
+        attention_mask: Device-local bool [1, sequence] valid prefix positions.
+        image_mask: CPU bool [sequence] positions belonging to the input image.
+        candidate_token_id: Device-local long [1, 1] candidate continuation token.
+
+    Returns:
+        Layer -> CPU float32 [image_tokens] sums of squared candidate-loss
+        gradients over hidden dimensions, plus the candidate CE scalar.
+
+    Side effects:
+        Temporarily enables and populates the existing activation hooks; clears
+        captured graph references and disables capture before returning.
+    """
+    if image_mask.numel() != prefix_embeds.shape[1]:
+        raise ValueError("Image mask must align with the full candidate prefix")
+    # active_sample["layer_activations"]: dict[int, torch.Tensor], reset for this candidate's gradient forward.
+    active_sample["layer_activations"] = {}
+    # active_sample["capture_enabled"]: bool, enable hooks for the candidate-conditioned scoring forward.
+    active_sample["capture_enabled"] = True
+    # grad_prefix: torch.Tensor, gradient-enabled [1, sequence, hidden] full prompt and chosen prefix embeddings.
+    grad_prefix = prefix_embeds.detach().requires_grad_(True)
+    try:
+        with torch.enable_grad():
+            # outputs: ModelOutput, logits for the full candidate prefix.
+            outputs = model(
+                inputs_embeds=grad_prefix,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            # candidate_loss: torch.Tensor, scalar CE for the candidate at the final prefix position.
+            candidate_loss = F.cross_entropy(
+                outputs.logits[:, -1, :].float(),
+                candidate_token_id.to(device=outputs.logits.device, dtype=torch.long).reshape(1),
+            )
+            # layer_indices: list[int], decoder layers whose selected activations were captured.
+            layer_indices = sorted(active_sample["layer_activations"])
+            if not layer_indices:
+                raise RuntimeError("Candidate gradient hooks captured no decoder activations")
+            # captured_activations: list[torch.Tensor], one live [1, sequence, hidden] tensor per decoder layer.
+            captured_activations = [active_sample["layer_activations"][index] for index in layer_indices]
+            # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] candidate CE gradient per layer.
+            gradients = torch.autograd.grad(candidate_loss, tuple(captured_activations))
+            # candidate_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens] squared-gradient sums.
+            candidate_scores = {}
+            for layer_index, gradient in zip(layer_indices, gradients):
+                # image_gradient: torch.Tensor, float [image_tokens, hidden], candidate's image-position gradient.
+                image_gradient = gradient[0, image_mask.to(gradient.device), :].float()
+                candidate_scores[layer_index] = image_gradient.square().sum(dim=-1).detach().cpu()
+            # candidate_loss_value: float, detached scalar CE for the selected candidate.
+            candidate_loss_value = float(candidate_loss.detach().cpu())
+    finally:
+        # active_sample state: clear graph-owning tensors and disable hooks after this candidate inspection.
+        active_sample["layer_activations"] = {}
+        active_sample["capture_enabled"] = False
+    return candidate_scores, candidate_loss_value
+
+
 # ============================================================================
 # PHASE 5. DISPLAY AND OPTIONALLY SAVE GRADIENT HEATMAPS
 # ============================================================================
@@ -312,6 +500,7 @@ def show_gradient_heatmaps(
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
+    title_suffix: str | None = None,
     display: bool = True,
     save_dir: Path | None = None,
 ) -> Path | None:
@@ -326,6 +515,7 @@ def show_gradient_heatmaps(
         scale: Color normalization, either logarithmic or linear.
         score_normalization: ``raw`` preserves score magnitudes; ``percent``
             makes each image-token score a percentage of that layer's total.
+        title_suffix: Optional context appended to the figure title.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
 
@@ -463,10 +653,11 @@ def show_gradient_heatmaps(
                 else "Sum of squared assistant-token CE gradients"
             ),
         )
-    figure.suptitle(
-        f"Sample {sample_number}: selected decoder-activation gradient importance",
-        fontsize=14,
-    )
+    # figure_title: str, context for the sample's decoder-activation gradient maps.
+    figure_title = f"Sample {sample_number}: selected decoder-activation gradient importance"
+    if title_suffix:
+        figure_title += f" ({title_suffix})"
+    figure.suptitle(figure_title, fontsize=14)
 
     output_path = None
     if save_dir is not None:
@@ -511,15 +702,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--answer-mode",
-        choices=("example", "generate"),
+        choices=("example", "generate", "interactive"),
         default="example",
-        help="Score the dataset's assistant answer (default) or a greedily generated reply.",
+        help="Score the dataset answer, greedily generate a reply, or choose generated tokens interactively.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=128,
-        help="Maximum generated assistant tokens when --answer-mode generate is selected.",
+        help="Maximum generated assistant tokens for generate and interactive modes.",
     )
     parser.add_argument(
         "--save-dir",
@@ -691,7 +882,7 @@ def main() -> int:
                 image = sample["image"]
                 if hasattr(image, "convert"):
                     image = image.convert("RGB")
-                if args.answer_mode == "generate":
+                if args.answer_mode in {"generate", "interactive"}:
                     # user_turn_indices: list[int], positions of user turns available as generation context.
                     user_turn_indices = [
                         index
@@ -713,6 +904,12 @@ def main() -> int:
                             image,
                             prompt_row,
                             args.max_new_tokens,
+                            interactive=args.answer_mode == "interactive",
+                            active_sample=active_sample,
+                            sample_number=sample_index,
+                            heatmap_only=args.heatmap_only,
+                            scale=args.scale,
+                            score_normalization=args.score_normalization,
                         )
                     finally:
                         # active_sample["capture_enabled"]: bool, re-enable hooks for the answer-scoring forward.
