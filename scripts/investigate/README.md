@@ -149,8 +149,8 @@ model paths, or output locations.
   to image and non-image text keys, then saves per-layer percentages as a
   stacked graph and CSV.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
-  at a time, backpropagates each token loss to every decoder block input, sums
-  squared gradients over hidden dimensions and answer tokens for each image
+  at a time, backpropagates each token loss to a selected activation at every
+  decoder layer, sums squared gradients over hidden dimensions and answer tokens for each image
   token, and displays per-layer image-token heatmaps for each sample, overlaid
   on the source image by default. Use `--heatmap-only` to show the source image
   in a separate reference panel beside the plain patch-grid heatmaps. The
@@ -183,6 +183,15 @@ python scripts/investigate/investigate_grad_important.py \
   --samples 2 \
   --heatmap-only \
   --scale linear
+```
+
+Differentiate with respect to each layer's post-normalization activation instead
+of its pre-normalization block input:
+
+```bash
+python scripts/investigate/investigate_grad_important.py \
+  --samples 2 \
+  --capture-point after_layer_norm
 ```
 
 Save the same per-sample figures without opening windows:

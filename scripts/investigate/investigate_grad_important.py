@@ -31,29 +31,35 @@ from investigation_logging import configure_logging, log  # noqa: E402
 # ============================================================================
 # PHASE 3. REGISTER HOOKS
 # ============================================================================
-def register_decoder_input_hooks(
+def register_decoder_activation_hooks(
     model: torch.nn.Module,
     active_sample: dict[str, Any],
+    capture_point: str,
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture each decoder block's input activation without changing its input.
+    """Capture selected decoder activations without changing model computation.
 
     Args:
         model: Loaded LLaVA causal language model with decoder blocks at
             ``model.model.layers``.
-        active_sample: Mutable state whose ``layer_inputs`` key maps each
-            decoder-layer index to that block's live input tensor
-            [batch, sequence, hidden]. The mapping is cleared before each
-            sample; the tensors remain attached to the current forward graph.
+        active_sample: Mutable state whose ``layer_activations`` key maps each
+            decoder-layer index to a live tensor [batch, sequence, hidden].
+            The mapping is cleared before each sample; captured tensors remain
+            attached to the current forward graph.
+        capture_point: ``block_input`` for pre-normalization block inputs or
+            ``after_layer_norm`` for the output of each block's input norm.
 
     Returns:
-        Forward-pre-hook handles. The caller must remove every handle in a
-        ``finally`` block.
+        Hook handles. The caller must remove every handle in a ``finally`` block.
 
     Hook contract:
-        Read the first positional input to each decoder block, validate its
-        [batch, sequence, hidden] shape, and store it by layer index. Return
-        ``None`` so the original block input is left unchanged.
+        For ``block_input``, read the first positional input to each decoder
+        block with a forward-pre-hook. For ``after_layer_norm``, read the
+        output of that block's ``input_layernorm`` with a forward hook. Store
+        the [batch, sequence, hidden] tensor by layer index; neither hook
+        changes model values.
     """
+    if capture_point not in {"block_input", "after_layer_norm"}:
+        raise ValueError(f"Unsupported activation capture point: {capture_point}")
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         raise RuntimeError("Could not find decoder blocks at model.model.layers")
@@ -61,31 +67,48 @@ def register_decoder_input_hooks(
     # handles: list[torch.utils.hooks.RemovableHandle], hooks removed after all forwards.
     handles: list[torch.utils.hooks.RemovableHandle] = []
     for layer_index, layer in enumerate(layers):
-        def capture_block_input(
-            _module: Any,
-            inputs: tuple[Any, ...],
-            *,
-            index: int = layer_index,
-        ) -> None:
-            if not inputs or not torch.is_tensor(inputs[0]):
-                raise RuntimeError(f"Decoder layer {index} received no tensor hidden-state input")
-            # hidden_input: torch.Tensor, [batch, sequence, hidden], activation entering this decoder block.
-            hidden_input = inputs[0]
-            if hidden_input.ndim != 3:
+        def store_activation(activation: Any, *, index: int) -> None:
+            if not torch.is_tensor(activation) or activation.ndim != 3:
+                shape = tuple(activation.shape) if torch.is_tensor(activation) else type(activation).__name__
                 raise RuntimeError(
-                    f"Decoder layer {index} input must be [batch, sequence, hidden], "
-                    f"got {tuple(hidden_input.shape)}"
+                    f"Decoder layer {index} captured an invalid activation; expected "
+                    f"[batch, sequence, hidden], got {shape}"
                 )
-            if not hidden_input.requires_grad:
+            if not activation.requires_grad:
                 raise RuntimeError(
-                    f"Decoder layer {index} input does not require gradients; "
+                    f"Decoder layer {index} activation does not require gradients; "
                     "ensure the model forward runs with gradients enabled"
                 )
-            # active_sample["layer_inputs"][index]: torch.Tensor, live [batch, sequence, hidden] activation.
-            active_sample["layer_inputs"][index] = hidden_input
-            # Forward-pre-hook contract: None preserves the original positional inputs.
+            # active_sample["layer_activations"][index]: torch.Tensor, live [batch, sequence, hidden] selected activation.
+            active_sample["layer_activations"][index] = activation
 
-        handles.append(layer.register_forward_pre_hook(capture_block_input))
+        if capture_point == "block_input":
+            def capture_block_input(
+                _module: Any,
+                inputs: tuple[Any, ...],
+                *,
+                index: int = layer_index,
+            ) -> None:
+                if not inputs:
+                    raise RuntimeError(f"Decoder layer {index} received no hidden-state input")
+                store_activation(inputs[0], index=index)
+
+            handles.append(layer.register_forward_pre_hook(capture_block_input))
+        else:
+            layer_norm = getattr(layer, "input_layernorm", None)
+            if layer_norm is None:
+                raise RuntimeError(f"Decoder layer {layer_index} has no input_layernorm module")
+
+            def capture_after_layer_norm(
+                _module: Any,
+                _inputs: tuple[Any, ...],
+                output: Any,
+                *,
+                index: int = layer_index,
+            ) -> None:
+                store_activation(output, index=index)
+
+            handles.append(layer_norm.register_forward_hook(capture_after_layer_norm))
 
     if not handles:
         raise RuntimeError("No decoder blocks were found in the loaded model")
@@ -99,28 +122,28 @@ def score_assistant_token_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
     image_mask: torch.Tensor,
-    layer_inputs: dict[int, torch.Tensor],
+    layer_activations: dict[int, torch.Tensor],
 ) -> tuple[dict[int, torch.Tensor], list[float]]:
-    """Sum squared decoder-input gradients separately for every answer-token CE.
+    """Sum squared selected-activation gradients for each answer-token CE.
 
     Args:
         logits: Model output logits [1, sequence, vocabulary] for one sample.
         labels: CPU integer token labels [sequence]; ``-100`` marks positions
             that are not assistant answer targets.
         image_mask: CPU boolean [sequence] mask selecting image tokens.
-        layer_inputs: Layer index -> live decoder-block input tensor
+        layer_activations: Layer index -> live selected activation tensor
             [1, sequence, hidden] captured by phase 3.
 
     Returns:
         ``scores`` maps layer index to a CPU float32 [image_tokens] vector. Each
         image-token score is the sum, over assistant answer tokens and hidden
         features, of squared gradients of that token's CE with respect to the
-        corresponding decoder-block input. ``token_losses`` contains each
+        corresponding selected decoder activation. ``token_losses`` contains each
         scalar CE in answer-token order for logging.
 
     Assumptions:
         The forward batch has one sample, logits and labels have matching
-        sequence length, and every captured block input participates in the
+        sequence length, and every captured decoder activation participates in the
         loss graph. This performs one backward calculation per assistant token.
     """
     if logits.ndim != 3 or logits.shape[0] != 1:
@@ -129,20 +152,20 @@ def score_assistant_token_losses(
         raise ValueError("Labels must be [sequence] and align with the model logits")
     if image_mask.ndim != 1 or image_mask.numel() != logits.shape[1]:
         raise ValueError("Image mask must be [sequence] and align with the model logits")
-    if not layer_inputs:
-        raise RuntimeError("Decoder input hooks captured no layer activations")
+    if not layer_activations:
+        raise RuntimeError("Activation hooks captured no layer activations")
 
     # answer_positions: torch.Tensor, CPU long [answer_tokens], shifted label indices to score.
     answer_positions = labels[1:].ne(-100).nonzero(as_tuple=True)[0] + 1
     if answer_positions.numel() == 0:
         raise ValueError("Sample has no assistant answer tokens with valid CE targets")
 
-    layer_indices = sorted(layer_inputs)
-    captured_inputs = [layer_inputs[index] for index in layer_indices]
-    for layer_index, activation in zip(layer_indices, captured_inputs):
+    layer_indices = sorted(layer_activations)
+    captured_activations = [layer_activations[index] for index in layer_indices]
+    for layer_index, activation in zip(layer_indices, captured_activations):
         if activation.shape[0] != 1 or activation.shape[1] != logits.shape[1]:
             raise RuntimeError(
-                f"Layer {layer_index} input shape {tuple(activation.shape)} does not align "
+                f"Layer {layer_index} activation shape {tuple(activation.shape)} does not align "
                 "with the one-sample logits"
             )
 
@@ -166,10 +189,10 @@ def score_assistant_token_losses(
         token_loss = F.cross_entropy(token_logits, target)
         token_losses.append(float(token_loss.detach().cpu()))
 
-        # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] gradient per decoder block input.
+        # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] gradient per selected layer activation.
         gradients = torch.autograd.grad(
             token_loss,
-            tuple(captured_inputs),
+            tuple(captured_activations),
             retain_graph=token_number + 1 < answer_token_count,
             allow_unused=False,
         )
@@ -320,7 +343,7 @@ def show_gradient_heatmaps(
             label="Sum of squared assistant-token CE gradients",
         )
     figure.suptitle(
-        f"Sample {sample_number}: decoder-block-input gradient importance",
+        f"Sample {sample_number}: selected decoder-activation gradient importance",
         fontsize=14,
     )
 
@@ -344,7 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Display image-token importance maps from separate assistant answer-token "
-            "cross-entropy gradients at every decoder block input."
+            "cross-entropy gradients at selected decoder activations."
         )
     )
     parser.add_argument(
@@ -359,6 +382,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured sample seed.")
+    parser.add_argument(
+        "--capture-point",
+        choices=("block_input", "after_layer_norm"),
+        default="block_input",
+        help="Activation to differentiate: pre-norm block input (default) or input-layer-norm output.",
+    )
     parser.add_argument(
         "--save-dir",
         type=Path,
@@ -487,14 +516,14 @@ def main() -> int:
         # 3. REGISTER HOOKS
         # =====================================================================
         # Inputs from phases 1–2:
-        # model: torch.nn.Module, frozen LLaVA model whose block inputs are differentiated.
+        # model: torch.nn.Module, frozen LLaVA model whose selected decoder activations are differentiated.
         # dataset: datasets.Dataset, selected examples processed one at a time.
         hooks_started = time.perf_counter() if args.timing else None
         # active_sample: dict[str, Any], live decoder input tensors for one current forward.
-        # active_sample["layer_inputs"]: dict[int, torch.Tensor], layer -> live [batch, sequence, hidden] tensor.
-        active_sample: dict[str, Any] = {"layer_inputs": {}}
-        hook_handles = register_decoder_input_hooks(model, active_sample)
-        log(f"Registered decoder-input hooks on {len(hook_handles)} layers")
+        # active_sample["layer_activations"]: dict[int, torch.Tensor], layer -> live [batch, sequence, hidden] selected activation.
+        active_sample: dict[str, Any] = {"layer_activations": {}}
+        hook_handles = register_decoder_activation_hooks(model, active_sample, args.capture_point)
+        log(f"Registered {args.capture_point} hooks on {len(hook_handles)} layers")
         if hooks_started is not None:
             log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
 
@@ -503,12 +532,12 @@ def main() -> int:
         # =====================================================================
         # Inputs from phase 3:
         # hook_handles: list[torch.utils.hooks.RemovableHandle], removed in finally after all samples.
-        # active_sample["layer_inputs"]: dict[int, torch.Tensor], reset for each forward and kept live for token gradients.
+        # active_sample["layer_activations"]: dict[int, torch.Tensor], reset per forward and retained for token gradients.
         try:
             for sample_index, sample in enumerate(dataset, start=1):
                 sample_started = time.perf_counter() if args.timing else None
-                # active_sample["layer_inputs"]: dict[int, torch.Tensor], reset before this sample's forward.
-                active_sample["layer_inputs"] = {}
+                # active_sample["layer_activations"]: dict[int, torch.Tensor], reset before this sample's forward.
+                active_sample["layer_activations"] = {}
                 # row: dict[str, Any], QIG adapter input with conversation, stable id, and local-image sentinel.
                 row = {
                     "conversations": sample["conversations"],
@@ -560,23 +589,24 @@ def main() -> int:
                         use_cache=False,
                         return_dict=True,
                     )
-                    if not active_sample["layer_inputs"]:
-                        raise RuntimeError("Decoder-input hooks captured no block activations")
+                    if not active_sample["layer_activations"]:
+                        raise RuntimeError("Activation hooks captured no decoder activations")
                     expected_layers = len(model.model.layers)
                     missing_layers = sorted(
-                        set(range(expected_layers)) - set(active_sample["layer_inputs"])
+                        set(range(expected_layers)) - set(active_sample["layer_activations"])
                     )
                     if missing_layers:
-                        raise RuntimeError(f"Decoder-input hooks missed layers {missing_layers}")
+                        raise RuntimeError(f"Activation hooks missed layers {missing_layers}")
                     # logits: torch.Tensor, [1, sequence, vocabulary], causal-LM output used for per-token CE.
                     logits = outputs.logits
-                    forward_layer_inputs = active_sample["layer_inputs"]
+                    # forward_layer_activations: dict[int, torch.Tensor], layer -> live selected [1, sequence, hidden] activation.
+                    forward_layer_activations = active_sample["layer_activations"]
                     # layer_scores: dict[int, torch.Tensor], CPU float32 [image_tokens] sum of per-answer-token grad squares.
                     layer_scores, token_losses = score_assistant_token_losses(
                         logits,
                         labels,
                         image_mask,
-                        forward_layer_inputs,
+                        forward_layer_activations,
                     )
                 if forward_started is not None:
                     log(f"[timing] Sample {sample_index} forward and token gradients: {time.perf_counter() - forward_started:.2f} s")
@@ -586,8 +616,8 @@ def main() -> int:
                 )
 
                 # Clear references to the completed graph before drawing or forwarding the next sample.
-                active_sample["layer_inputs"] = {}
-                del outputs, logits, forward_layer_inputs, inputs_embeds
+                active_sample["layer_activations"] = {}
+                del outputs, logits, forward_layer_activations, inputs_embeds
                 plot_started = time.perf_counter() if args.timing else None
                 output_path = show_gradient_heatmaps(
                     image,
