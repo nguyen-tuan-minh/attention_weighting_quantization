@@ -171,8 +171,11 @@ model paths, or output locations.
   First choose an assistant position from the all-token list. At that
   position's top-candidate list, enter `n` to plot candidate rank n's image
   scores (the default), `n i` for image explicitly, `n t` for all prior
-  text-token scores, or `n t c` for only the latest c prior text tokens. The
-  chosen candidate is plotted in a separate image or text figure. After
+  text-token scores, or `n t c` for only the latest c prior text tokens. Enter
+  `n + c` to print the next c greedy tokens after candidate n is selected,
+  alongside the original token and its original continuation; this branch view
+  prints text only and does not plot gradients. The chosen candidate is plotted
+  in a separate image or text figure for the other commands. After
   inspecting a candidate, the interface stays at that assistant position;
   enter another candidate command, `b` to return to the token list, `i` to open
   the input image in a large window, or `q` to finish. These gradient maps are

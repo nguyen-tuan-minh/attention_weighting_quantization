@@ -484,6 +484,64 @@ def score_candidate_token_gradients(
     return candidate_image_scores, candidate_text_scores, candidate_loss_value
 
 
+def generate_candidate_continuation(
+    model: torch.nn.Module,
+    embedding_layer: torch.nn.Module,
+    prefix_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_ids: set[int],
+) -> list[int]:
+    """Greedily generate a candidate-conditioned continuation without gradients.
+
+    Args:
+        model: Loaded causal language model.
+        embedding_layer: Model token embedding table used to extend the prefix.
+        prefix_embeds: Prompt, accepted answer prefix, and selected candidate
+            embeddings [1, sequence, hidden].
+        attention_mask: Device-local bool mask [1, sequence] for that prefix.
+        max_new_tokens: Maximum number of continuation tokens to emit.
+        eos_token_ids: End-of-sequence ids that stop the branch after emission.
+
+    Returns:
+        Greedy continuation token ids, including EOS when emitted.
+
+    Side effects:
+        Runs no-gradient model forwards, leaving model parameters and hook state
+        unchanged.
+    """
+    # branch_embeds: torch.Tensor, device-local [1, prefix_tokens, hidden], current counterfactual prefix.
+    branch_embeds = prefix_embeds
+    # branch_attention_mask: torch.Tensor, bool [1, prefix_tokens], valid positions in the branch prefix.
+    branch_attention_mask = attention_mask
+    # branch_token_ids: list[int], greedily emitted continuation ids, EOS included if generated.
+    branch_token_ids: list[int] = []
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            # branch_outputs: ModelOutput, logits for the current branch prefix.
+            branch_outputs = model(
+                inputs_embeds=branch_embeds,
+                attention_mask=branch_attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            # next_token_id: torch.Tensor, device-local long [1, 1], greedy continuation token.
+            next_token_id = branch_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            # next_token_value: int, emitted token id used for EOS comparison and decoding.
+            next_token_value = int(next_token_id[0, 0])
+            branch_token_ids.append(next_token_value)
+            if next_token_value in eos_token_ids:
+                break
+            # next_token_embed: torch.Tensor, device-local [1, 1, hidden], continuation input for the next step.
+            next_token_embed = embedding_layer(next_token_id)
+            branch_embeds = torch.cat((branch_embeds, next_token_embed), dim=1)
+            # branch_attention_mask: torch.Tensor, bool [1, prefix_tokens + 1], marks the appended token valid.
+            branch_attention_mask = torch.cat(
+                (branch_attention_mask, torch.ones_like(branch_attention_mask[:, :1])), dim=1
+            )
+    return branch_token_ids
+
+
 def inspect_generated_token_positions(
     input_adapter: Any,
     active_sample: dict[str, Any],
@@ -556,7 +614,7 @@ def inspect_generated_token_positions(
         while True:
             try:
                 command = input(
-                    f"Candidate: n [i|t [c]] (n=1-{len(position_options)}), "
+                    f"Candidate: n [i|t [c]] or n + c (n=1-{len(position_options)}), "
                     "b to list positions, q to finish: "
                 ).strip().lower().split()
             except EOFError:
@@ -566,12 +624,100 @@ def inspect_generated_token_positions(
             if command == ["b"]:
                 break
             if not command or not command[0].isdigit() or len(command) > 3:
-                print("Use n, n i, n t, n t c, b, or q.")
+                print("Use n, n i, n t, n t c, n + c, b, or q.")
                 continue
             # candidate_rank: int, one-based rank in the top candidate list for the selected assistant position.
             candidate_rank = int(command[0])
             if not 1 <= candidate_rank <= len(position_options):
                 print(f"Choose a candidate rank from 1 to {len(position_options)}.")
+                continue
+            if len(command) >= 2 and command[1] == "+":
+                if len(command) != 3 or not command[2].isdigit() or int(command[2]) < 1:
+                    print("Use `n + c` with a positive continuation length c.")
+                    continue
+                # continuation_limit: int, number of next assistant tokens to generate in both branches.
+                continuation_limit = int(command[2])
+                # prefix_token_ids: torch.Tensor, device-local long [1, preceding_generated_tokens].
+                prefix_token_ids = generated_ids[:, : position - 1]
+                # branch_prefix_embeds: torch.Tensor, [1, prompt_plus_prior_tokens, hidden] before candidate selection.
+                branch_prefix_embeds = prompt_embeds
+                if prefix_token_ids.shape[1] > 0:
+                    # branch_prior_embeds: torch.Tensor, device-local [1, preceding_generated_tokens, hidden].
+                    branch_prior_embeds = input_adapter.model.get_input_embeddings()(prefix_token_ids)
+                    branch_prefix_embeds = torch.cat((prompt_embeds, branch_prior_embeds), dim=1)
+                # branch_attention_mask: torch.Tensor, bool [1, prompt_plus_prior_tokens], attention mask before candidate.
+                branch_attention_mask = torch.cat(
+                    (
+                        prompt_attention_mask,
+                        torch.ones(
+                            (1, prefix_token_ids.shape[1]),
+                            dtype=prompt_attention_mask.dtype,
+                            device=prompt_attention_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                # selected_candidate_id: torch.Tensor, device-local long [1, 1], chosen counterfactual token id.
+                selected_candidate_id = torch.tensor(
+                    [[position_options[candidate_rank - 1][0]]],
+                    device=prompt_embeds.device,
+                    dtype=torch.long,
+                )
+                # original_token_id: torch.Tensor, device-local long [1, 1], model-generated token at this position.
+                original_token_id = generated_ids[:, position - 1 : position]
+                # selected_prefix_embeds: torch.Tensor, [1, prefix_tokens + 1, hidden], prefix extended with candidate.
+                selected_prefix_embeds = torch.cat(
+                    (branch_prefix_embeds, input_adapter.model.get_input_embeddings()(selected_candidate_id)),
+                    dim=1,
+                )
+                # selected_attention_mask: torch.Tensor, bool [1, prefix_tokens + 1], valid counterfactual context.
+                selected_attention_mask = torch.cat(
+                    (branch_attention_mask, torch.ones_like(branch_attention_mask[:, :1])), dim=1
+                )
+                # model_eos_ids: set[int], EOS markers for dynamic branch termination.
+                model_eos_id = getattr(input_adapter.model.config, "eos_token_id", None)
+                if model_eos_id is None:
+                    model_eos_id = input_adapter.tokenizer.eos_token_id
+                model_eos_ids = set(model_eos_id) if isinstance(model_eos_id, (tuple, list)) else (
+                    {model_eos_id} if model_eos_id is not None else set()
+                )
+                # selected_suffix_ids: list[int], greedy counterfactual tokens following the selected candidate.
+                selected_suffix_ids = generate_candidate_continuation(
+                    input_adapter.model,
+                    input_adapter.model.get_input_embeddings(),
+                    selected_prefix_embeds,
+                    selected_attention_mask,
+                    continuation_limit,
+                    model_eos_ids,
+                )
+                # original_continuation: list[int], up to c already-generated tokens after the original token.
+                original_continuation = generated_ids[0, position : position + continuation_limit].tolist()
+                if model_eos_ids:
+                    for suffix_index, suffix_token_id in enumerate(original_continuation):
+                        if int(suffix_token_id) in model_eos_ids:
+                            original_continuation = original_continuation[: suffix_index + 1]
+                            break
+                # selected_candidate_text: str, chosen alternative token piece with special-token spelling retained.
+                selected_candidate_text = input_adapter.tokenizer.decode(
+                    [int(selected_candidate_id[0, 0])], skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                # original_token_text: str, model-generated token piece at the inspected position.
+                original_token_text = input_adapter.tokenizer.decode(
+                    [int(original_token_id[0, 0])], skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                # selected_suffix_text/original_suffix_text: str, printable continuations with special tokens removed.
+                selected_suffix_text = input_adapter.tokenizer.decode(
+                    selected_suffix_ids, skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                original_suffix_text = input_adapter.tokenizer.decode(
+                    original_continuation, skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                print(f"Original [{original_token_text!r}] then next tokens: {original_suffix_text!r}")
+                print(f"Candidate [{selected_candidate_text!r}] then next tokens: {selected_suffix_text!r}")
                 continue
             # modality: str, image by default or explicitly selected text-token scores.
             modality = command[1] if len(command) >= 2 else "i"
