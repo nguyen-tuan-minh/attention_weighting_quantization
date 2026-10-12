@@ -165,12 +165,20 @@ def generate_assistant_reply(
     # prompt_inputs: dict[str, torch.Tensor], multimodal prompt embeddings [1, sequence, hidden].
     # prompt_kwargs: dict[str, torch.Tensor], expanded attention mask and all-ignored prompt labels.
     prompt_inputs, prompt_kwargs = input_adapter.generate_input(prompt_batch)
+    # prompt_image_mask: torch.Tensor, CPU bool [prompt_sequence], image positions in the multimodal prompt.
+    prompt_image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+    # prompt_attention_mask_cpu: torch.Tensor, CPU bool [prompt_sequence], valid positions for text-label alignment.
+    prompt_attention_mask_cpu = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+    # prompt_text_mask: torch.Tensor, CPU bool [prompt_sequence], valid textual positions in the expanded prompt.
+    prompt_text_mask = prompt_attention_mask_cpu & ~prompt_image_mask
+    # prompt_text_labels: list[str], decoded one-token labels aligned with the prompt's text-mask positions.
+    prompt_text_labels = decode_non_image_token_labels(input_adapter, prompt_batch)
+    if len(prompt_text_labels) != int(prompt_text_mask.sum()):
+        raise RuntimeError("Prompt text token ids do not align with the expanded text-token mask")
     # current_embeds: torch.Tensor, prompt [1, sequence, hidden] or one newest token [1, 1, hidden] with KV cache.
     current_embeds = prompt_inputs["inputs_embeds"]
     # current_attention_mask: torch.Tensor, device-local bool [1, cached_sequence + current_sequence].
     current_attention_mask = prompt_kwargs["attention_mask"]
-    # prompt_image_mask: torch.Tensor, CPU bool [prompt_sequence], image positions in the multimodal prompt.
-    prompt_image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
     # generated_token_ids: list[torch.Tensor], device-local long [1, 1] ids emitted so far.
     generated_token_ids: list[torch.Tensor] = []
     # candidate_options: list[list[tuple[int, float]]], top token ids/probabilities at each generated position.
@@ -256,6 +264,7 @@ def generate_assistant_reply(
             prompt_inputs["inputs_embeds"],
             prompt_kwargs["attention_mask"],
             prompt_kwargs["vision_mask"][0].bool().detach().cpu(),
+            prompt_text_labels,
             generated_ids,
             candidate_options,
             image,
@@ -268,12 +277,41 @@ def generate_assistant_reply(
     return assistant_text
 
 
+def decode_non_image_token_labels(input_adapter: Any, batch: dict[str, Any]) -> list[str]:
+    """Decode original non-image input ids for labels aligned with expanded text positions.
+
+    Args:
+        input_adapter: Loaded QIG adapter exposing its tokenizer.
+        batch: Single-sample collator output with input_ids and attention_mask.
+
+    Returns:
+        Decoded token pieces for each valid original text id, excluding negative
+        image sentinel ids. This order matches valid non-image positions after
+        the adapter expands the image sentinel into image embeddings.
+    """
+    # input_ids: torch.Tensor, CPU long [1, original_sequence], text ids plus negative image sentinels.
+    input_ids = batch["input_ids"][0].detach().cpu()
+    # input_attention: torch.Tensor, CPU bool [original_sequence], true for original non-padding entries.
+    input_attention = batch["attention_mask"][0].bool().detach().cpu()
+    # text_ids: list[int], original valid token ids excluding negative image marker ids.
+    text_ids = input_ids[input_attention & input_ids.ge(0)].tolist()
+    return [
+        input_adapter.tokenizer.decode(
+            [int(token_id)],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        for token_id in text_ids
+    ]
+
+
 def score_assistant_token_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
     image_mask: torch.Tensor,
+    text_mask: torch.Tensor,
     layer_activations: dict[int, torch.Tensor],
-) -> tuple[dict[int, torch.Tensor], list[float]]:
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], list[float]]:
     """Sum squared selected-activation gradients for each answer-token CE.
 
     Args:
@@ -281,15 +319,15 @@ def score_assistant_token_losses(
         labels: CPU integer token labels [sequence]; ``-100`` marks positions
             that are not assistant answer targets.
         image_mask: CPU boolean [sequence] mask selecting image tokens.
+        text_mask: CPU boolean [sequence] mask selecting valid non-image text tokens.
         layer_activations: Layer index -> live selected activation tensor
             [1, sequence, hidden] captured by phase 3.
 
     Returns:
-        ``scores`` maps layer index to a CPU float32 [image_tokens] vector. Each
-        image-token score is the sum, over assistant answer tokens and hidden
-        features, of squared gradients of that token's CE with respect to the
-        corresponding selected decoder activation. ``token_losses`` contains each
-        scalar CE in answer-token order for logging.
+        Image and text score dictionaries map each layer to CPU float32 vectors
+        over their respective positions. Each score sums squared gradients over
+        assistant answer tokens and hidden features. ``token_losses`` contains
+        each scalar CE in answer-token order for logging.
 
     Assumptions:
         The forward batch has one sample, logits and labels have matching
@@ -302,6 +340,8 @@ def score_assistant_token_losses(
         raise ValueError("Labels must be [sequence] and align with the model logits")
     if image_mask.ndim != 1 or image_mask.numel() != logits.shape[1]:
         raise ValueError("Image mask must be [sequence] and align with the model logits")
+    if text_mask.ndim != 1 or text_mask.numel() != logits.shape[1]:
+        raise ValueError("Text mask must be [sequence] and align with the model logits")
     if not layer_activations:
         raise RuntimeError("Activation hooks captured no layer activations")
 
@@ -319,10 +359,14 @@ def score_assistant_token_losses(
                 "with the one-sample logits"
             )
 
-    # scores: dict[int, torch.Tensor], layer -> CPU float32 zeros [image_tokens],
-    # accumulated independently over answer-token losses for this sample.
-    scores: dict[int, torch.Tensor] = {
+    # image_scores: dict[int, torch.Tensor], layer -> CPU float32 zeros [image_tokens], accumulated for this sample.
+    image_scores: dict[int, torch.Tensor] = {
         layer_index: torch.zeros(int(image_mask.sum()), dtype=torch.float32)
+        for layer_index in layer_indices
+    }
+    # text_scores: dict[int, torch.Tensor], layer -> CPU float32 zeros [text_tokens], accumulated for this sample.
+    text_scores: dict[int, torch.Tensor] = {
+        layer_index: torch.zeros(int(text_mask.sum()), dtype=torch.float32)
         for layer_index in layer_indices
     }
     # token_losses: list[float], detached scalar CE values in answer-token order.
@@ -349,10 +393,14 @@ def score_assistant_token_losses(
         for layer_index, gradient in zip(layer_indices, gradients):
             # image_gradient: torch.Tensor, float [image_tokens, hidden], this CE's image-token input gradients.
             image_gradient = gradient[0, image_mask.to(gradient.device), :].float()
-            # scores[layer_index]: torch.Tensor, CPU float32 [image_tokens], sum of squared gradients so far.
-            scores[layer_index] += image_gradient.square().sum(dim=-1).detach().cpu()
+            # image_scores[layer_index]: torch.Tensor, CPU float32 [image_tokens], sum of squared gradients so far.
+            image_scores[layer_index] += image_gradient.square().sum(dim=-1).detach().cpu()
+            # text_gradient: torch.Tensor, float [text_tokens, hidden], this CE's valid text-token input gradients.
+            text_gradient = gradient[0, text_mask.to(gradient.device), :].float()
+            # text_scores[layer_index]: torch.Tensor, CPU float32 [text_tokens], sum of squared gradients so far.
+            text_scores[layer_index] += text_gradient.square().sum(dim=-1).detach().cpu()
 
-    return scores, token_losses
+    return image_scores, text_scores, token_losses
 
 
 def score_candidate_token_gradients(
@@ -361,9 +409,10 @@ def score_candidate_token_gradients(
     prefix_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     image_mask: torch.Tensor,
+    text_mask: torch.Tensor,
     candidate_token_id: torch.Tensor,
-) -> tuple[dict[int, torch.Tensor], float]:
-    """Score one candidate token's CE gradient over image positions at every layer.
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], float]:
+    """Score one candidate token's CE gradient over image and text positions.
 
     Args:
         model: Loaded LLaVA causal language model.
@@ -372,11 +421,12 @@ def score_candidate_token_gradients(
         prefix_embeds: Full prompt and accepted-token embeddings [1, sequence, hidden].
         attention_mask: Device-local bool [1, sequence] valid prefix positions.
         image_mask: CPU bool [sequence] positions belonging to the input image.
+        text_mask: CPU bool [sequence] valid non-image positions in the full prefix.
         candidate_token_id: Device-local long [1, 1] candidate continuation token.
 
     Returns:
-        Layer -> CPU float32 [image_tokens] sums of squared candidate-loss
-        gradients over hidden dimensions, plus the candidate CE scalar.
+        Image and text score dictionaries map each layer to CPU float32 vectors
+        over their token positions, plus the candidate CE scalar.
 
     Side effects:
         Temporarily enables and populates the existing activation hooks; clears
@@ -384,6 +434,8 @@ def score_candidate_token_gradients(
     """
     if image_mask.numel() != prefix_embeds.shape[1]:
         raise ValueError("Image mask must align with the full candidate prefix")
+    if text_mask.numel() != prefix_embeds.shape[1]:
+        raise ValueError("Text mask must align with the full candidate prefix")
     # active_sample["layer_activations"]: dict[int, torch.Tensor], reset for this candidate's gradient forward.
     active_sample["layer_activations"] = {}
     # active_sample["capture_enabled"]: bool, enable hooks for the candidate-conditioned scoring forward.
@@ -412,19 +464,24 @@ def score_candidate_token_gradients(
             captured_activations = [active_sample["layer_activations"][index] for index in layer_indices]
             # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] candidate CE gradient per layer.
             gradients = torch.autograd.grad(candidate_loss, tuple(captured_activations))
-            # candidate_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens] squared-gradient sums.
-            candidate_scores = {}
+            # candidate_image_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens] squared-gradient sums.
+            candidate_image_scores = {}
+            # candidate_text_scores: dict[int, torch.Tensor], layer -> CPU float32 [text_tokens] squared-gradient sums.
+            candidate_text_scores = {}
             for layer_index, gradient in zip(layer_indices, gradients):
                 # image_gradient: torch.Tensor, float [image_tokens, hidden], candidate's image-position gradient.
                 image_gradient = gradient[0, image_mask.to(gradient.device), :].float()
-                candidate_scores[layer_index] = image_gradient.square().sum(dim=-1).detach().cpu()
+                candidate_image_scores[layer_index] = image_gradient.square().sum(dim=-1).detach().cpu()
+                # text_gradient: torch.Tensor, float [text_tokens, hidden], candidate's valid-text-position gradient.
+                text_gradient = gradient[0, text_mask.to(gradient.device), :].float()
+                candidate_text_scores[layer_index] = text_gradient.square().sum(dim=-1).detach().cpu()
             # candidate_loss_value: float, detached scalar CE for the selected candidate.
             candidate_loss_value = float(candidate_loss.detach().cpu())
     finally:
         # active_sample state: clear graph-owning tensors and disable hooks after this candidate inspection.
         active_sample["layer_activations"] = {}
         active_sample["capture_enabled"] = False
-    return candidate_scores, candidate_loss_value
+    return candidate_image_scores, candidate_text_scores, candidate_loss_value
 
 
 def inspect_generated_token_positions(
@@ -433,6 +490,7 @@ def inspect_generated_token_positions(
     prompt_embeds: torch.Tensor,
     prompt_attention_mask: torch.Tensor,
     prompt_image_mask: torch.Tensor,
+    prompt_text_labels: list[str],
     generated_ids: torch.Tensor,
     candidate_options: list[list[tuple[int, float]]],
     image: Any,
@@ -447,7 +505,7 @@ def inspect_generated_token_positions(
     The model generates the full answer before this UI starts. Each stored
     distribution is conditioned on the prefix before its numbered token. The
     user may inspect several positions and optionally display one candidate's
-    image-token gradient map at each position.
+    image and text gradient views for each candidate at a position.
     """
     # token_ids: list[int], generated assistant tokens, including EOS when emitted.
     token_ids = generated_ids[0].tolist()
@@ -495,18 +553,18 @@ def inspect_generated_token_positions(
 
         while True:
             try:
-                gradient_choice = input(
-                    "Candidate rank for image-gradient inspection (1-10), "
-                    "Enter for another position, or q to finish: "
+            gradient_choice = input(
+                    "Candidate rank for image/text gradient inspection (1-10), "
+                    "b to return to all tokens, or q to finish: "
                 ).strip().lower()
             except EOFError:
                 return
             if gradient_choice == "q":
                 return
-            if gradient_choice == "":
+            if gradient_choice == "b":
                 break
             if not gradient_choice.isdigit() or not 1 <= int(gradient_choice) <= len(position_options):
-                print(f"Enter a candidate rank from 1 to {len(position_options)}, Enter, or q.")
+                print(f"Enter a candidate rank from 1 to {len(position_options)}, b, or q.")
                 continue
 
             # candidate_rank: int, one-based top-candidate index selected for gradient inspection.
@@ -535,18 +593,31 @@ def inspect_generated_token_positions(
             prefix_image_mask = torch.cat(
                 (prompt_image_mask, torch.zeros(prefix_token_ids.shape[1], dtype=torch.bool))
             )
+            # prefix_text_mask: torch.Tensor, CPU bool [prompt_plus_preceding_tokens], all valid non-image positions.
+            prefix_text_mask = prefix_attention_mask[0].detach().bool().cpu() & ~prefix_image_mask
+            # prefix_text_labels: list[str], text-token pieces aligned to prefix_text_mask positions.
+            prefix_text_labels = prompt_text_labels + [
+                input_adapter.tokenizer.decode(
+                    [int(token_id)], skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                for token_id in prefix_token_ids[0].detach().cpu().tolist()
+            ]
+            if len(prefix_text_labels) != int(prefix_text_mask.sum()):
+                raise RuntimeError("Generated prefix text labels do not align with non-image positions")
             # candidate_id: torch.Tensor, device-local long [1, 1], selected alternative token id.
             candidate_id = torch.tensor(
                 [[position_options[candidate_rank - 1][0]]],
                 device=prompt_embeds.device,
                 dtype=torch.long,
             )
-            candidate_scores, candidate_loss = score_candidate_token_gradients(
+            candidate_image_scores, candidate_text_scores, candidate_loss = score_candidate_token_gradients(
                 input_adapter.model,
                 active_sample,
                 prefix_embeds,
                 prefix_attention_mask,
                 prefix_image_mask,
+                prefix_text_mask,
                 candidate_id,
             )
             candidate_text = input_adapter.tokenizer.decode(
@@ -556,16 +627,22 @@ def inspect_generated_token_positions(
             )
             layer_totals = ", ".join(
                 f"L{layer_index}={float(scores.sum()):.3g}"
-                for layer_index, scores in sorted(candidate_scores.items())
+                for layer_index, scores in sorted(candidate_image_scores.items())
+            )
+            text_totals = ", ".join(
+                f"L{layer_index}={float(scores.sum()):.3g}"
+                for layer_index, scores in sorted(candidate_text_scores.items())
             )
             print(
                 f"Position [{position}] candidate {candidate_rank} {candidate_text!r}: "
-                f"CE={candidate_loss:.5g}; per-layer image-token sums: {layer_totals}"
+                f"CE={candidate_loss:.5g}; per-layer image sums: {layer_totals}; text sums: {text_totals}"
             )
             show_gradient_heatmaps(
                 image,
-                candidate_scores,
+                candidate_image_scores,
                 sample_number,
+                text_scores=candidate_text_scores,
+                text_labels=prefix_text_labels,
                 heatmap_only=heatmap_only,
                 scale=scale,
                 score_normalization=score_normalization,
@@ -573,7 +650,7 @@ def inspect_generated_token_positions(
                 display=True,
                 save_dir=None,
             )
-            break
+            # Stay in this position's candidate list after inspecting its gradient map.
 
 
 # ============================================================================
@@ -605,6 +682,8 @@ def show_gradient_heatmaps(
     layer_scores: dict[int, torch.Tensor],
     sample_number: int,
     *,
+    text_scores: dict[int, torch.Tensor] | None = None,
+    text_labels: list[str] | None = None,
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
@@ -612,11 +691,13 @@ def show_gradient_heatmaps(
     display: bool = True,
     save_dir: Path | None = None,
 ) -> Path | None:
-    """Display per-layer image-token heatmaps and optionally save the figure.
+    """Display image patch maps and aligned text-token score strips by layer.
 
     Args:
         source_image: Sample image used by the QIG/LLaVA adapter.
         layer_scores: Layer index -> CPU float32 [image_tokens] gradient scores.
+        text_scores: Optional layer -> CPU float32 [text_tokens] gradient scores.
+        text_labels: Optional decoded text-token pieces aligned with text_scores.
         sample_number: One-based index in the selected calibration subset.
         heatmap_only: Show the source image in a separate reference panel and
             patch-grid scores without image overlays when true.
@@ -636,132 +717,115 @@ def show_gradient_heatmaps(
     """
     if not layer_scores:
         raise ValueError("No per-layer gradient scores are available to plot")
+    if text_scores is not None and text_labels is not None:
+        if set(layer_scores) != set(text_scores):
+            raise ValueError("Image and text score dictionaries must contain the same layers")
+        if any(scores.numel() != len(text_labels) for scores in text_scores.values()):
+            raise ValueError("Text labels must align with every layer's text score vector")
 
-    # image_token_count: int, number of image positions represented in each layer score vector.
-    image_token_count = next(iter(layer_scores.values())).numel()
-    # grid_size: int, side length for reshaping square image-token grids.
+    def normalize_scores(scores_by_layer: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        if score_normalization == "raw":
+            return {layer: scores.float() for layer, scores in scores_by_layer.items()}
+        if score_normalization != "percent":
+            raise ValueError(f"Unknown score normalization: {score_normalization}")
+        normalized = {}
+        for layer, scores in scores_by_layer.items():
+            total = scores.float().sum()
+            normalized[layer] = scores.float() / total * 100.0 if total > 0 else torch.zeros_like(scores, dtype=torch.float32)
+        return normalized
+
+    def make_norm(scores_by_layer: dict[int, torch.Tensor]):
+        pooled = torch.cat([scores.reshape(-1) for scores in scores_by_layer.values()])
+        positives = pooled[pooled > 0]
+        if scale == "linear":
+            low, high = float(pooled.min()), float(pooled.max())
+            return Normalize(vmin=low, vmax=high if high > low else low + 1.0, clip=True)
+        if positives.numel() == 0:
+            return Normalize(vmin=0.0, vmax=1.0)
+        high = float(positives.max())
+        low = float(torch.quantile(positives, 0.01))
+        return LogNorm(vmin=low if low < high else high * 1e-6, vmax=high, clip=True)
+
+    # image_scores_display/text_scores_display: per-layer CPU float vectors; color scales are independent by modality.
+    image_scores_display = normalize_scores(layer_scores)
+    text_scores_display = normalize_scores(text_scores) if text_scores else None
+    image_token_count = next(iter(image_scores_display.values())).numel()
     grid_size = math.isqrt(image_token_count)
     if grid_size * grid_size != image_token_count:
-        raise ValueError(
-            f"Cannot reshape {image_token_count} image-token scores into a square patch grid"
-        )
-    if any(scores.numel() != image_token_count for scores in layer_scores.values()):
+        raise ValueError(f"Cannot reshape {image_token_count} image-token scores into a square patch grid")
+    if any(scores.numel() != image_token_count for scores in image_scores_display.values()):
         raise ValueError("All layers must have the same number of image-token scores")
 
-    # display_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens], raw or per-layer percentage values.
-    if score_normalization == "percent":
-        display_scores = {}
-        for layer_index, scores in layer_scores.items():
-            # layer_total: torch.Tensor, CPU float32 scalar, sum of this layer's image-token scores.
-            layer_total = scores.sum()
-            if layer_total > 0:
-                # display_scores[layer_index]: torch.Tensor, CPU float32 [image_tokens], each token's percent of layer total.
-                display_scores[layer_index] = scores.float() / layer_total * 100.0
-            else:
-                # All-zero scores have no defined share; represent every token as 0 percent.
-                display_scores[layer_index] = torch.zeros_like(scores, dtype=torch.float32)
-    elif score_normalization == "raw":
-        # display_scores: dict[int, torch.Tensor], raw CPU scores retained for each layer.
-        display_scores = layer_scores
-    else:
-        raise ValueError(f"Unknown score normalization: {score_normalization}")
-
-    # image: np.ndarray, float32 [square_side, square_side, 3] in [0, 1], square-padded RGB sample.
     source_image = source_image.convert("RGB")
     image_width, image_height = source_image.size
     square_side = max(image_width, image_height)
-    # background: tuple[int, int, int], CLIP mean RGB used to fill the square-padded canvas.
     background = tuple(round(value * 255) for value in (0.48145466, 0.4578275, 0.40821073))
     square_image = Image.new("RGB", (square_side, square_side), background)
-    square_image.paste(
-        source_image,
-        ((square_side - image_width) // 2, (square_side - image_height) // 2),
-    )
+    square_image.paste(source_image, ((square_side - image_width) // 2, (square_side - image_height) // 2))
     image = np.asarray(square_image).astype(np.float32) / 255.0
 
-    # pooled_scores: torch.Tensor, CPU float32 [layers * image_tokens], values for one shared color scale.
-    pooled_scores = torch.cat([scores.reshape(-1).float() for scores in display_scores.values()])
-    # positive_scores: torch.Tensor, CPU float32 [positive_values], strictly positive entries for LogNorm.
-    positive_scores = pooled_scores[pooled_scores > 0]
-    if scale == "linear":
-        # color_min/color_max: float, shared linear scale limits across all layers in this sample.
-        color_min = float(pooled_scores.min())
-        color_max = float(pooled_scores.max())
-        if color_min >= color_max:
-            color_max = color_min + 1.0
-        color_norm = Normalize(vmin=color_min, vmax=color_max, clip=True)
-    elif positive_scores.numel() > 0:
-        color_max = float(positive_scores.max())
-        color_min = float(torch.quantile(positive_scores, 0.01))
-        if color_min >= color_max:
-            color_min = color_max * 1e-6
-        color_norm = LogNorm(vmin=color_min, vmax=color_max, clip=True)
-    else:
-        # All scores are zero; linear normalization still produces a valid, legible figure.
-        color_norm = Normalize(vmin=0.0, vmax=1.0)
-
-    layer_indices = sorted(display_scores)
-    # panel_count: int, layer heatmap panels plus an image-reference panel in heatmap-only mode.
-    panel_count = len(layer_indices) + int(heatmap_only)
+    layer_indices = sorted(image_scores_display)
+    image_panel_count = len(layer_indices) + int(heatmap_only)
     columns = 6
-    rows = math.ceil(panel_count / columns)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(columns * 3.5, rows * 3.2),
-        constrained_layout=True,
-        squeeze=False,
-    )
-    flat_axes = axes.ravel()
-    heatmap_view = None
-    # first_heatmap_axis: int, first panel index reserved for per-layer heatmaps.
-    first_heatmap_axis = 1 if heatmap_only else 0
+    image_rows = math.ceil(image_panel_count / columns)
+    text_rows = math.ceil(len(layer_indices) / columns) if text_scores_display else 0
+    figure = plt.figure(figsize=(columns * 3.5, image_rows * 3.2 + text_rows * 2.5), constrained_layout=True)
+    outer = figure.add_gridspec(image_rows + text_rows, columns)
+    image_norm = make_norm(image_scores_display)
+    text_norm = make_norm(text_scores_display) if text_scores_display else None
+    image_mappable = text_mappable = None
+    image_offset = int(heatmap_only)
     if heatmap_only:
-        flat_axes[0].imshow(image)
-        flat_axes[0].set_title("Reference image")
+        ref_axis = figure.add_subplot(outer[0, 0])
+        ref_axis.imshow(image)
+        ref_axis.set_title("Reference image")
+        ref_axis.axis("off")
 
-    for axis, layer_index in zip(flat_axes[first_heatmap_axis:], layer_indices):
-        # grid_scores: torch.Tensor, float32 [1, 1, grid_size, grid_size], this layer's image-token scores.
-        grid_scores = display_scores[layer_index].float().reshape(1, 1, grid_size, grid_size)
-        # heatmap: torch.Tensor, CPU float32 [grid_size, grid_size], image-token scores in patch-grid layout.
-        heatmap = grid_scores[0, 0]
+    image_axes = []
+    for layer_number, layer_index in enumerate(layer_indices):
+        slot = layer_number + image_offset
+        axis = figure.add_subplot(outer[slot // columns, slot % columns])
+        image_axes.append(axis)
+        grid_scores = image_scores_display[layer_index].reshape(1, 1, grid_size, grid_size)
         if not heatmap_only:
             axis.imshow(image)
-            # display_heatmap: np.ndarray, float32 [square_side, square_side], resized scores over source image.
-            display_heatmap = F.interpolate(
-                grid_scores,
-                size=(square_side, square_side),
-                mode="bilinear",
-                align_corners=False,
-            )[0, 0].numpy()
+            display_heatmap = F.interpolate(grid_scores, size=(square_side, square_side), mode="bilinear", align_corners=False)[0, 0].numpy()
         else:
-            # display_heatmap: np.ndarray, float32 [grid_size, grid_size], raw image-token score grid.
-            display_heatmap = heatmap.numpy()
-        heatmap_view = axis.imshow(
-            display_heatmap,
-            cmap="inferno",
-            norm=color_norm,
-            alpha=0.58 if not heatmap_only else 1.0,
-        )
+            display_heatmap = grid_scores[0, 0].numpy()
+        image_mappable = axis.imshow(display_heatmap, cmap="inferno", norm=image_norm, alpha=0.58 if not heatmap_only else 1.0)
         axis.set_title(f"Layer {layer_index}")
+        axis.axis("off")
+    image_slots = image_panel_count
+    for slot in range(image_slots, image_rows * columns):
+        axis = figure.add_subplot(outer[slot // columns, slot % columns])
+        axis.axis("off")
+    if image_mappable is not None:
+        figure.colorbar(image_mappable, ax=image_axes, fraction=0.015, pad=0.01,
+                        label=f"Image-token score ({'percent within image tokens' if score_normalization == 'percent' else 'raw'})")
 
-    for axis in flat_axes[panel_count:]:
-        axis.axis("off")
-    for axis in flat_axes[:panel_count]:
-        axis.axis("off")
-    if heatmap_view is not None:
-        figure.colorbar(
-            heatmap_view,
-            ax=flat_axes[:panel_count].tolist(),
-            fraction=0.015,
-            pad=0.01,
-            label=(
-                "Percent of this layer's image-token gradient score"
-                if score_normalization == "percent"
-                else "Sum of squared assistant-token CE gradients"
-            ),
-        )
-    # figure_title: str, context for the sample's decoder-activation gradient maps.
+    if text_scores_display:
+        for layer_number, layer_index in enumerate(layer_indices):
+            slot = layer_number
+            axis = figure.add_subplot(outer[image_rows + slot // columns, slot % columns])
+            values = text_scores_display[layer_index].numpy()
+            text_mappable = axis.imshow(values[None, :], aspect="auto", interpolation="nearest", cmap="viridis", norm=text_norm)
+            axis.set_title(f"Layer {layer_index}")
+            axis.set_yticks([])
+            if len(values):
+                tick_count = min(12, len(values))
+                ticks = np.unique(np.linspace(0, len(values) - 1, tick_count, dtype=int))
+                token_tick_labels = [text_labels[index] if text_labels else str(index) for index in ticks]
+                axis.set_xticks(ticks)
+                axis.set_xticklabels(
+                    [label.replace("\n", "\\n")[:10] for label in token_tick_labels],
+                    rotation=90,
+                    fontsize=6,
+                )
+        if text_mappable is not None:
+            text_axes = figure.axes[-len(layer_indices):]
+            figure.colorbar(text_mappable, ax=text_axes, fraction=0.015, pad=0.01,
+                            label=f"Text-token score ({'percent within text tokens' if score_normalization == 'percent' else 'raw'})")
+
     figure_title = f"Sample {sample_number}: selected decoder-activation gradient importance"
     if title_suffix:
         figure_title += f" ({title_suffix})"
@@ -1092,11 +1156,18 @@ def main() -> int:
                     logits = outputs.logits
                     # forward_layer_activations: dict[int, torch.Tensor], layer -> live selected [1, sequence, hidden] activation.
                     forward_layer_activations = active_sample["layer_activations"]
-                    # layer_scores: dict[int, torch.Tensor], CPU float32 [image_tokens] sum of per-answer-token grad squares.
-                    layer_scores, token_losses = score_assistant_token_losses(
+                    # text_mask: torch.Tensor, CPU bool [sequence], valid non-image tokens aligned to the expanded decoder input.
+                    text_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu() & ~image_mask
+                    # text_token_labels: list[str], decoded original text pieces aligned with text_mask positions.
+                    text_token_labels = decode_non_image_token_labels(input_adapter, batch)
+                    if len(text_token_labels) != int(text_mask.sum()):
+                        raise RuntimeError("Input text labels do not align with non-image decoder positions")
+                    # layer_scores/text_layer_scores: per-layer CPU float32 image/text position sums of squared gradients.
+                    layer_scores, text_layer_scores, token_losses = score_assistant_token_losses(
                         logits,
                         labels,
                         image_mask,
+                        text_mask,
                         forward_layer_activations,
                     )
                 if forward_started is not None:
@@ -1114,6 +1185,8 @@ def main() -> int:
                     image,
                     layer_scores,
                     sample_index,
+                    text_scores=text_layer_scores,
+                    text_labels=text_token_labels,
                     heatmap_only=args.heatmap_only,
                     scale=args.scale,
                     score_normalization=args.score_normalization,
@@ -1126,7 +1199,7 @@ def main() -> int:
                     log(f"[timing] Sample {sample_index} plot: {time.perf_counter() - plot_started:.2f} s")
                 if sample_started is not None:
                     log(f"[timing] Sample {sample_index} total: {time.perf_counter() - sample_started:.2f} s")
-                del layer_scores, token_losses, prompt_inputs, prompt_kwargs, batch, prepared, image, sample
+                del layer_scores, text_layer_scores, text_mask, text_token_labels, token_losses, prompt_inputs, prompt_kwargs, batch, prepared, image, sample
         finally:
             for handle in hook_handles:
                 handle.remove()

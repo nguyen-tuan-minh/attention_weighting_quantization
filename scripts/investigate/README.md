@@ -151,13 +151,16 @@ model paths, or output locations.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
   at a time, backpropagates each token loss to a selected activation at every
   decoder layer, sums squared gradients over hidden dimensions and answer tokens for each image
-  token, and displays per-layer image-token heatmaps for each sample, overlaid
-  on the source image by default. Use `--heatmap-only` to show the source image
-  in a separate reference panel beside the plain patch-grid heatmaps. The
-  default color scale is logarithmic; use `--scale linear` for a normal linear
-  scale. Use `--score-normalization percent` to divide each token score by the
-  sum of image-token scores in its layer, so each layer's image-token values sum
-  to 100%. It displays by default and saves nothing unless `--save-dir` is
+  and valid non-image text token, and displays both by layer: image-patch maps
+  and a text-token score strip with decoded token labels. Each modality has its
+  own colorbar and scale, so the image and text colors show relative levels
+  within that modality and their raw colors must not be compared across the two.
+  Use `--heatmap-only` to show the source image in a separate reference panel
+  beside the plain patch-grid heatmaps. The default color scale is logarithmic;
+  use `--scale linear` for a normal linear scale. Use
+  `--score-normalization percent` to normalize image and text tokens separately
+  within each layer, so each modality's scores sum to 100% in that layer. It
+  displays by default and saves nothing unless `--save-dir` is
   supplied. By default it scores the dataset's assistant answer. Use
   `--answer-mode generate` to first greedily generate a reply from the user
   prompt, then score that generated reply; the sentence is printed in both
@@ -166,9 +169,11 @@ model paths, or output locations.
   criterion. Use `--answer-mode interactive` to generate the complete answer
   first, then inspect the top ten candidates at any numbered token position.
   After viewing a position's candidates, enter a candidate rank to print its
-  image-token gradient scores and display its heatmaps; press Enter to inspect
-  another position, type `i` to open the input image in a large window, or `q`
-  to finish. These gradient maps are diagnostic clues, not a standalone
+  image/text gradient scores and display both score views. After inspecting a
+  candidate, the interface stays at that position; enter another rank to
+  inspect another candidate, `b` to return to the all-token list, `i` to open
+  the input image in a large window, or `q` to finish. These gradient maps are
+  diagnostic clues, not a standalone
   hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
@@ -238,8 +243,10 @@ python scripts/investigate/investigate_grad_important.py \
 For each assistant answer token, this script computes that token's causal
 cross-entropy from the preceding-position logits and obtains gradients with
 respect to the [batch, sequence, hidden] input of each decoder block. The
-per-layer score for an image token is the sum of squared gradient values over
-hidden dimensions and all assistant answer tokens. Since each answer token
+per-layer score for an image or valid non-image text token is the sum of squared
+gradient values over hidden dimensions and all assistant answer tokens. The
+figure gives image and text their own color scales because their score magnitudes
+can differ; percent mode normalizes each type within its own layer. Since each answer token
 requires a separate gradient calculation, this analysis can be slow for long
 answers and retains the forward graph until all answer-token gradients are
 computed.
