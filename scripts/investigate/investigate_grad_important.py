@@ -523,38 +523,24 @@ def inspect_generated_token_positions(
 
     while True:
         try:
-            command = input(
-                f"Inspect token: n [i|t [c]] (1-{len(token_ids)}), b to list tokens, i for large image, q to finish: "
-            ).strip().lower().split()
+            position_text = input(
+                f"Token position 1-{len(token_ids)}, i for large image, or q to finish: "
+            ).strip().lower()
         except EOFError:
             return
-        if command == ["i"]:
+        if position_text == "i":
             show_large_source_image(image, sample_number)
             continue
-        if command == ["q"]:
+        if position_text == "q":
             return
-        if command == ["b"]:
-            continue
-        if not command or not command[0].isdigit():
-            print("Use n, n i, n t, n t c, b, i, or q.")
+        if not position_text.isdigit():
+            print(f"Enter a position from 1 to {len(token_ids)}, i, or q.")
             continue
         # position: int, one-based generated assistant token position selected for inspection.
-        position = int(command[0])
-        if not 1 <= position <= len(token_ids) or len(command) > 3:
-            print(f"Choose token 1-{len(token_ids)} using n, n i, n t, or n t c.")
+        position = int(position_text)
+        if not 1 <= position <= len(token_ids):
+            print(f"Choose a token position from 1 to {len(token_ids)}.")
             continue
-        # modality: str, image by default or explicitly selected text-token scores.
-        modality = command[1] if len(command) >= 2 else "i"
-        if modality not in {"i", "t"} or (modality == "i" and len(command) > 2):
-            print("Use n, n i, n t, or n t c; the optional count is only valid for text.")
-            continue
-        # text_limit: int | None, number of most recent previous text tokens to display; None means all.
-        text_limit = None
-        if len(command) == 3:
-            if modality != "t" or not command[2].isdigit() or int(command[2]) < 1:
-                print("The text-token count c must be a positive integer in `n t c`.")
-                continue
-            text_limit = int(command[2])
         # position_options: list[tuple[int, float]], ranked candidate ids and probabilities for this position.
         position_options = candidate_options[position - 1]
         print(f"Top candidates at position [{position}]:")
@@ -569,22 +555,36 @@ def inspect_generated_token_positions(
 
         while True:
             try:
-                gradient_choice = input(
-                    f"Candidate rank for {'image' if modality == 'i' else 'text'} score plot "
-                    f"(1-{len(position_options)}), b to list tokens, or q to finish: "
-                ).strip().lower()
+                command = input(
+                    f"Candidate: n [i|t [c]] (n=1-{len(position_options)}), "
+                    "b to list positions, q to finish: "
+                ).strip().lower().split()
             except EOFError:
                 return
-            if gradient_choice == "q":
+            if command == ["q"]:
                 return
-            if gradient_choice == "b":
+            if command == ["b"]:
                 break
-            if not gradient_choice.isdigit() or not 1 <= int(gradient_choice) <= len(position_options):
-                print(f"Enter a candidate rank from 1 to {len(position_options)}, b, or q.")
+            if not command or not command[0].isdigit() or len(command) > 3:
+                print("Use n, n i, n t, n t c, b, or q.")
                 continue
-
-            # candidate_rank: int, one-based top-candidate index selected for gradient inspection.
-            candidate_rank = int(gradient_choice)
+            # candidate_rank: int, one-based rank in the top candidate list for the selected assistant position.
+            candidate_rank = int(command[0])
+            if not 1 <= candidate_rank <= len(position_options):
+                print(f"Choose a candidate rank from 1 to {len(position_options)}.")
+                continue
+            # modality: str, image by default or explicitly selected text-token scores.
+            modality = command[1] if len(command) >= 2 else "i"
+            if modality not in {"i", "t"} or (modality == "i" and len(command) > 2):
+                print("Use n, n i, n t, or n t c; c is only valid with text.")
+                continue
+            # text_limit: int | None, number of most recent prior text tokens to display; None means all.
+            text_limit = None
+            if len(command) == 3:
+                if modality != "t" or not command[2].isdigit() or int(command[2]) < 1:
+                    print("The text-token count c must be a positive integer in `n t c`.")
+                    continue
+                text_limit = int(command[2])
             # prefix_token_ids: torch.Tensor, device-local long [1, preceding_generated_tokens].
             prefix_token_ids = generated_ids[:, : position - 1]
             # prefix_embeds: torch.Tensor, device-local [1, prompt_plus_preceding_tokens, hidden].
@@ -675,7 +675,7 @@ def inspect_generated_token_positions(
                 display=True,
                 save_dir=None,
             )
-            # Stay with this token and candidate list after drawing its selected modality.
+            # Stay with this assistant position after drawing the selected candidate and modality.
 
 
 # ============================================================================
