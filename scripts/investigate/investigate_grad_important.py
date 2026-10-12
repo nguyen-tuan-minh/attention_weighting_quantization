@@ -523,22 +523,38 @@ def inspect_generated_token_positions(
 
     while True:
         try:
-            position_text = input(
-                f"Token position 1-{len(token_ids)}, i for large image, or q to finish: "
-            ).strip().lower()
+            command = input(
+                f"Inspect token: n [i|t [c]] (1-{len(token_ids)}), b to list tokens, i for large image, q to finish: "
+            ).strip().lower().split()
         except EOFError:
             return
-        if position_text == "i":
+        if command == ["i"]:
             show_large_source_image(image, sample_number)
             continue
-        if position_text == "q":
+        if command == ["q"]:
             return
-        if not position_text.isdigit() or not 1 <= int(position_text) <= len(token_ids):
-            print(f"Enter a position from 1 to {len(token_ids)}, i, or q.")
+        if command == ["b"]:
             continue
-
-        # position: int, one-based generated assistant token position selected by the user.
-        position = int(position_text)
+        if not command or not command[0].isdigit():
+            print("Use n, n i, n t, n t c, b, i, or q.")
+            continue
+        # position: int, one-based generated assistant token position selected for inspection.
+        position = int(command[0])
+        if not 1 <= position <= len(token_ids) or len(command) > 3:
+            print(f"Choose token 1-{len(token_ids)} using n, n i, n t, or n t c.")
+            continue
+        # modality: str, image by default or explicitly selected text-token scores.
+        modality = command[1] if len(command) >= 2 else "i"
+        if modality not in {"i", "t"} or (modality == "i" and len(command) > 2):
+            print("Use n, n i, n t, or n t c; the optional count is only valid for text.")
+            continue
+        # text_limit: int | None, number of most recent previous text tokens to display; None means all.
+        text_limit = None
+        if len(command) == 3:
+            if modality != "t" or not command[2].isdigit() or int(command[2]) < 1:
+                print("The text-token count c must be a positive integer in `n t c`.")
+                continue
+            text_limit = int(command[2])
         # position_options: list[tuple[int, float]], ranked candidate ids and probabilities for this position.
         position_options = candidate_options[position - 1]
         print(f"Top candidates at position [{position}]:")
@@ -554,8 +570,8 @@ def inspect_generated_token_positions(
         while True:
             try:
                 gradient_choice = input(
-                    "Candidate rank for image/text gradient inspection (1-10), "
-                    "b to return to all tokens, or q to finish: "
+                    f"Candidate rank for {'image' if modality == 'i' else 'text'} score plot "
+                    f"(1-{len(position_options)}), b to list tokens, or q to finish: "
                 ).strip().lower()
             except EOFError:
                 return
@@ -633,6 +649,14 @@ def inspect_generated_token_positions(
                 f"L{layer_index}={float(scores.sum()):.3g}"
                 for layer_index, scores in sorted(candidate_text_scores.items())
             )
+            if text_limit is not None:
+                # candidate_text_scores: dict[int, torch.Tensor], retain only the latest c prior text positions for display.
+                candidate_text_scores = {
+                    layer_index: scores[-text_limit:]
+                    for layer_index, scores in candidate_text_scores.items()
+                }
+                # prefix_text_labels: list[str], token labels corresponding to the retained recent text positions.
+                prefix_text_labels = prefix_text_labels[-text_limit:]
             print(
                 f"Position [{position}] candidate {candidate_rank} {candidate_text!r}: "
                 f"CE={candidate_loss:.5g}; per-layer image sums: {layer_totals}; text sums: {text_totals}"
@@ -641,16 +665,17 @@ def inspect_generated_token_positions(
                 image,
                 candidate_image_scores,
                 sample_number,
-                text_scores=candidate_text_scores,
-                text_labels=prefix_text_labels,
+                text_scores=candidate_text_scores if modality == "t" else None,
+                text_labels=prefix_text_labels if modality == "t" else None,
                 heatmap_only=heatmap_only,
                 scale=scale,
                 score_normalization=score_normalization,
                 title_suffix=f"position {position}, candidate {candidate_text!r}",
+                modality="image" if modality == "i" else "text",
                 display=True,
                 save_dir=None,
             )
-            # Stay in this position's candidate list after inspecting its gradient map.
+            # Stay with this token and candidate list after drawing its selected modality.
 
 
 # ============================================================================
@@ -684,6 +709,7 @@ def show_gradient_heatmaps(
     *,
     text_scores: dict[int, torch.Tensor] | None = None,
     text_labels: list[str] | None = None,
+    modality: str = "both",
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
@@ -698,6 +724,7 @@ def show_gradient_heatmaps(
         layer_scores: Layer index -> CPU float32 [image_tokens] gradient scores.
         text_scores: Optional layer -> CPU float32 [text_tokens] gradient scores.
         text_labels: Optional decoded text-token pieces aligned with text_scores.
+        modality: Draw the image map, text-token strips, or both modalities.
         sample_number: One-based index in the selected calibration subset.
         heatmap_only: Show the source image in a separate reference panel and
             patch-grid scores without image overlays when true.
@@ -717,6 +744,10 @@ def show_gradient_heatmaps(
     """
     if not layer_scores:
         raise ValueError("No per-layer gradient scores are available to plot")
+    if modality not in {"image", "text", "both"}:
+        raise ValueError(f"Unknown score modality: {modality}")
+    if modality in {"text", "both"} and (not text_scores or text_labels is None):
+        raise ValueError("Text plotting requires text scores and aligned token labels")
     if text_scores is not None and text_labels is not None:
         if set(layer_scores) != set(text_scores):
             raise ValueError("Image and text score dictionaries must contain the same layers")
@@ -746,15 +777,19 @@ def show_gradient_heatmaps(
         low = float(torch.quantile(positives, 0.01))
         return LogNorm(vmin=low if low < high else high * 1e-6, vmax=high, clip=True)
 
-    # image_scores_display/text_scores_display: per-layer CPU float vectors; color scales are independent by modality.
-    image_scores_display = normalize_scores(layer_scores)
-    text_scores_display = normalize_scores(text_scores) if text_scores else None
-    image_token_count = next(iter(image_scores_display.values())).numel()
-    grid_size = math.isqrt(image_token_count)
-    if grid_size * grid_size != image_token_count:
-        raise ValueError(f"Cannot reshape {image_token_count} image-token scores into a square patch grid")
-    if any(scores.numel() != image_token_count for scores in image_scores_display.values()):
-        raise ValueError("All layers must have the same number of image-token scores")
+    # show_image/show_text: bool, selects one modality or both for a standalone figure.
+    show_image = modality in {"image", "both"}
+    show_text = modality in {"text", "both"}
+    # image_scores_display/text_scores_display: per-layer CPU float vectors with independent modality color scales.
+    image_scores_display = normalize_scores(layer_scores) if show_image else None
+    text_scores_display = normalize_scores(text_scores) if show_text and text_scores else None
+    if show_image:
+        image_token_count = next(iter(image_scores_display.values())).numel()
+        grid_size = math.isqrt(image_token_count)
+        if grid_size * grid_size != image_token_count:
+            raise ValueError(f"Cannot reshape {image_token_count} image-token scores into a square patch grid")
+        if any(scores.numel() != image_token_count for scores in image_scores_display.values()):
+            raise ValueError("All layers must have the same number of image-token scores")
 
     source_image = source_image.convert("RGB")
     image_width, image_height = source_image.size
@@ -764,25 +799,25 @@ def show_gradient_heatmaps(
     square_image.paste(source_image, ((square_side - image_width) // 2, (square_side - image_height) // 2))
     image = np.asarray(square_image).astype(np.float32) / 255.0
 
-    layer_indices = sorted(image_scores_display)
-    image_panel_count = len(layer_indices) + int(heatmap_only)
+    layer_indices = sorted(layer_scores if show_image else text_scores)
+    image_panel_count = len(layer_indices) + int(heatmap_only) if show_image else 0
     columns = 6
-    image_rows = math.ceil(image_panel_count / columns)
-    text_rows = math.ceil(len(layer_indices) / columns) if text_scores_display else 0
+    image_rows = math.ceil(image_panel_count / columns) if show_image else 0
+    text_rows = math.ceil(len(layer_indices) / columns) if show_text else 0
     figure = plt.figure(figsize=(columns * 3.5, image_rows * 3.2 + text_rows * 2.5), constrained_layout=True)
-    outer = figure.add_gridspec(image_rows + text_rows, columns)
-    image_norm = make_norm(image_scores_display)
+    outer = figure.add_gridspec(max(1, image_rows + text_rows), columns)
+    image_norm = make_norm(image_scores_display) if show_image else None
     text_norm = make_norm(text_scores_display) if text_scores_display else None
     image_mappable = text_mappable = None
-    image_offset = int(heatmap_only)
-    if heatmap_only:
+    image_offset = int(heatmap_only) if show_image else 0
+    if heatmap_only and show_image:
         ref_axis = figure.add_subplot(outer[0, 0])
         ref_axis.imshow(image)
         ref_axis.set_title("Reference image")
         ref_axis.axis("off")
 
     image_axes = []
-    for layer_number, layer_index in enumerate(layer_indices):
+    for layer_number, layer_index in enumerate(layer_indices if show_image else []):
         slot = layer_number + image_offset
         axis = figure.add_subplot(outer[slot // columns, slot % columns])
         image_axes.append(axis)
@@ -803,7 +838,7 @@ def show_gradient_heatmaps(
         figure.colorbar(image_mappable, ax=image_axes, fraction=0.015, pad=0.01,
                         label=f"Image-token score ({'percent within image tokens' if score_normalization == 'percent' else 'raw'})")
 
-    if text_scores_display:
+    if show_text and text_scores_display:
         for layer_number, layer_index in enumerate(layer_indices):
             slot = layer_number
             axis = figure.add_subplot(outer[image_rows + slot // columns, slot % columns])
@@ -834,7 +869,7 @@ def show_gradient_heatmaps(
     output_path = None
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
-        output_path = save_dir / f"sample_{sample_number:04d}_grad_important.png"
+        output_path = save_dir / f"sample_{sample_number:04d}_grad_important_{modality}.png"
         figure.savefig(output_path, dpi=160, bbox_inches="tight")
         log(f"Saved gradient heatmaps to {output_path}")
     if display:
@@ -1181,20 +1216,34 @@ def main() -> int:
                 active_sample["layer_activations"] = {}
                 del outputs, logits, forward_layer_activations, inputs_embeds
                 plot_started = time.perf_counter() if args.timing else None
-                output_path = show_gradient_heatmaps(
+                image_output_path = show_gradient_heatmaps(
                     image,
                     layer_scores,
                     sample_index,
                     text_scores=text_layer_scores,
                     text_labels=text_token_labels,
+                    modality="image",
                     heatmap_only=args.heatmap_only,
                     scale=args.scale,
                     score_normalization=args.score_normalization,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )
-                if output_path is None:
-                    log(f"Displayed gradient heatmaps for sample {sample_index}")
+                text_output_path = show_gradient_heatmaps(
+                    image,
+                    layer_scores,
+                    sample_index,
+                    text_scores=text_layer_scores,
+                    text_labels=text_token_labels,
+                    modality="text",
+                    heatmap_only=args.heatmap_only,
+                    scale=args.scale,
+                    score_normalization=args.score_normalization,
+                    display=not args.no_display,
+                    save_dir=save_dir,
+                )
+                if image_output_path is None and text_output_path is None:
+                    log(f"Displayed image and text gradient plots for sample {sample_index}")
                 if plot_started is not None:
                     log(f"[timing] Sample {sample_index} plot: {time.perf_counter() - plot_started:.2f} s")
                 if sample_started is not None:

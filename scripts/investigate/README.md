@@ -151,9 +151,9 @@ model paths, or output locations.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
   at a time, backpropagates each token loss to a selected activation at every
   decoder layer, sums squared gradients over hidden dimensions and answer tokens for each image
-  and valid non-image text token, and displays both by layer: image-patch maps
-  and a text-token score strip with decoded token labels. Each modality has its
-  own colorbar and scale, so the image and text colors show relative levels
+  and valid non-image text token, and displays separate per-layer figures for
+  image-patch maps and text-token scores with decoded labels. Each modality has
+  its own colorbar and scale, so image and text colors show relative levels
   within that modality and their raw colors must not be compared across the two.
   Use `--heatmap-only` to show the source image in a separate reference panel
   beside the plain patch-grid heatmaps. The default color scale is logarithmic;
@@ -168,11 +168,13 @@ model paths, or output locations.
   the `--max-new-tokens` cap (default 128); there is no custom semantic stopping
   criterion. Use `--answer-mode interactive` to generate the complete answer
   first, then inspect the top ten candidates at any numbered token position.
-  After viewing a position's candidates, enter a candidate rank to print its
-  image/text gradient scores and display both score views. After inspecting a
-  candidate, the interface stays at that position; enter another rank to
-  inspect another candidate, `b` to return to the all-token list, `i` to open
-  the input image in a large window, or `q` to finish. These gradient maps are
+  Enter `n` to inspect token position n's image scores (the default), `n i`
+  for image explicitly, `n t` for all prior text-token scores, or `n t c` for
+  only the latest c prior text tokens. The chosen candidate is plotted in a
+  separate image or text figure. After inspecting a candidate, the interface
+  stays at that token position; enter another candidate rank to inspect it,
+  `b` to return to the token list, `i` to open the input image in a large
+  window, or `q` to finish. These gradient maps are
   diagnostic clues, not a standalone
   hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
