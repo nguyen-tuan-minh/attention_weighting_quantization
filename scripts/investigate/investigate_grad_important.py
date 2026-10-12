@@ -553,7 +553,7 @@ def inspect_generated_token_positions(
 
         while True:
             try:
-            gradient_choice = input(
+                gradient_choice = input(
                     "Candidate rank for image/text gradient inspection (1-10), "
                     "b to return to all tokens, or q to finish: "
                 ).strip().lower()
