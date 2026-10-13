@@ -90,6 +90,13 @@ The gradient investigation's interactive terminal has two screens:
   screen. Inspecting a candidate keeps the user at the same position; replacing
   it regenerates the rest of the answer and returns to the all-token screen;
   `b` returns without replacing it.
+- Entering `q` from either screen exits the investigation program after hook
+  cleanup; it does not just leave the current screen or continue with another
+  sample. The timeout counts idle time at each terminal prompt and resets when
+  the next prompt is shown. If the terminal receives no input for the configured
+  inactivity timeout, the program exits cleanly as well. Set
+  `interactive_timeout_minutes` in `configs/investigate.yaml` (default: `10`);
+  use `--investigate-config PATH` to load a different investigation config.
 
 Plots and large-image views are visualizations opened from the candidate
 screen, not additional terminal screens. Keep the terminal flow organized

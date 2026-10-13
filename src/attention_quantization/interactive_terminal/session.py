@@ -12,6 +12,7 @@ from .candidate_screen import (
     render_candidates,
     show_candidate_help,
 )
+from .terminal_io import read_timed_input
 
 
 def inspect_generated_token_positions(
@@ -36,6 +37,7 @@ def inspect_generated_token_positions(
     show_gradient_heatmaps_fn: Any,
     show_large_source_image_fn: Any,
     log_fn: Any,
+    interactive_timeout_seconds: float,
 ) -> dict[str, Any] | None:
     """Inspect stored top-token distributions and candidate gradients by generated position.
 
@@ -46,23 +48,21 @@ def inspect_generated_token_positions(
     """
     # token_ids: list[int], generated assistant tokens, including EOS when emitted.
     token_ids = generated_ids[0].tolist()
-    # answer_was_replaced: bool, records whether the current token sequence differs from initial generation.
-    answer_was_replaced = False
     # current_assistant_text: str, decoded current answer, refreshed after candidate replacement.
     current_assistant_text = input_adapter.tokenizer.decode(
         generated_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
     ).strip()
     while True:
         render_all_tokens(input_adapter, initial_question, token_ids, position_distributions)
-        command_parts = read_all_tokens_command(len(token_ids))
+        command_parts = read_all_tokens_command(len(token_ids), interactive_timeout_seconds)
         if command_parts is None:
-            return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+            return {"action": "quit"}
         command_name = command_parts[0].lower() if command_parts else ""
         if command_name == "i" and len(command_parts) == 1:
             show_large_source_image_fn(image, sample_number)
             continue
         if command_name == "q" and len(command_parts) == 1:
-            return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+            return {"action": "quit"}
         if command_name == "r" and len(command_parts) <= 2:
             sampling_mode = "sample" if len(command_parts) == 2 and command_parts[1].lower() in {"s", "sample"} else "greedy"
             if len(command_parts) == 2 and command_parts[1].lower() not in {"s", "sample", "g", "greedy"}:
@@ -71,19 +71,20 @@ def inspect_generated_token_positions(
             return {"action": "regenerate", "sampling_mode": sampling_mode}
         if command_name == "e" and len(command_parts) == 1:
             try:
-                new_question = input("New initial question: ").strip()
+                new_question = read_timed_input("New initial question: ", interactive_timeout_seconds).strip()
             except EOFError:
-                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+                return {"action": "quit"}
             if not new_question:
                 print("Question was empty; keeping the current answer.")
                 continue
             while True:
                 try:
-                    sampling_choice = input(
-                        "Regenerate with [g]reedy or [s]tochastic sampling? [g]: "
+                    sampling_choice = read_timed_input(
+                        "Regenerate with [g]reedy or [s]tochastic sampling? [g]: ",
+                        interactive_timeout_seconds,
                     ).strip().lower()
                 except EOFError:
-                    return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+                    return {"action": "quit"}
                 if sampling_choice in {"", "g", "greedy", "s", "sample", "stochastic"}:
                     break
                 print("Choose g for greedy or s for stochastic sampling.")
@@ -149,11 +150,11 @@ def inspect_generated_token_positions(
         ]
         while True:
             render_candidates(input_adapter, position, position_options)
-            command = read_candidate_command(len(position_options))
+            command = read_candidate_command(len(position_options), interactive_timeout_seconds)
             if command is None:
-                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+                return {"action": "quit"}
             if command == ["q"]:
-                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+                return {"action": "quit"}
             if command == ["b"]:
                 break
             if command == ["h"]:
@@ -265,7 +266,6 @@ def inspect_generated_token_positions(
                 generated_ids = updated_generated_ids
                 token_ids = generated_ids[0].tolist()
                 position_distributions = updated_position_distributions
-                answer_was_replaced = True
                 current_assistant_text = input_adapter.tokenizer.decode(
                     generated_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
                 ).strip()

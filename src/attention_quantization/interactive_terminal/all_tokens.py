@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from .terminal_io import read_timed_input
+
 
 def render_all_tokens(
     input_adapter: Any,
@@ -26,12 +28,13 @@ def render_all_tokens(
         print(f"[{position}] {token_text!r}  p={chosen_probability:.4f}")
 
 
-def read_all_tokens_command(token_count: int) -> list[str] | None:
+def read_all_tokens_command(token_count: int, timeout_seconds: float) -> list[str] | None:
     """Read one all-token screen command, returning None on terminal EOF."""
     try:
-        command = input(
+        command = read_timed_input(
             f"Position n [k count | p mass], r [s], e, i, h, q "
-            f"(n=1-{token_count}): "
+            f"(n=1-{token_count}): ",
+            timeout_seconds,
         ).strip()
     except EOFError:
         return None

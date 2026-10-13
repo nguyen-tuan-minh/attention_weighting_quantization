@@ -25,7 +25,11 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
-from attention_quantization.interactive_terminal import inspect_generated_token_positions  # noqa: E402
+from attention_quantization.interactive_terminal import (  # noqa: E402
+    InteractiveSessionExit,
+    InteractiveTimeoutError,
+    inspect_generated_token_positions,
+)
 from investigation_logging import configure_logging, log  # noqa: E402
 
 
@@ -138,6 +142,7 @@ def _generate_assistant_once(
     sampling_mode: str = "greedy",
     temperature: float = 0.8,
     top_p: float = 0.9,
+    interactive_timeout_seconds: float = 600.0,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate one assistant response and run one interactive inspection pass.
 
@@ -301,6 +306,7 @@ def _generate_assistant_once(
             show_gradient_heatmaps_fn=show_gradient_heatmaps,
             show_large_source_image_fn=show_large_source_image,
             log_fn=log,
+            interactive_timeout_seconds=interactive_timeout_seconds,
         )
     del generated_ids, generated_token_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
     return assistant_text, inspection_action
@@ -320,6 +326,7 @@ def generate_assistant_reply(
     score_normalization: str = "raw",
     temperature: float = 0.8,
     top_p: float = 0.9,
+    interactive_timeout_seconds: float = 600.0,
 ) -> str:
     """Generate an answer, handling interactive regenerate and question-edit actions.
 
@@ -364,7 +371,10 @@ def generate_assistant_reply(
             sampling_mode=sampling_mode,
             temperature=temperature,
             top_p=top_p,
+            interactive_timeout_seconds=interactive_timeout_seconds,
         )
+        if action and action["action"] == "quit":
+            raise InteractiveSessionExit
         if not action or action["action"] == "answer_replaced":
             prompt_row["conversations"][:] = [
                 dict(turn) for turn in current_prompt_row["conversations"]
@@ -886,6 +896,12 @@ def parse_args() -> argparse.Namespace:
         default=REPOSITORY_ROOT / "configs" / "dataset.yaml",
     )
     parser.add_argument(
+        "--investigate-config",
+        type=Path,
+        default=REPOSITORY_ROOT / "configs" / "investigate.yaml",
+        help="Investigation-specific settings, including interactive terminal timeout.",
+    )
+    parser.add_argument(
         "--model-config",
         type=Path,
         default=REPOSITORY_ROOT / "configs" / "model.yaml",
@@ -970,6 +986,16 @@ def main() -> int:
         # Read options and validate settings before loading large resources.
         dataset_config = read_yaml(args.dataset_config)
         model_config = read_yaml(args.model_config)
+        investigate_config = read_yaml(args.investigate_config)
+        interactive_timeout_minutes = investigate_config.get("interactive_timeout_minutes", 10)
+        if (
+            isinstance(interactive_timeout_minutes, bool)
+            or not isinstance(interactive_timeout_minutes, (int, float))
+            or not math.isfinite(interactive_timeout_minutes)
+            or interactive_timeout_minutes <= 0
+        ):
+            raise ValueError("interactive_timeout_minutes must be a finite positive number")
+        interactive_timeout_seconds = float(interactive_timeout_minutes) * 60.0
         sample_count = (
             args.samples
             if args.samples is not None
@@ -1126,6 +1152,7 @@ def main() -> int:
                             score_normalization=args.score_normalization,
                             temperature=args.temperature,
                             top_p=args.top_p,
+                            interactive_timeout_seconds=interactive_timeout_seconds,
                         )
                     finally:
                         # active_sample["capture_enabled"]: bool, re-enable hooks for the answer-scoring forward.
@@ -1272,6 +1299,11 @@ def main() -> int:
             log(f"Saved per-sample figures under: {save_dir}")
         if total_started is not None:
             log(f"[timing] Total: {time.perf_counter() - total_started:.2f} s")
+    except InteractiveTimeoutError:
+        print("Interactive session timed out; exiting the investigation.")
+        return 0
+    except InteractiveSessionExit:
+        return 0
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

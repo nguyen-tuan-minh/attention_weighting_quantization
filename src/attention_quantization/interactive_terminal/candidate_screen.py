@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .terminal_io import read_timed_input
+
 
 def render_candidates(
     input_adapter: Any,
@@ -21,12 +23,13 @@ def render_candidates(
         print(f"[{rank}] {candidate_text!r}  p={probability:.4f}")
 
 
-def read_candidate_command(candidate_count: int) -> list[str] | None:
+def read_candidate_command(candidate_count: int, timeout_seconds: float) -> list[str] | None:
     """Read one candidate-screen command, returning None on terminal EOF."""
     try:
-        command = input(
+        command = read_timed_input(
             f"Candidate: n [i|t [c]], n + c, or n replace [c] (n=1-{candidate_count}), "
-            "h for help, b to list positions, q to finish: "
+            "h for help, b to list positions, q to finish: ",
+            timeout_seconds,
         ).strip().lower().split()
     except EOFError:
         return None

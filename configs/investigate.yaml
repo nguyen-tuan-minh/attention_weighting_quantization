@@ -1,0 +1,2 @@
+# Interactive terminal inactivity timeout, in minutes.
+interactive_timeout_minutes: 10
