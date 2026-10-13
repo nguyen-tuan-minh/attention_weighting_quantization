@@ -11,6 +11,7 @@ from .candidate_screen import (
     read_candidate_command,
     render_candidates,
     show_candidate_help,
+    show_gradient_norm_percentages,
 )
 from .terminal_io import read_timed_input
 
@@ -161,7 +162,7 @@ def inspect_generated_token_positions(
                 show_candidate_help()
                 continue
             if not command or not command[0].isdigit() or len(command) > 3:
-                print("Use n, n i, n t, n t c, n + c, n replace [c], b, or q.")
+                print("Use n, n i, n t, n t c, n g, n + c, n replace [c], b, or q.")
                 continue
             # candidate_rank: int, one-based rank in the top candidate list for the selected assistant position.
             candidate_rank = int(command[0])
@@ -362,8 +363,8 @@ def inspect_generated_token_positions(
                 continue
             # modality: str, image by default or explicitly selected text-token scores.
             modality = command[1] if len(command) >= 2 else "i"
-            if modality not in {"i", "t"} or (modality == "i" and len(command) > 2):
-                print("Use n, n i, n t, or n t c; c is only valid with text.")
+            if modality not in {"i", "t", "g"} or (modality in {"i", "g"} and len(command) > 2):
+                print("Use n, n i, n t, n t c, or n g; c is only valid with text.")
                 continue
             # text_limit: int | None, number of most recent prior text tokens to display; None means all.
             text_limit = None
@@ -448,6 +449,16 @@ def inspect_generated_token_positions(
                 f"Position [{position}] candidate {candidate_rank} {candidate_text!r}: "
                 f"CE={candidate_loss:.5g}; per-layer image sums: {layer_totals}; text sums: {text_totals}"
             )
+            if modality == "g":
+                show_gradient_norm_percentages(
+                    candidate_image_scores,
+                    candidate_text_scores,
+                    title=(
+                        f"Position {position}, candidate {candidate_text!r}: "
+                        "image/text gradient norm share by layer"
+                    ),
+                )
+                continue
             show_gradient_heatmaps_fn(
                 image,
                 candidate_image_scores,

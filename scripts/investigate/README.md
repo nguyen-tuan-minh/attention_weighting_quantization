@@ -87,7 +87,10 @@ The gradient investigation's interactive terminal has two screens:
 - **Candidate screen** — shows the top candidate tokens and probabilities for
   the selected answer position. Candidate inspection, gradient plots,
   continuation comparisons, and replacing the current token belong to this
-  screen. Inspecting a candidate keeps the user at the same position; replacing
+  screen. Use `n g` to graph the image and text shares per layer, computed by
+  taking the square root of each modality's summed squared token gradients and
+  normalizing those two values to 100%. Inspecting a candidate keeps the user
+  at the same position; replacing
   it regenerates the rest of the answer and returns to the all-token screen;
   `b` returns without replacing it.
 - Entering `q` from either screen exits the investigation program after hook
