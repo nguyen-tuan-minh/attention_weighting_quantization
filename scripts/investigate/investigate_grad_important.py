@@ -122,7 +122,7 @@ def register_decoder_activation_hooks(
 # ============================================================================
 # PHASE 4. FORWARD SAMPLES AND BACKPROPAGATE ASSISTANT TOKEN LOSSES
 # ============================================================================
-def generate_assistant_reply(
+def _generate_assistant_once(
     input_adapter: Any,
     image: Any,
     prompt_row: dict[str, Any],
@@ -134,8 +134,11 @@ def generate_assistant_reply(
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
-) -> str:
-    """Greedily decode one assistant response from a prompt-only multimodal row.
+    sampling_mode: str = "greedy",
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+) -> tuple[str, dict[str, Any] | None]:
+    """Generate one assistant response and run one interactive inspection pass.
 
     Args:
         input_adapter: Loaded QIG LLaVA adapter, providing preprocessing,
@@ -150,9 +153,12 @@ def generate_assistant_reply(
         heatmap_only: Use the separate-reference-image heatmap layout.
         scale: Heatmap color normalization, logarithmic or linear.
         score_normalization: Raw scores or per-layer image-token percentages.
+        sampling_mode: ``greedy`` or stochastic nucleus ``sample`` generation.
+        temperature: Positive softmax temperature for stochastic generation.
+        top_p: Cumulative probability threshold for nucleus sampling.
 
     Returns:
-        Decoded assistant response with tokenizer special tokens removed.
+        Decoded response and an optional interactive action requesting a rerun.
 
     Side effects:
         Runs repeated model forwards under no-grad mode, stopping on EOS or
@@ -181,8 +187,8 @@ def generate_assistant_reply(
     current_attention_mask = prompt_kwargs["attention_mask"]
     # generated_token_ids: list[torch.Tensor], device-local long [1, 1] ids emitted so far.
     generated_token_ids: list[torch.Tensor] = []
-    # candidate_options: list[list[tuple[int, float]]], top token ids/probabilities at each generated position.
-    candidate_options: list[list[tuple[int, float]]] = []
+    # position_distributions: list[torch.Tensor], CPU float32 [vocabulary] probabilities per generated position.
+    position_distributions: list[torch.Tensor] = []
     # past_key_values: model cache for the prompt and generated prefix, or None when unsupported.
     past_key_values = None
     # eos_token_ids: set[int], configured end-of-sequence token ids that stop greedy decoding.
@@ -204,25 +210,30 @@ def generate_assistant_reply(
                 use_cache=True,
                 return_dict=True,
             )
-            # next_token_id: torch.Tensor, device-local long [1, 1], greedy next-token choice.
             # next_token_logits: torch.Tensor, float [vocabulary], distribution for the next assistant token.
             next_token_logits = outputs.logits[0, -1].float()
+            # next_probabilities: torch.Tensor, device-local float [vocabulary], full unfiltered token distribution.
+            next_probabilities = torch.softmax(next_token_logits, dim=-1)
             if interactive:
-                # top_probabilities: torch.Tensor, float [candidates], probability mass for ranked candidates.
-                # top_token_ids: torch.Tensor, long [candidates], ranked candidate token ids (at most ten).
-                top_probabilities, top_token_ids = torch.topk(
-                    torch.softmax(next_token_logits, dim=-1),
-                    k=min(10, next_token_logits.numel()),
-                )
-                # candidate_options[position]: list[tuple[int, float]], top candidate ids and probabilities for this position.
-                candidate_options.append([
-                    (int(candidate_id), float(candidate_probability))
-                    for candidate_id, candidate_probability in zip(top_token_ids, top_probabilities)
-                ])
-                # next_token_id: torch.Tensor, device-local long [1, 1], greedy top-probability continuation.
-                next_token_id = top_token_ids[:1].reshape(1, 1)
+                # position_distributions[position]: CPU float32 [vocabulary], retained for selectable top-k/p views.
+                position_distributions.append(next_probabilities.detach().cpu())
+            if sampling_mode == "sample":
+                # sampling_logits: torch.Tensor, float [vocabulary], temperature-scaled scores for sampling.
+                sampling_logits = next_token_logits / temperature
+                # sampling_probabilities: torch.Tensor, float [vocabulary], temperature-scaled probability distribution.
+                sampling_probabilities = torch.softmax(sampling_logits, dim=-1)
+                # sorted_probabilities/sorted_ids: descending probability distribution and corresponding token ids.
+                sorted_probabilities, sorted_ids = torch.sort(sampling_probabilities, descending=True)
+                # cumulative_probabilities: torch.Tensor, float [vocabulary], top-p cumulative mass by rank.
+                cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=0)
+                # remove_after_nucleus: torch.Tensor, bool [vocabulary], tokens ranked after the top-p nucleus.
+                remove_after_nucleus = cumulative_probabilities - sorted_probabilities >= top_p
+                sampling_probabilities[sorted_ids[remove_after_nucleus]] = 0.0
+                sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
+                # next_token_id: torch.Tensor, device-local long [1, 1], sampled from the temperature/top-p distribution.
+                next_token_id = torch.multinomial(sampling_probabilities, num_samples=1).reshape(1, 1)
             else:
-                # next_token_id: torch.Tensor, device-local long [1, 1], greedy next-token choice.
+                # next_token_id: torch.Tensor, device-local long [1, 1], greedy highest-probability token.
                 next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)
             generated_token_ids.append(next_token_id)
             if int(next_token_id[0, 0]) in eos_token_ids:
@@ -246,7 +257,7 @@ def generate_assistant_reply(
                 # With a KV cache, only the newest token embedding is needed for the next forward.
                 current_embeds = next_token_embed
 
-    # generated_ids: torch.Tensor, [1, generated_tokens], all greedy continuation ids, including EOS if emitted.
+    # generated_ids: torch.Tensor, [1, generated_tokens], decoded continuation ids, including EOS if emitted.
     generated_ids = torch.cat(generated_token_ids, dim=1)
     # assistant_text: str, decoded generated continuation with tokenizer special tokens removed.
     assistant_text = input_adapter.tokenizer.decode(
@@ -254,11 +265,21 @@ def generate_assistant_reply(
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
+    inspection_action = None
     if interactive:
         if active_sample is None:
             raise RuntimeError("Interactive inspection requires activation-hook state")
-        log(f"GENERATED ASSISTANT: {assistant_text}", level="normal")
-        inspect_generated_token_positions(
+        log(f"GENERATED ASSISTANT ({sampling_mode}): {assistant_text}", level="normal")
+        # initial_question: str, latest user-turn text currently used to condition this generated answer.
+        initial_question = next(
+            (
+                str(turn.get("value", ""))
+                for turn in reversed(prompt_row["conversations"])
+                if turn.get("from") in {"human", "user"}
+            ),
+            "",
+        )
+        inspection_action = inspect_generated_token_positions(
             input_adapter,
             active_sample,
             prompt_inputs["inputs_embeds"],
@@ -266,7 +287,9 @@ def generate_assistant_reply(
             prompt_kwargs["vision_mask"][0].bool().detach().cpu(),
             prompt_text_labels,
             generated_ids,
-            candidate_options,
+            position_distributions,
+            max_new_tokens,
+            initial_question,
             image,
             sample_number,
             heatmap_only=heatmap_only,
@@ -274,7 +297,96 @@ def generate_assistant_reply(
             score_normalization=score_normalization,
         )
     del generated_ids, generated_token_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
-    return assistant_text
+    return assistant_text, inspection_action
+
+
+def generate_assistant_reply(
+    input_adapter: Any,
+    image: Any,
+    prompt_row: dict[str, Any],
+    max_new_tokens: int,
+    *,
+    interactive: bool = False,
+    active_sample: dict[str, Any] | None = None,
+    sample_number: int = 1,
+    heatmap_only: bool = False,
+    scale: str = "log",
+    score_normalization: str = "raw",
+    temperature: float = 0.8,
+    top_p: float = 0.9,
+) -> str:
+    """Generate an answer, handling interactive regenerate and question-edit actions.
+
+    Args:
+        input_adapter: Loaded multimodal adapter and model.
+        image: PIL input image for the sample.
+        prompt_row: Adapter conversation through the initial user question.
+        max_new_tokens: Per-generation assistant token cap.
+        interactive: Run the two-screen token and candidate interface.
+        active_sample: Shared hook state used for candidate gradient inspection.
+        sample_number: One-based sample index shown in visualization titles.
+        heatmap_only: Display plain patch maps beside a reference image.
+        scale: Gradient-plot color scale.
+        score_normalization: Raw scores or within-modality percentages.
+        temperature: Sampling temperature for interactive stochastic regeneration.
+        top_p: Nucleus mass threshold for stochastic generation.
+
+    Returns:
+        Final assistant text after the user exits the interactive interface.
+
+    Side effects:
+        Regeneration and question-edit actions rerun preprocessing and generation
+        from the updated user prompt until the user exits.
+    """
+    # current_prompt_row: dict[str, Any], independent prompt conversation that may be edited in the UI.
+    current_prompt_row = {**prompt_row, "conversations": [dict(turn) for turn in prompt_row["conversations"]]}
+    # sampling_mode: str, current decoding mode, initially greedy for predictable first-pass output.
+    sampling_mode = "greedy"
+    while True:
+        # assistant_text/action: str and optional UI request returned by one complete generation pass.
+        assistant_text, action = _generate_assistant_once(
+            input_adapter,
+            image,
+            current_prompt_row,
+            max_new_tokens,
+            interactive=interactive,
+            active_sample=active_sample,
+            sample_number=sample_number,
+            heatmap_only=heatmap_only,
+            scale=scale,
+            score_normalization=score_normalization,
+            sampling_mode=sampling_mode,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        if not action or action["action"] == "answer_replaced":
+            prompt_row["conversations"][:] = [
+                dict(turn) for turn in current_prompt_row["conversations"]
+            ]
+            return action.get("assistant_text", assistant_text) if action else assistant_text
+        if action["action"] == "regenerate":
+            sampling_mode = action["sampling_mode"]
+            continue
+        if action["action"] == "edit_question":
+            # user_turn_indices: list[int], user question turns available in this prompt-only conversation.
+            user_turn_indices = [
+                index for index, turn in enumerate(current_prompt_row["conversations"])
+                if turn.get("from") in {"human", "user"}
+            ]
+            if not user_turn_indices:
+                raise ValueError("Cannot edit a prompt with no user question")
+            # selected_user_turn: dict[str, Any], latest user turn receiving the replacement question text.
+            selected_user_turn = current_prompt_row["conversations"][user_turn_indices[-1]]
+            # image_marker_count: int, image sentinel count preserved from the original multimodal question.
+            image_marker_count = str(selected_user_turn.get("value", "")).count("<image>")
+            # replacement_question: str, edited question with the original image sentinels restored at its start.
+            replacement_question = action["question"].replace("<image>", "").strip()
+            if image_marker_count:
+                replacement_question = "\n".join(["<image>"] * image_marker_count + [replacement_question])
+            selected_user_turn["value"] = replacement_question
+            sampling_mode = action["sampling_mode"]
+            continue
+        raise ValueError(f"Unknown interactive action: {action['action']}")
 
 
 def decode_non_image_token_labels(input_adapter: Any, batch: dict[str, Any]) -> list[str]:
@@ -491,7 +603,7 @@ def generate_candidate_continuation(
     attention_mask: torch.Tensor,
     max_new_tokens: int,
     eos_token_ids: set[int],
-) -> list[int]:
+) -> tuple[list[int], list[torch.Tensor]]:
     """Greedily generate a candidate-conditioned continuation without gradients.
 
     Args:
@@ -504,7 +616,8 @@ def generate_candidate_continuation(
         eos_token_ids: End-of-sequence ids that stop the branch after emission.
 
     Returns:
-        Greedy continuation token ids, including EOS when emitted.
+        Greedy continuation token ids and each step's CPU float32
+        [vocabulary] probability distribution, including EOS when emitted.
 
     Side effects:
         Runs no-gradient model forwards, leaving model parameters and hook state
@@ -516,6 +629,8 @@ def generate_candidate_continuation(
     branch_attention_mask = attention_mask
     # branch_token_ids: list[int], greedily emitted continuation ids, EOS included if generated.
     branch_token_ids: list[int] = []
+    # branch_distributions: list[torch.Tensor], CPU float32 [vocabulary] probabilities before each emitted token.
+    branch_distributions: list[torch.Tensor] = []
     with torch.no_grad():
         for _ in range(max_new_tokens):
             # branch_outputs: ModelOutput, logits for the current branch prefix.
@@ -525,8 +640,12 @@ def generate_candidate_continuation(
                 use_cache=False,
                 return_dict=True,
             )
+            # next_probabilities: torch.Tensor, device-local float [vocabulary], raw model distribution for this step.
+            next_probabilities = torch.softmax(branch_outputs.logits[0, -1].float(), dim=-1)
             # next_token_id: torch.Tensor, device-local long [1, 1], greedy continuation token.
-            next_token_id = branch_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token_id = next_probabilities.argmax(dim=-1, keepdim=True)
+            # branch_distributions: append CPU float32 [vocabulary] probabilities aligned to the emitted token.
+            branch_distributions.append(next_probabilities.detach().cpu())
             # next_token_value: int, emitted token id used for EOS comparison and decoding.
             next_token_value = int(next_token_id[0, 0])
             branch_token_ids.append(next_token_value)
@@ -539,7 +658,7 @@ def generate_candidate_continuation(
             branch_attention_mask = torch.cat(
                 (branch_attention_mask, torch.ones_like(branch_attention_mask[:, :1])), dim=1
             )
-    return branch_token_ids
+    return branch_token_ids, branch_distributions
 
 
 def inspect_generated_token_positions(
@@ -550,14 +669,16 @@ def inspect_generated_token_positions(
     prompt_image_mask: torch.Tensor,
     prompt_text_labels: list[str],
     generated_ids: torch.Tensor,
-    candidate_options: list[list[tuple[int, float]]],
+    position_distributions: list[torch.Tensor],
+    max_new_tokens: int,
+    initial_question: str,
     image: Any,
     sample_number: int,
     *,
     heatmap_only: bool,
     scale: str,
     score_normalization: str,
-) -> None:
+) -> dict[str, Any] | None:
     """Inspect stored top-token distributions and candidate gradients by generated position.
 
     The model generates the full answer before this UI starts. Each stored
@@ -567,70 +688,260 @@ def inspect_generated_token_positions(
     """
     # token_ids: list[int], generated assistant tokens, including EOS when emitted.
     token_ids = generated_ids[0].tolist()
-    print("\nGenerated assistant tokens:")
-    for position, token_id in enumerate(token_ids, start=1):
-        # token_text: str, decoded single-token piece with whitespace exposed by repr().
-        token_text = input_adapter.tokenizer.decode(
-            [token_id],
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        # chosen_probability: float, probability assigned to the generated token at its position.
-        chosen_probability = candidate_options[position - 1][0][1]
-        print(f"[{position}] {token_text!r}  p={chosen_probability:.4f}")
-
+    # answer_was_replaced: bool, records whether the current token sequence differs from initial generation.
+    answer_was_replaced = False
+    # current_assistant_text: str, decoded current answer, refreshed after candidate replacement.
+    current_assistant_text = input_adapter.tokenizer.decode(
+        generated_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
+    ).strip()
     while True:
-        try:
-            position_text = input(
-                f"Token position 1-{len(token_ids)}, i for large image, or q to finish: "
-            ).strip().lower()
-        except EOFError:
-            return
-        if position_text == "i":
-            show_large_source_image(image, sample_number)
-            continue
-        if position_text == "q":
-            return
-        if not position_text.isdigit():
-            print(f"Enter a position from 1 to {len(token_ids)}, i, or q.")
-            continue
-        # position: int, one-based generated assistant token position selected for inspection.
-        position = int(position_text)
-        if not 1 <= position <= len(token_ids):
-            print(f"Choose a token position from 1 to {len(token_ids)}.")
-            continue
-        # position_options: list[tuple[int, float]], ranked candidate ids and probabilities for this position.
-        position_options = candidate_options[position - 1]
-        print(f"Top candidates at position [{position}]:")
-        for rank, (candidate_id, probability) in enumerate(position_options, start=1):
-            # candidate_text: str, decoded candidate token piece with whitespace visible.
-            candidate_text = input_adapter.tokenizer.decode(
-                [candidate_id],
+        print(f"\nInitial question: {initial_question}")
+        print("\nGenerated assistant tokens:")
+        for position, token_id in enumerate(token_ids, start=1):
+            # token_text: str, decoded single-token piece with whitespace exposed by repr().
+            token_text = input_adapter.tokenizer.decode(
+                [token_id],
                 skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             )
-            print(f"[{rank}] {candidate_text!r}  p={probability:.4f}")
-
+            # chosen_probability: float, probability assigned to the generated token at its position.
+            chosen_probability = float(position_distributions[position - 1][token_id])
+            print(f"[{position}] {token_text!r}  p={chosen_probability:.4f}")
+        try:
+            command = input(
+                f"Position n [k count | p mass], r [s], e, i, h, q "
+                f"(n=1-{len(token_ids)}): "
+            ).strip()
+        except EOFError:
+            return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+        command_parts = command.split()
+        command_name = command_parts[0].lower() if command_parts else ""
+        if command_name == "i" and len(command_parts) == 1:
+            show_large_source_image(image, sample_number)
+            continue
+        if command_name == "q" and len(command_parts) == 1:
+            return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+        if command_name == "r" and len(command_parts) <= 2:
+            sampling_mode = "sample" if len(command_parts) == 2 and command_parts[1].lower() in {"s", "sample"} else "greedy"
+            if len(command_parts) == 2 and command_parts[1].lower() not in {"s", "sample", "g", "greedy"}:
+                print("Use r for greedy regeneration or r s for stochastic regeneration.")
+                continue
+            return {"action": "regenerate", "sampling_mode": sampling_mode}
+        if command_name == "e" and len(command_parts) == 1:
+            try:
+                new_question = input("New initial question: ").strip()
+            except EOFError:
+                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+            if not new_question:
+                print("Question was empty; keeping the current answer.")
+                continue
+            while True:
+                try:
+                    sampling_choice = input(
+                        "Regenerate with [g]reedy or [s]tochastic sampling? [g]: "
+                    ).strip().lower()
+                except EOFError:
+                    return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
+                if sampling_choice in {"", "g", "greedy", "s", "sample", "stochastic"}:
+                    break
+                print("Choose g for greedy or s for stochastic sampling.")
+            return {
+                "action": "edit_question",
+                "question": new_question,
+                "sampling_mode": "sample" if sampling_choice in {"s", "sample", "stochastic"} else "greedy",
+            }
+        if command_name == "h" and len(command_parts) == 1:
+            print("Select n, n k count, or n p mass; r regenerates, r s samples, e edits the question, i shows the image, q exits.")
+            continue
+        if not command_parts or not command_parts[0].isdigit():
+            print("Use n, n k count, n p mass, r [s], e, i, h, or q.")
+            continue
+        # position: int, one-based generated assistant token position selected for inspection.
+        position = int(command_parts[0])
+        if not 1 <= position <= len(token_ids):
+            print(f"Choose a token position from 1 to {len(token_ids)}.")
+            continue
+        # candidate_distribution: torch.Tensor, CPU float32 [vocabulary], probabilities at this generated position.
+        candidate_distribution = position_distributions[position - 1]
+        # display_count: int, number of ranked candidates requested, defaulting to ten.
+        display_count = 10
+        if len(command_parts) == 1:
+            pass
+        elif len(command_parts) == 3 and command_parts[1].lower() == "k" and command_parts[2].isdigit():
+            display_count = int(command_parts[2])
+            if not 1 <= display_count <= candidate_distribution.numel():
+                print(f"Top-k must be from 1 to {candidate_distribution.numel()}.")
+                continue
+        elif len(command_parts) == 3 and command_parts[1].lower() == "p":
+            # top_mass: float, requested cumulative probability mass, accepted as 0.9 or 90%.
+            mass_text = command_parts[2]
+            try:
+                top_mass = float(mass_text[:-1]) / 100.0 if mass_text.endswith("%") else float(mass_text)
+            except ValueError:
+                print("Top-p mass must be between 0 and 1, or a percent such as 90%.")
+                continue
+            if not 0.0 < top_mass <= 1.0:
+                print("Top-p mass must be greater than 0 and at most 1.")
+                continue
+            # sorted_probabilities/sorted_ids: CPU float32 probabilities and ids in descending rank order.
+            sorted_probabilities, sorted_ids = torch.sort(candidate_distribution, descending=True)
+            # cumulative_mass: CPU float32 [vocabulary], accumulated probability mass by rank.
+            cumulative_mass = torch.cumsum(sorted_probabilities, dim=0)
+            display_count = min(
+                candidate_distribution.numel(),
+                int(torch.searchsorted(cumulative_mass, top_mass).item()) + 1,
+            )
+        else:
+            print("Use n, n k count, or n p mass (for example: 27 k 20 or 27 p 0.9).")
+            continue
+        # top_probabilities/top_token_ids: CPU vectors [display_count], selected ranked candidate distribution.
+        if len(command_parts) == 3 and command_parts[1].lower() == "p":
+            top_probabilities = sorted_probabilities[:display_count]
+            top_token_ids = sorted_ids[:display_count]
+        else:
+            top_probabilities, top_token_ids = torch.topk(candidate_distribution, k=display_count)
+        # position_options: list[tuple[int, float]], ranked candidate ids and their full-distribution probabilities.
+        position_options = [
+            (int(candidate_id), float(candidate_probability))
+            for candidate_id, candidate_probability in zip(top_token_ids, top_probabilities)
+        ]
         while True:
+            print(f"\nTop candidates at position [{position}]:")
+            for rank, (candidate_id, probability) in enumerate(position_options, start=1):
+                # candidate_text: str, decoded candidate token piece with whitespace visible.
+                candidate_text = input_adapter.tokenizer.decode(
+                    [candidate_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                print(f"[{rank}] {candidate_text!r}  p={probability:.4f}")
             try:
                 command = input(
-                    f"Candidate: n [i|t [c]] or n + c (n=1-{len(position_options)}), "
-                    "b to list positions, q to finish: "
+                    f"Candidate: n [i|t [c]], n + c, or n replace [c] (n=1-{len(position_options)}), "
+                    "h for help, b to list positions, q to finish: "
                 ).strip().lower().split()
             except EOFError:
-                return
+                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
             if command == ["q"]:
-                return
+                return {"action": "answer_replaced", "assistant_text": current_assistant_text} if answer_was_replaced else None
             if command == ["b"]:
                 break
+            if command == ["h"]:
+                print("Use n or n i for image scores, n t for all prior text scores, n t c for the latest c, n + c to preview a continuation, n replace [c] to replace and regenerate, b to return, q to exit.")
+                continue
             if not command or not command[0].isdigit() or len(command) > 3:
-                print("Use n, n i, n t, n t c, n + c, b, or q.")
+                print("Use n, n i, n t, n t c, n + c, n replace [c], b, or q.")
                 continue
             # candidate_rank: int, one-based rank in the top candidate list for the selected assistant position.
             candidate_rank = int(command[0])
             if not 1 <= candidate_rank <= len(position_options):
                 print(f"Choose a candidate rank from 1 to {len(position_options)}.")
                 continue
+            if len(command) >= 2 and command[1] == "replace":
+                if len(command) == 3 and (not command[2].isdigit() or int(command[2]) < 1):
+                    print("Use `n replace c` with a positive continuation token limit.")
+                    continue
+                if len(command) > 3:
+                    print("Use `n replace` or `n replace c`.")
+                    continue
+                # replacement_suffix_limit: int, optional continuation cap after replacement; default uses remaining total cap.
+                replacement_suffix_limit = (
+                    int(command[2]) if len(command) == 3 else max(0, max_new_tokens - position)
+                )
+                # replacement_token_id: torch.Tensor, device-local long [1, 1], selected alternative at this position.
+                replacement_token_id = torch.tensor(
+                    [[position_options[candidate_rank - 1][0]]],
+                    device=prompt_embeds.device,
+                    dtype=torch.long,
+                )
+                # preceding_token_ids: torch.Tensor, device-local long [1, preceding_generated_tokens].
+                preceding_token_ids = generated_ids[:, : position - 1]
+                # replacement_prefix_embeds: torch.Tensor, [1, prompt_plus_preceding_tokens, hidden] before replacement.
+                replacement_prefix_embeds = prompt_embeds
+                if preceding_token_ids.shape[1] > 0:
+                    # preceding_token_embeds: torch.Tensor, device-local [1, preceding_generated_tokens, hidden].
+                    preceding_token_embeds = input_adapter.model.get_input_embeddings()(preceding_token_ids)
+                    replacement_prefix_embeds = torch.cat(
+                        (prompt_embeds, preceding_token_embeds), dim=1
+                    )
+                # replacement_prefix_attention: torch.Tensor, bool [1, prompt_plus_preceding_tokens].
+                replacement_prefix_attention = torch.cat(
+                    (
+                        prompt_attention_mask,
+                        torch.ones(
+                            (1, preceding_token_ids.shape[1]),
+                            dtype=prompt_attention_mask.dtype,
+                            device=prompt_attention_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                # replacement_prefix_with_token: torch.Tensor, [1, prefix_tokens + 1, hidden], context including candidate.
+                replacement_prefix_with_token = torch.cat(
+                    (
+                        replacement_prefix_embeds,
+                        input_adapter.model.get_input_embeddings()(replacement_token_id),
+                    ),
+                    dim=1,
+                )
+                # replacement_attention: torch.Tensor, bool [1, prefix_tokens + 1], valid selected-token context.
+                replacement_attention = torch.cat(
+                    (
+                        replacement_prefix_attention,
+                        torch.ones_like(replacement_prefix_attention[:, :1]),
+                    ),
+                    dim=1,
+                )
+                # replacement_eos_ids: set[int], EOS markers for stopping regenerated continuation tokens.
+                replacement_eos_id = getattr(input_adapter.model.config, "eos_token_id", None)
+                if replacement_eos_id is None:
+                    replacement_eos_id = input_adapter.tokenizer.eos_token_id
+                replacement_eos_ids = set(replacement_eos_id) if isinstance(replacement_eos_id, (tuple, list)) else (
+                    {replacement_eos_id} if replacement_eos_id is not None else set()
+                )
+                if int(replacement_token_id[0, 0]) in replacement_eos_ids:
+                    replacement_suffix_limit = 0
+                # replacement_suffix_ids/distributions: generated continuation and per-position CPU distributions.
+                replacement_suffix_ids, replacement_suffix_distributions = generate_candidate_continuation(
+                    input_adapter.model,
+                    input_adapter.model.get_input_embeddings(),
+                    replacement_prefix_with_token,
+                    replacement_attention,
+                    replacement_suffix_limit,
+                    replacement_eos_ids,
+                )
+                # replacement_suffix_tensor: device-local long [1, regenerated_suffix_tokens].
+                replacement_suffix_tensor = torch.tensor(
+                    [replacement_suffix_ids], device=generated_ids.device, dtype=generated_ids.dtype
+                )
+                # updated_generated_ids: device-local long [1, prefix + replacement + regenerated suffix].
+                updated_generated_ids = torch.cat(
+                    (
+                        preceding_token_ids,
+                        replacement_token_id,
+                        replacement_suffix_tensor,
+                    ),
+                    dim=1,
+                )
+                # replacement_distribution: CPU float32 [vocabulary], original conditional distribution at this position.
+                replacement_distribution = position_distributions[position - 1]
+                # updated_position_distributions: per-position CPU probability vectors aligned with updated_generated_ids.
+                updated_position_distributions = (
+                    position_distributions[: position - 1]
+                    + [replacement_distribution]
+                    + replacement_suffix_distributions
+                )
+                # generated_ids/token_ids/distributions: replace displayed answer sequence and return screen to all tokens.
+                generated_ids = updated_generated_ids
+                token_ids = generated_ids[0].tolist()
+                position_distributions = updated_position_distributions
+                answer_was_replaced = True
+                current_assistant_text = input_adapter.tokenizer.decode(
+                    generated_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False
+                ).strip()
+                print(f"Replaced position [{position}] and regenerated: {current_assistant_text}")
+                log(f"GENERATED ASSISTANT (candidate replacement): {current_assistant_text}", level="normal")
+                break
             if len(command) >= 2 and command[1] == "+":
                 if len(command) != 3 or not command[2].isdigit() or int(command[2]) < 1:
                     print("Use `n + c` with a positive continuation length c.")
@@ -682,7 +993,7 @@ def inspect_generated_token_positions(
                     {model_eos_id} if model_eos_id is not None else set()
                 )
                 # selected_suffix_ids: list[int], greedy counterfactual tokens following the selected candidate.
-                selected_suffix_ids = generate_candidate_continuation(
+                selected_suffix_ids, _ = generate_candidate_continuation(
                     input_adapter.model,
                     input_adapter.model.get_input_embeddings(),
                     selected_prefix_embeds,
@@ -1066,6 +1377,18 @@ def parse_args() -> argparse.Namespace:
         help="Maximum generated assistant tokens for generate and interactive modes.",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Temperature used by interactive stochastic regeneration (default: 0.8).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Nucleus probability mass used by interactive stochastic regeneration (default: 0.9).",
+    )
+    parser.add_argument(
         "--save-dir",
         type=Path,
         default=None,
@@ -1123,6 +1446,10 @@ def main() -> int:
             raise ValueError("calibration_samples must be a positive integer")
         if not isinstance(args.max_new_tokens, int) or args.max_new_tokens < 1:
             raise ValueError("--max-new-tokens must be a positive integer")
+        if not math.isfinite(args.temperature) or args.temperature <= 0:
+            raise ValueError("--temperature must be a finite positive number")
+        if not math.isfinite(args.top_p) or not 0.0 < args.top_p <= 1.0:
+            raise ValueError("--top-p must be greater than 0 and at most 1")
         if seed is not None and not isinstance(seed, int):
             raise ValueError("calibration_seed must be an integer or null")
         if args.save_dir is not None:
@@ -1263,6 +1590,8 @@ def main() -> int:
                             heatmap_only=args.heatmap_only,
                             scale=args.scale,
                             score_normalization=args.score_normalization,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
                         )
                     finally:
                         # active_sample["capture_enabled"]: bool, re-enable hooks for the answer-scoring forward.

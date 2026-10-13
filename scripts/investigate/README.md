@@ -79,11 +79,17 @@ The gradient investigation's interactive terminal has two screens:
 
 - **All-token screen** — shows the generated assistant answer as numbered
   tokens with their probabilities. Selecting a position opens its candidate
-  screen.
+  screen. This screen also owns answer regeneration, initial-question editing,
+  and the choice of how many candidates to display for a position. Commands
+  include `n`, `n k count`, and `n p mass` for selection; `r` or `r s` to
+  regenerate greedily or stochastically; and `e` to replace the initial
+  question and regenerate.
 - **Candidate screen** — shows the top candidate tokens and probabilities for
-  the selected answer position. Candidate inspection, gradient plots, and
-  continuation comparisons belong to this screen. Inspecting a candidate keeps
-  the user at the same position; returning goes back to the all-token screen.
+  the selected answer position. Candidate inspection, gradient plots,
+  continuation comparisons, and replacing the current token belong to this
+  screen. Inspecting a candidate keeps the user at the same position; replacing
+  it regenerates the rest of the answer and returns to the all-token screen;
+  `b` returns without replacing it.
 
 Plots and large-image views are visualizations opened from the candidate
 screen, not additional terminal screens. Keep the terminal flow organized
@@ -182,20 +188,30 @@ model paths, or output locations.
   prompt, then score that generated reply; the sentence is printed in both
   normal and extensive logging. Generation stops at the model's EOS token or
   the `--max-new-tokens` cap (default 128); there is no custom semantic stopping
-  criterion. Use `--answer-mode interactive` to generate the complete answer
-  first, then inspect the top ten candidates at any numbered token position.
-  First choose an assistant position from the all-token list. At that
-  position's top-candidate list, enter `n` to plot candidate rank n's image
-  scores (the default), `n i` for image explicitly, `n t` for all prior
-  text-token scores, or `n t c` for only the latest c prior text tokens. Enter
-  `n + c` to print the next c greedy tokens after candidate n is selected,
-  alongside the original token and its original continuation; this branch view
-  prints text only and does not plot gradients. The chosen candidate is plotted
-  in a separate image or text figure for the other commands. After
-  inspecting a candidate, the interface stays at that assistant position;
-  enter another candidate command, `b` to return to the token list, `i` to open
-  the input image in a large window, or `q` to finish. These gradient maps are
-  diagnostic clues, not a standalone
+  criterion. Use `--answer-mode interactive` for the two-screen token browser.
+  On the all-token screen, enter `n` for the default top 10 candidates at
+  position n, `n k count` for top-k, or `n p mass` for candidates covering a
+  cumulative probability mass such as `0.9` or `90%`. Enter `r` to regenerate
+  greedily, `r s` to regenerate with stochastic nucleus sampling, or `e` to
+  replace the initial question and choose greedy or stochastic generation.
+  The display command `n p mass` uses the untempered model probabilities;
+  `--top-p` controls sampling during `r s` or stochastic question regeneration.
+  Stochastic regeneration uses `--temperature` (default 0.8) and `--top-p`
+  (default 0.9). On the candidate screen, n is the candidate rank: enter `n`
+  or `n i` for image scores, `n t` for all prior text-token scores, or `n t c`
+  for the latest c prior text tokens. Enter `n + c` to print the next c greedy
+  tokens after candidate n is selected, alongside the original token and its
+  original continuation. This branch view prints text only and does not plot
+  gradients. Enter `n replace` to use candidate n as the current token and
+  greedily regenerate the rest of the answer up to the original total token
+  cap. Add a positive count, `n replace c`, to cap the newly generated suffix
+  at c tokens. This returns to the all-token screen with the updated answer.
+  The other candidate commands plot the selected candidate in a separate image
+  or text figure. After an inspection, the interface stays at the same
+  position; use `h` for candidate-screen help, `b` to return to the
+  token list, `i` to open the input image in a large window, or `q` to finish.
+  `h` on the all-token screen prints its command summary. These gradient maps
+  are diagnostic clues, not a standalone
   hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
