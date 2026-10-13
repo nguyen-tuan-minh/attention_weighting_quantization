@@ -234,7 +234,7 @@ def _generate_assistant_once(
                 next_token_id = torch.multinomial(sampling_probabilities, num_samples=1).reshape(1, 1)
             else:
                 # next_token_id: torch.Tensor, device-local long [1, 1], greedy highest-probability token.
-                next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)
+                next_token_id = next_token_logits.argmax(dim=-1).reshape(1, 1)
             generated_token_ids.append(next_token_id)
             if int(next_token_id[0, 0]) in eos_token_ids:
                 break
