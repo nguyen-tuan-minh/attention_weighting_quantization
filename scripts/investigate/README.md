@@ -73,6 +73,22 @@ follow each phase and trace how inputs become saved results:
   mutate shared state, write files, or display plots. Keep cleanup visible,
   especially hook removal in `finally` blocks.
 
+### Interactive terminal convention
+
+The gradient investigation's interactive terminal has two screens:
+
+- **All-token screen** — shows the generated assistant answer as numbered
+  tokens with their probabilities. Selecting a position opens its candidate
+  screen.
+- **Candidate screen** — shows the top candidate tokens and probabilities for
+  the selected answer position. Candidate inspection, gradient plots, and
+  continuation comparisons belong to this screen. Inspecting a candidate keeps
+  the user at the same position; returning goes back to the all-token screen.
+
+Plots and large-image views are visualizations opened from the candidate
+screen, not additional terminal screens. Keep the terminal flow organized
+around these two screens as their features grow.
+
 ## Configuration files
 
 Use these shared configs by default, with CLI paths available to override them:
