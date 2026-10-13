@@ -643,7 +643,7 @@ def generate_candidate_continuation(
             # next_probabilities: torch.Tensor, device-local float [vocabulary], raw model distribution for this step.
             next_probabilities = torch.softmax(branch_outputs.logits[0, -1].float(), dim=-1)
             # next_token_id: torch.Tensor, device-local long [1, 1], greedy continuation token.
-            next_token_id = next_probabilities.argmax(dim=-1, keepdim=True)
+            next_token_id = next_probabilities.argmax(dim=-1).reshape(1, 1)
             # branch_distributions: append CPU float32 [vocabulary] probabilities aligned to the emitted token.
             branch_distributions.append(next_probabilities.detach().cpu())
             # next_token_value: int, emitted token id used for EOS comparison and decoding.
