@@ -180,6 +180,15 @@ model paths, or output locations.
 - `investigate_assistant_attention.py`: measures assistant answer-token attention
   to image and non-image text keys, then saves per-layer percentages as a
   stacked graph and CSV.
+- `investigate_overlap.py`: for each selected COCO ShareGPT4V pair, first
+  greedily generates an assistant answer with no gradients or attention-map
+  retention, then frees that generation cache before a gradient-enabled,
+  teacher-forced pass. It compares per-image-token IGA (attention averaged over
+  generated assistant queries and heads) against the root-sum-square gradient
+  of the mean generated-answer CE with respect to each selected layer's value
+  projection. It reports the intersection count between each metric's top
+  `--top-percent` image tokens (ceil of the requested fraction), and saves a
+  per-sample/layer CSV plus a graph of mean overlap count.
 - `investigate_grad_important.py`: computes assistant answer-token CE one token
   at a time, backpropagates each token loss to a selected activation at every
   decoder layer, sums squared gradients over hidden dimensions and answer tokens for each image
@@ -241,6 +250,24 @@ python scripts/investigate/investigate_assistant_attention.py \
   --log-level extensive \
   --quiet-warnings
 ```
+
+Compare the top 10% of IGA and value-cache gradient scores on 128 greedy
+generated COCO answers, for decoder layers 22–25:
+
+```bash
+python scripts/investigate/investigate_overlap.py \
+  --samples 128 \
+  --layers 22 23 24 25 \
+  --top-percent 10 \
+  --log-level extensive \
+  --quiet-warnings
+```
+
+The graph and companion CSV default to `data/processed/investigate_overlap.png`
+and `.csv`. Use `--output PATH` to change the destination, and `--no-display`
+to save the graph without opening a window. Greedy answers are generated one at
+a time before the scoring forward to keep the generation KV cache out of the
+gradient pass.
 
 Display only the gradient heatmaps for two samples (no files are written):
 
