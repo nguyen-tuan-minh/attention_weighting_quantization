@@ -136,6 +136,51 @@ tensor's device. Keep the original adapter tensors on their expected devices
 when passing inputs to the model. This avoids errors such as `Expected all
 tensors to be on the same device`.
 
+## Resource and memory conventions
+
+For new investigations that accumulate large CPU-side measurements, prefer a
+run that finishes using disk space over one that exhausts system RAM. Provide a
+disk-offload option and use a configurable RAM reserve threshold. Interpret a
+10% threshold as **less than 10% of system RAM available** (about 90% used),
+not 10% utilization. Check available memory before retaining the next large
+detached result, so offload begins before a large allocation pushes the
+process over the limit.
+
+- Use `--offload-to-disk` to enable threshold-based spilling,
+  `--ram-reserve-percent` to set the available-RAM threshold (default `10`),
+  and `--offload-dir` to select the destination. Scripts that normally retain
+  large captures should enable offload by default and offer an explicit opt-out;
+  small scripts may leave it opt-in.
+- Offload completed, detached measurements or sample chunks; do not move a
+  live autograd graph to disk. Keep the current sample's tensors in memory only
+  as long as the computation needs them, then write the reduced results and
+  release their references.
+- Make the reserve percentage and offload directory configurable through the
+  script config and/or CLI. Use predictable per-script output paths and record
+  enough metadata to recover tensor shapes, dtypes, layers, and sample IDs.
+- When no offload directory is specified, use a unique run-specific temporary
+  directory and remove it during normal cleanup after analysis. Preserve a
+  user-specified `--offload-dir`; never recursively delete a shared or
+  pre-existing directory. Keep final graphs, CSVs, and other requested outputs
+  outside the temporary offload directory.
+- Write bounded chunks instead of collecting the full dataset and spilling it
+  only at the end. If analysis needs the spilled data, read it in chunks or use
+  memory mapping rather than loading the complete store back into RAM.
+- Check that the destination is writable and has space before starting a large
+  run. If offload cannot proceed, give a clear error with the path and a
+  practical alternative such as reducing samples or selecting fewer layers;
+  never silently keep accumulating CPU tensors until the process is killed.
+- Log when offloading starts and how many samples/chunks have been written.
+  Extensive logging may include available and total RAM; normal logging should
+  stay concise. `--quiet-warnings` must not hide offload errors.
+
+Offload is for retained analysis data, not a substitute for reducing a live
+model forward or gradient graph that exceeds available memory. For those cases,
+use smaller batches or process one sample at a time. Existing investigation
+scripts do not need to be changed just to adopt this convention; apply it when
+adding or substantially extending a script that retains enough data to risk
+RAM exhaustion.
+
 ## Common command-line options
 
 Unless an investigation has a clear reason to differ, provide:
