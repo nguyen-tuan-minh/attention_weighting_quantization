@@ -123,6 +123,26 @@ tokenizer = wrapper._tokenizer
 
 The loader uses QIG's LMMS-Eval `llava` adapter, so call it from `.venv` after running setup.
 
+### Evaluate benchmark performance
+
+[`scripts/evaluate_model.py`](scripts/evaluate_model.py) runs benchmark evaluation through the companion LMMS-Eval package. By default it evaluates the five benchmarks used in the QIG paper: VizWiz, MMMU, ChartQA, AI2D, and image-based ScienceQA. LMMS-Eval uses each task's configured score: normalized exact match for VizWiz, MMMU accuracy, relaxed accuracy for ChartQA, and exact match for AI2D and ScienceQA. These are reported individually; the QIG paper also reports their arithmetic mean as `Avg.`. Evaluation uses the task configurations shipped with the local LMMS-Eval checkout.
+
+Evaluate the base model from `configs/model.yaml`:
+
+```bash
+.venv/bin/python scripts/evaluate_model.py
+```
+
+Evaluate a QIG checkpoint using the same benchmark tasks:
+
+```bash
+.venv/bin/python scripts/evaluate_model.py \
+  --pretrained models/quantized/llava-1.5-7b-qig-w4g128 \
+  --output-dir outputs/evaluations/llava-qig-w4g128
+```
+
+The default output directory is a timestamped folder under `outputs/evaluations/`. Use `--tasks` to select another comma-separated set of registered LMMS-Eval tasks, `--batch-size` to adjust memory use, and `--log-samples` to save per-example outputs. `--limit 8` is useful for checking that the environment and model adapter work; limited runs are not benchmark results. For reproducible comparisons, use the same task IDs, model prompt settings, seed, and LMMS-Eval checkout for each model. The QIG paper's five benchmarks are evaluated on the task splits selected in its LMMS-Eval protocol; dataset versions and metric details are controlled by the installed task configs.
+
 Compare a saved QIG checkpoint with its base model on the exact calibration records used for quantization:
 
 ```bash
