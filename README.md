@@ -143,19 +143,6 @@ Evaluate a QIG checkpoint using the same benchmark tasks:
 
 The default output directory is a timestamped folder under `outputs/evaluations/`. Use `--tasks` to select another comma-separated set of registered LMMS-Eval tasks, `--batch-size` to adjust memory use, and `--log-samples` to save per-example outputs. `--limit 8` is useful for checking that the environment and model adapter work; limited runs are not benchmark results. For reproducible comparisons, use the same task IDs, model prompt settings, seed, and LMMS-Eval checkout for each model. The QIG paper's five benchmarks are evaluated on the task splits selected in its LMMS-Eval protocol; dataset versions and metric details are controlled by the installed task configs.
 
-For GPUs that cannot hold the model and generation cache together, pass `--max-memory-gpu` and `--max-memory-cpu` to enable automatic GPU/CPU placement. Any remaining weights are offloaded to disk. The script creates a temporary offload directory inside the result folder and removes it after evaluation; pass `--offload-dir` to keep weights in a specified directory instead. Disk offloading can make inference substantially slower. For example, on a 15 GiB GPU:
-
-```bash
-.venv/bin/python scripts/evaluate_model.py \
-  --tasks ai2d \
-  --batch-size 1 \
-  --max-memory-gpu 9GiB \
-  --max-memory-cpu 4GiB \
-  --model-args attn_implementation=sdpa
-```
-
-The LLaVA adapter logs the number of model modules placed on GPU, CPU, and disk. LMMS-Eval now exits with a nonzero status when a task fails, including CUDA out-of-memory errors.
-
 Pass `--remove-new-task-data` to evaluate tasks one at a time and remove newly created files from the Hugging Face Hub and datasets caches after each task. Cache files and directories already present before a task are preserved, as is the Hub cache for the selected model. The option can make a full run slower because LMMS-Eval starts the model once per task. It honors `HF_HOME`, `HF_HUB_CACHE`, and `HF_DATASETS_CACHE` when set.
 
 Compare a saved QIG checkpoint with its base model on the exact calibration records used for quantization:

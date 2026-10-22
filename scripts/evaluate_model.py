@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -39,9 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", default=PAPER_TASKS, help=f"Comma-separated LMMS-Eval task IDs (default: {PAPER_TASKS}).")
     parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size; use 1 for LLaVA 1.5 compatibility.")
     parser.add_argument("--device", default=None, help="Evaluation device, for example cuda:0.")
-    parser.add_argument("--max-memory-gpu", default=None, help='GPU memory cap for automatic placement, for example "10GiB".')
-    parser.add_argument("--max-memory-cpu", default=None, help='CPU memory cap for automatic placement, for example "4GiB".')
-    parser.add_argument("--offload-dir", type=Path, default=None, help="Directory for model weights offloaded to disk; requires automatic device placement.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: outputs/evaluations/<timestamp>).")
     parser.add_argument("--limit", type=float, default=None, help="Limit examples per task for a smoke run; do not use for reported metrics.")
     parser.add_argument("--seed", default="42", help="LMMS-Eval seed (single integer or four comma-separated seeds).")
@@ -156,24 +151,6 @@ def main() -> int:
             model_args.append(f"{key}={value}")
     if args.model_args:
         model_args.append(args.model_args.strip().strip(","))
-    generated_offload_dir = None
-    offload_dir = repository_path(args.offload_dir) if args.offload_dir is not None else None
-    if args.offload_dir is None and (args.max_memory_gpu is not None or args.max_memory_cpu is not None):
-        generated_offload_dir = Path(
-            tempfile.mkdtemp(prefix="model-offload-", dir=output_dir)
-        )
-        offload_dir = generated_offload_dir
-    if args.max_memory_gpu is not None or args.max_memory_cpu is not None or offload_dir is not None:
-        # A memory cap implies automatic placement even if the model config
-        # selects a single CUDA device.
-        model_args.append("device_map=auto")
-    if args.max_memory_gpu is not None:
-        model_args.append(f"max_memory_gpu={args.max_memory_gpu}")
-    if args.max_memory_cpu is not None:
-        model_args.append(f"max_memory_cpu={args.max_memory_cpu}")
-    if offload_dir is not None:
-        offload_dir.mkdir(parents=True, exist_ok=True)
-        model_args.append(f"offload_folder={offload_dir}")
 
     command = [
         sys.executable,
@@ -201,8 +178,6 @@ def main() -> int:
 
     print(f"Model: {pretrained}", flush=True)
     print(f"LMMS-Eval results: {output_dir}", flush=True)
-    if offload_dir is not None:
-        print(f"Model disk offload: {offload_dir}", flush=True)
     print("LMMS-Eval reports each task's configured metric; metrics differ by benchmark.", flush=True)
     try:
         if not args.remove_new_task_data:
@@ -241,9 +216,6 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Evaluation interrupted.", file=sys.stderr)
         return 130
-    finally:
-        if generated_offload_dir is not None:
-            shutil.rmtree(generated_offload_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

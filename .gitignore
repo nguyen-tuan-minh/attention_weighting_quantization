@@ -185,14 +185,5 @@ cython_debug/
 /models/
 /third_party/QIG/3rdparty/LLaVA-NeXT/
 /third_party/QIG/3rdparty/lmms-eval/
-# Keep the small local LMMS-Eval adapter changes needed by evaluate_model.py.
-!/third_party/QIG/3rdparty/lmms-eval/
-/third_party/QIG/3rdparty/lmms-eval/*
-!/third_party/QIG/3rdparty/lmms-eval/lmms_eval/
-/third_party/QIG/3rdparty/lmms-eval/lmms_eval/*
-!/third_party/QIG/3rdparty/lmms-eval/lmms_eval/models/
-/third_party/QIG/3rdparty/lmms-eval/lmms_eval/models/*
-!/third_party/QIG/3rdparty/lmms-eval/lmms_eval/models/llava.py
-!/third_party/QIG/3rdparty/lmms-eval/lmms_eval/__main__.py
 # Legacy environment path from the previous setup; current scripts use .venv.
 /.venv-qig/
