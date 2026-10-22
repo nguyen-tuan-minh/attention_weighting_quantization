@@ -10,6 +10,9 @@ input activation for every decoder layer** to disk. Each layer's Hessian is
 then accumulated from those saved activations in a disk-backed float32 memmap;
 outputs from quantized layers are not propagated into later layers. Quantization
 loads one linear's Hessian at a time onto the GPU for GPTQ factorization.
+`--hessian-token-scope all` (the default) uses every valid image and text token
+position. Set it to `text` to exclude image positions; this uses the adapter's
+vision mask and attention mask, so padding is excluded as well.
 
 Example on a 15 GiB GPU:
 
@@ -19,6 +22,7 @@ Example on a 15 GiB GPU:
   --samples 128 \
   --bits 4 \
   --group-size 128 \
+  --hessian-token-scope text \
   --max-memory-gpu 10GiB \
   --max-memory-cpu 2GiB
 ```

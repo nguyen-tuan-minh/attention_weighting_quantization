@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4)
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument(
+        "--hessian-token-scope", choices=("all", "text"), default="all",
+        help="Accumulate Hessians from all valid tokens or only non-image text tokens.",
+    )
     parser.add_argument("--damp", type=float, default=0.01)
     parser.add_argument("--max-memory-gpu", default="10GiB")
     parser.add_argument("--max-memory-cpu", default="2GiB")
@@ -101,7 +105,14 @@ def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
     return {name: module for name, module in block.named_modules() if isinstance(module, nn.Linear)}
 
 
-def disk_hessian_hook(path: Path, width: int, tile: int, counts: dict[str, int], key: str):
+def disk_hessian_hook(
+    path: Path,
+    width: int,
+    tile: int,
+    counts: dict[str, int],
+    key: str,
+    token_selection: dict[str, torch.Tensor | None],
+):
     """Accumulate X'X in a float32 disk memmap using bounded GPU tiles."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
@@ -114,6 +125,17 @@ def disk_hessian_hook(path: Path, width: int, tile: int, counts: dict[str, int],
         if not inputs or not torch.is_tensor(inputs[0]):
             return
         x = inputs[0].detach().reshape(-1, width).float()
+        # mask: bool[batch, sequence], selecting only token rows used in H.
+        mask = token_selection["mask"]
+        if mask is not None:
+            flat_mask = mask.reshape(-1)
+            if flat_mask.numel() != x.shape[0]:
+                raise RuntimeError(
+                    f"Hessian token mask has {flat_mask.numel()} positions but {key} received {x.shape[0]} tokens"
+                )
+            x = x[flat_mask.to(device=x.device)]
+            if x.shape[0] == 0:
+                return
         counts[key] = counts.get(key, 0) + x.shape[0]
         matrix = np.memmap(path, mode="r+", dtype=np.float32, shape=(width, width))
         for row_start in range(0, width, tile):
@@ -339,18 +361,22 @@ def main() -> int:
         prepared = adapter.preprocess_data([image_value], row)
         batch = adapter.data_collator([prepared])
         inputs, kwargs = adapter.generate_input(batch)
+        # text_mask: bool[batch, sequence], excludes image positions and padding.
+        vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
+        attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
+        text_mask = attention_mask & ~vision_mask
         handles = []
-        def capture_layer(layer_index: int):
+        def capture_layer(layer_index: int, text_mask: torch.Tensor):
             def capture(_module, args_, kwargs_):
                 layer_input = args_[0].detach().cpu()
                 layer_kwargs = to_device_tree(kwargs_, torch.device("cpu"))
                 torch.save(
-                    {"hidden": layer_input, "kwargs": layer_kwargs},
+                    {"hidden": layer_input, "kwargs": layer_kwargs, "text_mask": text_mask},
                     activation_dir / f"layer-{layer_index:03d}" / f"sample-{sample_index:05d}.pt",
                 )
             return capture
         for layer_index, block in enumerate(blocks):
-            handles.append(block.register_forward_pre_hook(capture_layer(layer_index), with_kwargs=True))
+            handles.append(block.register_forward_pre_hook(capture_layer(layer_index, text_mask), with_kwargs=True))
         try:
             with torch.inference_mode():
                 model(inputs_embeds=inputs["inputs_embeds"], attention_mask=kwargs.get("attention_mask"), use_cache=False, return_dict=True)
@@ -368,6 +394,7 @@ def main() -> int:
             raise RuntimeError(f"Decoder layer {layer_index} contains no Linear modules")
         counts: dict[str, int] = {}
         hessian_paths: dict[str, Path] = {}
+        token_selection: dict[str, torch.Tensor | None] = {"mask": None}
         collect_handles = []
         layer_bytes = sum(
             linear.in_features * linear.in_features * np.dtype(np.float32).itemsize
@@ -394,7 +421,7 @@ def main() -> int:
             hessian_paths[key] = path
             collect_handles.append(
                 linear.register_forward_hook(
-                    disk_hessian_hook(path, linear.in_features, 1024, counts, key)
+                    disk_hessian_hook(path, linear.in_features, 1024, counts, key, token_selection)
                 )
             )
         log(f"Collecting layer {layer_index + 1}/{len(blocks)} Hessians (~{layer_bytes / 1024**3:.2f} GiB)")
@@ -404,15 +431,24 @@ def main() -> int:
                     activation_dir / f"layer-{layer_index:03d}" / f"sample-{sample_index:05d}.pt",
                     map_location="cpu", weights_only=False,
                 )
+                token_selection["mask"] = (
+                    saved["text_mask"] if args.hessian_token_scope == "text" else None
+                )
                 hidden = saved["hidden"].to("cuda")
                 layer_kwargs = to_device_tree(saved["kwargs"], torch.device("cuda"))
                 with torch.inference_mode():
                     block(hidden, **layer_kwargs)
                 del hidden, saved, layer_kwargs
+                token_selection["mask"] = None
                 torch.cuda.empty_cache()
         finally:
+            token_selection["mask"] = None
             for handle in collect_handles:
                 handle.remove()
+        if args.hessian_token_scope == "text":
+            empty_linears = [key for key in hessian_paths if counts.get(key, 0) == 0]
+            if empty_linears:
+                raise RuntimeError(f"No text-token activations were collected for: {', '.join(empty_linears)}")
 
         # Quantize in Accelerate's layer pre-hook, after its weights are loaded.
         # Disk-offloaded layers reload base weights on every call, so reapply
@@ -465,6 +501,7 @@ def main() -> int:
         "model_family": "llava-v1.5",
         "bits": args.bits,
         "group_size": args.group_size,
+        "hessian_token_scope": args.hessian_token_scope,
         "damp": args.damp,
         "calibration_samples": len(dataset),
         "seed": args.seed,
