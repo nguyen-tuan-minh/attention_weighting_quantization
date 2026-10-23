@@ -49,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--damp", type=float, default=0.01)
     parser.add_argument("--max-memory-gpu", default="10GiB")
     parser.add_argument("--max-memory-cpu", default="2GiB")
+    parser.add_argument(
+        "--hessian-ram-gib", type=float, default=None,
+        help="RAM budget for Hessian matrices; default None means unlimited, remaining matrices are disk-backed.",
+    )
     parser.add_argument("--offload-dir", type=Path, default=None, help="Scratch disk directory; defaults under output-dir.")
     parser.add_argument("--keep-hessians", action="store_true", help="Keep Hessian files after success for inspection/resume work.")
     parser.add_argument("--overwrite", action="store_true")
@@ -96,38 +100,19 @@ def sample_records(args: argparse.Namespace, data_config: dict[str, Any], datase
     return data.shuffle(seed=args.seed).select(range(args.samples))
 
 
-def to_device_tree(value: Any, device: torch.device) -> Any:
-    if torch.is_tensor(value):
-        return value.to(device)
-    if isinstance(value, tuple):
-        return tuple(to_device_tree(item, device) for item in value)
-    if isinstance(value, list):
-        return [to_device_tree(item, device) for item in value]
-    if isinstance(value, dict):
-        return {key: to_device_tree(item, device) for key, item in value.items()}
-    return value
-
-
 def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
     return {name: module for name, module in block.named_modules() if isinstance(module, nn.Linear)}
 
 
-def disk_hessian_hook(
-    path: Path,
+def hessian_hook(
+    hessian: np.ndarray,
     width: int,
     tile: int,
     counts: dict[str, int],
     key: str,
     token_selection: dict[str, torch.Tensor | None],
 ):
-    """Accumulate X'X in a float32 disk memmap using bounded GPU tiles."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        matrix = np.memmap(path, mode="w+", dtype=np.float32, shape=(width, width))
-        matrix[:] = 0
-        matrix.flush()
-        del matrix
-
+    """Accumulate X'X into a RAM array or disk memmap using bounded GPU tiles."""
     def capture(_module: nn.Module, inputs: tuple[Any, ...], _output: Any) -> None:
         if not inputs or not torch.is_tensor(inputs[0]):
             return
@@ -144,20 +129,99 @@ def disk_hessian_hook(
             if x.shape[0] == 0:
                 return
         counts[key] = counts.get(key, 0) + x.shape[0]
-        matrix = np.memmap(path, mode="r+", dtype=np.float32, shape=(width, width))
+        x = x.to(device="cuda", dtype=torch.float32)
         for row_start in range(0, width, tile):
             row_end = min(row_start + tile, width)
             left = x[:, row_start:row_end]
             for col_start in range(row_start, width, tile):
                 col_end = min(col_start + tile, width)
                 gram = (left.T @ x[:, col_start:col_end]).cpu().numpy()
-                matrix[row_start:row_end, col_start:col_end] += gram
+                hessian[row_start:row_end, col_start:col_end] += gram
                 if col_start != row_start:
-                    matrix[col_start:col_end, row_start:row_end] += gram.T
-        matrix.flush()
-        del matrix, x
+                    hessian[col_start:col_end, row_start:row_end] += gram.T
+        del x
 
     return capture
+
+
+def allocate_hessians(
+    blocks: Any,
+    hessian_dir: Path,
+    ram_budget_bytes: int | None,
+) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str], int, int]:
+    """Allocate Hessian matrices greedily in RAM, then as disk memmaps."""
+    linears_by_layer = [linear_layers(block) for block in blocks]
+    entries = [
+        (f"{layer_index}:{name}", linear)
+        for layer_index, linears in enumerate(linears_by_layer)
+        for name, linear in linears.items()
+    ]
+    planned: list[tuple[str, nn.Linear, int, bool]] = []
+    remaining_ram = ram_budget_bytes
+    disk_bytes = 0
+    for key, linear in entries:
+        matrix_bytes = linear.in_features * linear.in_features * np.dtype(np.float32).itemsize
+        in_ram = remaining_ram is None or matrix_bytes <= remaining_ram
+        if in_ram:
+            if remaining_ram is not None:
+                remaining_ram -= matrix_bytes
+        else:
+            disk_bytes += matrix_bytes
+        planned.append((key, linear, matrix_bytes, in_ram))
+
+    hessian_dir.mkdir(parents=True, exist_ok=True)
+    free_disk = shutil.disk_usage(hessian_dir).free
+    if free_disk < disk_bytes * 1.1:
+        raise OSError(
+            f"Disk-backed Hessians need about {disk_bytes / 1024**3:.1f} GiB plus temporary space; "
+            f"only {free_disk / 1024**3:.1f} GiB is free at {hessian_dir}"
+        )
+
+    hessians: dict[str, np.ndarray] = {}
+    paths: dict[str, Path] = {}
+    placement: dict[str, str] = {}
+    for key, linear, _matrix_bytes, in_ram in planned:
+        if in_ram:
+            hessians[key] = np.zeros((linear.in_features, linear.in_features), dtype=np.float32)
+            placement[key] = "ram"
+            continue
+        layer_index, name = key.split(":", 1)
+        path = hessian_dir / f"layer-{int(layer_index):03d}-{name.replace('.', '_')}.f32"
+        path.unlink(missing_ok=True)
+        hessians[key] = np.memmap(
+            path, mode="w+", dtype=np.float32,
+            shape=(linear.in_features, linear.in_features),
+        )
+        paths[key] = path
+        placement[key] = "disk"
+    ram_bytes = (
+        sum(matrix_bytes for _, _, matrix_bytes, in_ram in planned if in_ram)
+        if ram_budget_bytes is None
+        else ram_budget_bytes - remaining_ram
+    )
+    log(
+        f"Hessian storage: {ram_bytes / 1024**3:.2f} GiB RAM, "
+        f"{disk_bytes / 1024**3:.2f} GiB disk"
+    )
+    return hessians, paths, placement, ram_bytes, disk_bytes
+
+
+def flush_disk_hessians(hessians: dict[str, np.ndarray]) -> None:
+    """Flush all disk-backed Hessian arrays after calibration collection."""
+    for hessian in hessians.values():
+        if isinstance(hessian, np.memmap):
+            hessian.flush()
+
+
+def release_hessian(key: str, hessians: dict[str, np.ndarray], paths: dict[str, Path], keep: bool) -> None:
+    """Release one matrix after it has been quantized; optionally delete its file."""
+    hessian = hessians.pop(key, None)
+    if isinstance(hessian, np.memmap):
+        hessian.flush()
+        hessian._mmap.close()
+    path = paths.get(key)
+    if path is not None and not keep:
+        path.unlink(missing_ok=True)
 
 
 def pack_codes(codes: torch.Tensor, bits: int) -> torch.Tensor:
@@ -207,23 +271,21 @@ def dequantize_entry(entry: dict[str, Any], device: torch.device, dtype: torch.d
 
 def quantize_linear_gptq(
     layer: nn.Linear,
-    hessian_path: Path,
+    hessian: np.ndarray,
     token_count: int,
     *,
     bits: int,
     group_size: int,
     damp: float,
 ) -> dict[str, Any]:
-    """Classic dense-Hessian GPTQ for one Linear; H is disk-backed until use."""
+    """Classic dense-Hessian GPTQ for one Linear; H is copied to GPU for use."""
     storage_device = layer.weight.device
     device = torch.device("cuda", torch.cuda.current_device())
     if storage_device != device:
         layer.weight.data = layer.weight.data.to(device)
     width = layer.in_features
-    mapped = np.memmap(hessian_path, mode="r", dtype=np.float32, shape=(width, width))
-    # Only this Linear's Hessian is resident during factorization.
-    h = torch.from_numpy(np.array(mapped, copy=True)).to(device=device, dtype=torch.float32)
-    del mapped
+    # Only this Linear's Hessian is resident on GPU during factorization.
+    h = torch.from_numpy(np.array(hessian, copy=True)).to(device=device, dtype=torch.float32)
     h.mul_(2.0 / max(token_count, 1))
     dead = h.diagonal() == 0
     if dead.any():
@@ -315,6 +377,8 @@ def main() -> int:
         raise ValueError("--samples must be positive")
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
+    if args.hessian_ram_gib is not None and args.hessian_ram_gib < 0:
+        raise ValueError("--hessian-ram-gib must be nonnegative")
     if args.damp < 0:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
@@ -351,156 +415,141 @@ def main() -> int:
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
     blocks = model.model.layers
     log(f"Model has {len(blocks)} decoder layers; device map: {getattr(model, 'hf_device_map', {})}")
-
-    # Capture each decoder block's original base-model input and kwargs while
-    # the model's own multimodal path handles image tokens and positional data.
-    activation_dir = offload_dir / "activations"
-    activation_dir.mkdir(parents=True, exist_ok=True)
-    for layer_index in range(len(blocks)):
-        (activation_dir / f"layer-{layer_index:03d}").mkdir(parents=True, exist_ok=True)
-    for sample_index, sample in enumerate(dataset):
-        image_value = sample["image"]
-        if isinstance(image_value, dict):
-            image_value = Image.open(image_value["path"]).convert("RGB")
-        elif hasattr(image_value, "convert"):
-            image_value = image_value.convert("RGB")
-        row = {"conversations": sample["conversations"], "id": str(sample.get("id", sample_index)), "image": "local"}
-        prepared = adapter.preprocess_data([image_value], row)
-        batch = adapter.data_collator([prepared])
-        inputs, kwargs = adapter.generate_input(batch)
-        # text_mask: bool[batch, sequence], excludes image positions and padding.
-        vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
-        attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
-        text_mask = attention_mask & ~vision_mask
-        handles = []
-        def capture_layer(layer_index: int, text_mask: torch.Tensor):
-            def capture(_module, args_, kwargs_):
-                layer_input = args_[0].detach().cpu()
-                layer_kwargs = to_device_tree(kwargs_, torch.device("cpu"))
-                torch.save(
-                    {"hidden": layer_input, "kwargs": layer_kwargs, "text_mask": text_mask},
-                    activation_dir / f"layer-{layer_index:03d}" / f"sample-{sample_index:05d}.pt",
-                )
-            return capture
-        for layer_index, block in enumerate(blocks):
-            handles.append(block.register_forward_pre_hook(capture_layer(layer_index, text_mask), with_kwargs=True))
-        try:
-            with torch.inference_mode():
-                model(inputs_embeds=inputs["inputs_embeds"], attention_mask=kwargs.get("attention_mask"), use_cache=False, return_dict=True)
-        finally:
-            for handle in handles:
-                handle.remove()
-        del inputs, kwargs, batch, prepared, image_value
-        log(f"Captured base-model activations {sample_index + 1}/{len(dataset)}")
-
-    # Process decoder blocks in order, but use each layer's saved original
-    # base-model activations independently. Quantized outputs are not propagated.
-    for layer_index, block in enumerate(blocks):
-        linears = linear_layers(block)
+    linears_by_layer = [linear_layers(block) for block in blocks]
+    for layer_index, linears in enumerate(linears_by_layer):
         if not linears:
             raise RuntimeError(f"Decoder layer {layer_index} contains no Linear modules")
-        counts: dict[str, int] = {}
-        hessian_paths: dict[str, Path] = {}
-        token_selection: dict[str, torch.Tensor | None] = {"mask": None}
-        collect_handles = []
-        layer_bytes = sum(
-            linear.in_features * linear.in_features * np.dtype(np.float32).itemsize
-            for linear in linears.values()
-        )
-        if args.keep_hessians:
-            remaining_bytes = sum(
-                module.in_features * module.in_features * np.dtype(np.float32).itemsize
-                for later_block in blocks[layer_index:]
-                for module in linear_layers(later_block).values()
-            )
-        else:
-            remaining_bytes = layer_bytes
-        free_disk = shutil.disk_usage(hessian_dir).free
-        if free_disk < remaining_bytes * 1.1:
-            raise OSError(
-                f"Layer {layer_index} Hessians need up to {remaining_bytes / 1024**3:.2f} GiB plus temporary space; "
-                f"only {free_disk / 1024**3:.2f} GiB is free at {hessian_dir}"
-            )
+    ram_budget_bytes = (
+        None if args.hessian_ram_gib is None else int(args.hessian_ram_gib * (1024**3))
+    )
+    hessians, hessian_paths, hessian_placement, ram_bytes, disk_bytes = allocate_hessians(
+        blocks, hessian_dir, ram_budget_bytes
+    )
+    counts: dict[str, int] = {}
+    token_selection: dict[str, torch.Tensor | None] = {"mask": None}
+    collect_handles = []
+    for layer_index, linears in enumerate(linears_by_layer):
         for name, linear in linears.items():
             key = f"{layer_index}:{name}"
-            path = hessian_dir / f"layer-{layer_index:03d}-{name.replace('.', '_')}.f32"
-            path.unlink(missing_ok=True)
-            hessian_paths[key] = path
             collect_handles.append(
                 linear.register_forward_hook(
-                    disk_hessian_hook(path, linear.in_features, 1024, counts, key, token_selection)
+                    hessian_hook(
+                        hessians[key], linear.in_features, 1024, counts, key, token_selection
+                    )
                 )
             )
-        log(f"Collecting layer {layer_index + 1}/{len(blocks)} Hessians (~{layer_bytes / 1024**3:.2f} GiB)")
-        try:
-            for sample_index in range(len(dataset)):
-                saved = torch.load(
-                    activation_dir / f"layer-{layer_index:03d}" / f"sample-{sample_index:05d}.pt",
-                    map_location="cpu", weights_only=False,
-                )
-                token_selection["mask"] = (
-                    saved["text_mask"] if args.hessian_token_scope == "text" else None
-                )
-                hidden = saved["hidden"].to("cuda")
-                layer_kwargs = to_device_tree(saved["kwargs"], torch.device("cuda"))
-                with torch.inference_mode():
-                    block(hidden, **layer_kwargs)
-                del hidden, saved, layer_kwargs
-                token_selection["mask"] = None
-                torch.cuda.empty_cache()
-        finally:
-            token_selection["mask"] = None
-            for handle in collect_handles:
-                handle.remove()
-        if args.hessian_token_scope == "text":
-            empty_linears = [key for key in hessian_paths if counts.get(key, 0) == 0]
-            if empty_linears:
-                raise RuntimeError(f"No text-token activations were collected for: {', '.join(empty_linears)}")
 
-        # Quantize in Accelerate's layer pre-hook, after its weights are loaded.
-        # Disk-offloaded layers reload base weights on every call, so reapply
-        # the already-saved quantized overlay on subsequent calibration samples.
-        quantized = {"done": False}
+    # One unquantized full-model forward per sample accumulates every layer's
+    # Hessian online. Only Hessian matrices are retained; token activations are
+    # consumed by the hooks and discarded immediately.
+    log(f"Collecting original-model Hessians from {len(dataset)} samples")
+    try:
+        for sample_index, sample in enumerate(dataset):
+            image_value = sample["image"]
+            if isinstance(image_value, dict):
+                image_value = Image.open(image_value["path"]).convert("RGB")
+            elif hasattr(image_value, "convert"):
+                image_value = image_value.convert("RGB")
+            row = {
+                "conversations": sample["conversations"],
+                "id": str(sample.get("id", sample_index)),
+                "image": "local",
+            }
+            prepared = adapter.preprocess_data([image_value], row)
+            batch = adapter.data_collator([prepared])
+            inputs, kwargs = adapter.generate_input(batch)
+            # mask: bool[batch, sequence], optionally selecting text tokens only.
+            vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
+            attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
+            token_selection["mask"] = (
+                attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
+            )
+            try:
+                with torch.inference_mode():
+                    model(
+                        inputs_embeds=inputs["inputs_embeds"],
+                        attention_mask=kwargs.get("attention_mask"),
+                        use_cache=False,
+                        return_dict=True,
+                    )
+            finally:
+                token_selection["mask"] = None
+            del inputs, kwargs, batch, prepared, image_value
+            log(f"Accumulated Hessians from sample {sample_index + 1}/{len(dataset)}")
+    finally:
+        token_selection["mask"] = None
+        for handle in collect_handles:
+            handle.remove()
+    flush_disk_hessians(hessians)
+    if args.hessian_token_scope == "text":
+        empty_linears = [key for key in hessians if counts.get(key, 0) == 0]
+        if empty_linears:
+            raise RuntimeError(f"No text-token activations were collected for: {', '.join(empty_linears)}")
+
+    quantized_layers: set[int] = set()
+    quantize_handles = []
+    for layer_index, (block, linears) in enumerate(zip(blocks, linears_by_layer)):
         overlay_path = overlay_dir / f"decoder-{layer_index:03d}.pt"
-        def quantize_or_restore(_module, _args, layer_index=layer_index, linears=linears, quantized=quantized, overlay_path=overlay_path):
-            if quantized["done"]:
-                state = torch.load(overlay_path, map_location="cpu", weights_only=True)
-                for name, entry in state.items():
-                    parameter = linears[name].weight
-                    parameter.data.copy_(dequantize_entry(entry, parameter.device, parameter.dtype))
-                return
+
+        def quantize_layer(
+            _module,
+            _args,
+            layer_index=layer_index,
+            linears=linears,
+            overlay_path=overlay_path,
+        ):
             state = {}
             for name, linear in linears.items():
                 key = f"{layer_index}:{name}"
-                entry = quantize_linear_gptq(
-                    linear, hessian_paths[key], counts.get(key, 0),
-                    bits=args.bits, group_size=args.group_size, damp=args.damp,
+                state[name] = quantize_linear_gptq(
+                    linear,
+                    hessians[key],
+                    counts.get(key, 0),
+                    bits=args.bits,
+                    group_size=args.group_size,
+                    damp=args.damp,
                 )
-                state[name] = entry
-                if not args.keep_hessians:
-                    hessian_paths[key].unlink(missing_ok=True)
                 log(f"Quantized layer {layer_index + 1}/{len(blocks)}: {name}")
+                release_hessian(key, hessians, hessian_paths, args.keep_hessians)
             temporary = overlay_path.with_suffix(".tmp")
             torch.save(state, temporary)
             os.replace(temporary, overlay_path)
-            quantized["done"] = True
+            quantized_layers.add(layer_index)
 
-        quantize_handle = block.register_forward_pre_hook(quantize_or_restore)
-        try:
-            for sample_index in range(len(dataset)):
-                saved = torch.load(
-                    activation_dir / f"layer-{layer_index:03d}" / f"sample-{sample_index:05d}.pt",
-                    map_location="cpu", weights_only=False,
-                )
-                hidden = saved["hidden"].to("cuda")
-                layer_kwargs = to_device_tree(saved["kwargs"], torch.device("cuda"))
-                with torch.inference_mode():
-                    block(hidden, **layer_kwargs)
-                del hidden, saved, layer_kwargs
-                torch.cuda.empty_cache()
-            log(f"Finished quantized layer {layer_index + 1}/{len(blocks)}")
-        finally:
-            quantize_handle.remove()
+        quantize_handles.append(block.register_forward_pre_hook(quantize_layer))
+
+    # This one forward loads each offloaded decoder layer, allowing its hook to
+    # quantize and save it. The Hessians above all came from base-model forwards.
+    first_sample = dataset[0]
+    image_value = first_sample["image"]
+    if isinstance(image_value, dict):
+        image_value = Image.open(image_value["path"]).convert("RGB")
+    elif hasattr(image_value, "convert"):
+        image_value = image_value.convert("RGB")
+    row = {
+        "conversations": first_sample["conversations"],
+        "id": str(first_sample.get("id", 0)),
+        "image": "local",
+    }
+    prepared = adapter.preprocess_data([image_value], row)
+    batch = adapter.data_collator([prepared])
+    inputs, kwargs = adapter.generate_input(batch)
+    try:
+        with torch.inference_mode():
+            model(
+                inputs_embeds=inputs["inputs_embeds"],
+                attention_mask=kwargs.get("attention_mask"),
+                use_cache=False,
+                return_dict=True,
+            )
+    finally:
+        for handle in quantize_handles:
+            handle.remove()
+    del inputs, kwargs, batch, prepared, image_value
+    if len(quantized_layers) != len(blocks):
+        raise RuntimeError(
+            f"Quantized {len(quantized_layers)} of {len(blocks)} decoder layers during finalization"
+        )
 
     metadata = {
         "format": "attention-quantization-gptq-packed-overlay-v1",
@@ -509,6 +558,14 @@ def main() -> int:
         "bits": args.bits,
         "group_size": args.group_size,
         "hessian_token_scope": args.hessian_token_scope,
+        "hessian_ram_budget_gib": args.hessian_ram_gib,
+        "hessian_ram_used_gib": ram_bytes / (1024**3),
+        "hessian_disk_used_gib": disk_bytes / (1024**3),
+        "hessian_disk_files": (
+            [str(path.relative_to(offload_dir)) for path in hessian_paths.values()]
+            if args.keep_hessians else []
+        ),
+        "hessian_placement": hessian_placement,
         "damp": args.damp,
         "calibration_samples": len(dataset),
         "seed": args.seed,
@@ -516,8 +573,6 @@ def main() -> int:
         "load_note": "Load the base model with the same architecture, then call apply_overlay(model, output_dir / 'layers').",
     }
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    if activation_dir.exists():
-        shutil.rmtree(activation_dir)
     if not args.keep_hessians and hessian_dir.exists():
         shutil.rmtree(hessian_dir)
     shutil.rmtree(offload_dir / "model", ignore_errors=True)
