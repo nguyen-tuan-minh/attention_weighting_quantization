@@ -81,7 +81,7 @@ def sample_records(args: argparse.Namespace, data_config: dict[str, Any], datase
     data = load_sharegpt4v_dataset(
         source=data_config.get("calibration_source", "coco"),
         config_path=dataset_config_path,
-        download_images=False,
+        download_images=True,
         existing_images_only=True,
     )
     if args.samples < 1 or args.samples > len(data):

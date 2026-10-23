@@ -35,6 +35,12 @@ a scratch location with sufficient free space. Calibration activations can
 also consume substantial disk space, especially with many samples and image
 tokens.
 
+Before sampling, the script downloads the configured calibration image source
+if the local image subset is missing or incomplete. For COCO, the default
+`configs/dataset.yaml` setting downloads the full `train2017.zip` archive,
+extracts up to 1,024 images, then removes the archive. Change `max_images` in
+that config to control the extracted subset; existing extracted images are kept.
+
 The output is a **packed weight overlay**, not a standalone Hugging Face
 checkpoint. It stores quantized decoder Linear weights and their scales/zero
 points under `layers/`; the original model checkpoint stays untouched. Load
