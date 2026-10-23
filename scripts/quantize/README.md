@@ -40,6 +40,10 @@ if the local image subset is missing or incomplete. For COCO, the default
 `configs/dataset.yaml` setting downloads the full `train2017.zip` archive,
 extracts up to 1,024 images, then removes the archive. Change `max_images` in
 that config to control the extracted subset; existing extracted images are kept.
+Calibration samples are selected from ShareGPT4V records whose image files are
+present in that extracted subset. Local paths and file-existence checks are
+refreshed against the current `raw_dir`, rather than reused from a previous
+machine's dataset cache.
 
 The output is a **packed weight overlay**, not a standalone Hugging Face
 checkpoint. It stores quantized decoder Linear weights and their scales/zero

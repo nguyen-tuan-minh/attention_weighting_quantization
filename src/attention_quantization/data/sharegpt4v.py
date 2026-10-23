@@ -138,7 +138,13 @@ def load_sharegpt4v_dataset(
             raise ValueError(f"Unsafe ShareGPT4V image path: {reference}")
         return {"image": str((resolved_image_dir / relative_path).resolve())}
 
-    dataset = dataset.map(resolve_image_path, desc="Resolving local ShareGPT4V image paths")
+    # Resolve paths against the current machine's configured raw_dir instead
+    # of reusing absolute paths cached on another machine or in an older run.
+    dataset = dataset.map(
+        resolve_image_path,
+        desc="Resolving local ShareGPT4V image paths",
+        load_from_cache_file=False,
+    )
     if existing_images_only:
         dataset = dataset.cast_column("image", Image(decode=False))
         total_records = len(dataset)
@@ -148,7 +154,11 @@ def load_sharegpt4v_dataset(
             image_path = image_value.get("path") if isinstance(image_value, dict) else None
             return isinstance(image_path, str) and Path(image_path).is_file()
 
-        dataset = dataset.filter(image_exists, desc="Filtering to records with local images")
+        dataset = dataset.filter(
+            image_exists,
+            desc="Filtering to records with local images",
+            load_from_cache_file=False,
+        )
         print(f"Records with local images: {len(dataset):,}/{total_records:,}")
     return dataset.cast_column("image", Image(decode=True))
 

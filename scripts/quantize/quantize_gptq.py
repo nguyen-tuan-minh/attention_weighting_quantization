@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
-from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
 
 
 def log(message: str) -> None:
@@ -78,12 +78,19 @@ def resolve_checkpoint(args: argparse.Namespace, model_config: dict[str, Any]) -
 
 
 def sample_records(args: argparse.Namespace, data_config: dict[str, Any], dataset_config_path: Path):
+    source = data_config.get("calibration_source", "coco")
     data = load_sharegpt4v_dataset(
-        source=data_config.get("calibration_source", "coco"),
+        source=source,
         config_path=dataset_config_path,
         download_images=True,
         existing_images_only=True,
     )
+    if not len(data):
+        raw_dir = get_data_paths(dataset_config_path)["raw_dir"]
+        raise ValueError(
+            f"No ShareGPT4V {source!r} records match local images under {raw_dir}. "
+            "Check the extracted image paths and raw_dir in the dataset config."
+        )
     if args.samples < 1 or args.samples > len(data):
         raise ValueError(f"--samples must be in [1, {len(data)}]")
     return data.shuffle(seed=args.seed).select(range(args.samples))
