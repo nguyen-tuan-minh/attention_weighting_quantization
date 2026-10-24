@@ -7,8 +7,8 @@ configured LLaVA 1.5 checkpoint. It does not call QIG's GPTQ quantizer and does
 not modify LMMS-Eval. Accelerate handles CPU and disk weight offload: those are
 storage locations, and offloaded decoder weights are staged onto GPU 0 for
 forward execution. The script logs the storage map separately from the
-execution device and reports the size of the disk-offload cache. `--max-memory-gpu`
-and `--max-memory-cpu` constrain automatic placement; when weights do not fit
+execution device and reports the size of the disk-offload cache. `--max-model-memory-gpu`
+and `--max-model-memory-cpu` constrain automatic placement; when weights do not fit
 within those budgets, Accelerate can spill them to the disk cache in
 `--offload-dir` (or the output directory's temporary work folder). Disk access
 can make forwards substantially slower than GPU-resident weights. The script
@@ -18,11 +18,16 @@ the calibration set once per layer group (five passes for LLaVA 1.5's 32
 layers). `--hessian-group-layers` changes this tradeoff: larger groups need
 more VRAM; smaller groups require more forwards. GPU and CPU placement limits
 default to unset, so Accelerate chooses placement automatically. If you set
-`--max-memory-gpu`, leave enough VRAM beyond the resident weights for the active
+`--max-model-memory-gpu`, leave enough VRAM beyond the resident weights for the active
 Hessian group and forward workspace; reduce `--hessian-group-layers` if GPU
 allocation fails.
-`--hessian-ram-gib` controls storage after GPU accumulation. Quantized outputs
-are not used to collect Hessians.
+All model and Hessian memory limits accept `KB`, `MB`, `GB`, `TB` and binary
+`KiB`, `MiB`, `GiB`, `TiB` units. A bare number means decimal `GB`, so `10`
+equals `10GB`. `--max-hessian-memory-gpu` caps the active GPU accumulation group. Completed
+Hessians are placed in RAM up to `--max-hessian-memory-cpu`, with the remainder
+stored on disk up to `--max-hessian-memory-disk`. Each limit defaults to unset
+(no explicit cap); disk free space is checked before allocation. Quantized
+outputs are not used to collect Hessians.
 `--hessian-token-scope all` (the default) uses every valid image and text token
 position. Set it to `text` to exclude image positions; this uses the adapter's
 vision mask and attention mask, so padding is excluded as well.
@@ -37,9 +42,11 @@ Example on a 15 GiB GPU:
   --bits 4 \
   --group-size 128 \
   --hessian-token-scope text \
-  --hessian-ram-gib 0.5 \
-  --max-memory-gpu 10GiB \
-  --max-memory-cpu 2GiB \
+  --max-hessian-memory-gpu 7GB \
+  --max-hessian-memory-cpu 500MB \
+  --max-hessian-memory-disk 30GB \
+  --max-model-memory-gpu 10GB \
+  --max-model-memory-cpu 2GB \
   --log-level extensive
 ```
 
@@ -54,10 +61,9 @@ errors. This script requires CUDA for execution, so it does not expose a
 The script checks free disk space for disk-backed Hessians before calibration.
 Allow additional free space for the model disk-offload cache when the automatic
 device map places weights on disk; its size is reported after model loading.
-It does not write calibration activations to disk. The Hessian RAM budget
-defaults to `None` (unlimited), so all Hessians stay in RAM unless you set
-`--hessian-ram-gib`. For example, `--hessian-ram-gib 0.5` limits Hessians in
-RAM to 0.5 GiB and stores the remainder on disk. Disk-backed Hessians and the
+It does not write calibration activations to disk. For example,
+`--max-hessian-memory-cpu 500MB` limits stored Hessians in system RAM to 500 MB
+and places the remainder on disk, subject to the disk limit. Disk-backed Hessians and the
 temporary model cache are removed after success. Pass
 `--keep-hessians` to retain disk-backed Hessians, or `--offload-dir` to choose a
 scratch location with sufficient free space. RAM-backed Hessians are released

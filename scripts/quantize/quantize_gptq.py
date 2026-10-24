@@ -11,6 +11,7 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -60,6 +61,40 @@ def cuda_memory_summary() -> str:
     return f"CUDA memory allocated/reserved={allocated:.2f}/{reserved:.2f} GiB"
 
 
+_MEMORY_UNITS = {
+    "b": 1,
+    "kb": 10**3,
+    "mb": 10**6,
+    "gb": 10**9,
+    "tb": 10**12,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
+
+
+def parse_memory_size(value: str) -> int:
+    """Parse a memory limit to bytes; an omitted unit means decimal GB."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*((?:[kmgt]i?b)|b)?\s*", value, re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid memory size {value!r}; use a number with B, KB, MB, GB, TB, "
+            "KiB, MiB, GiB, or TiB (a bare number means GB)"
+        )
+    try:
+        amount = float(match.group(1))
+        unit = (match.group(2) or "GB").lower()
+        return int(amount * _MEMORY_UNITS[unit])
+    except (ValueError, OverflowError) as error:
+        raise argparse.ArgumentTypeError(f"invalid memory size: {value!r}") from error
+
+
+def format_memory_gb(memory_bytes: int | None) -> str:
+    """Format bytes as decimal GB for human-readable diagnostics."""
+    return "unlimited" if memory_bytes is None else f"{memory_bytes / 10**9:.2f} GB"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the quantized weight overlay.")
@@ -86,16 +121,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--damp", type=float, default=0.01, help="Relative diagonal damping for Hessian factorization.")
     parser.add_argument(
-        "--max-memory-gpu", default=None,
-        help="Optional GPU weight-placement limit (for example 5GiB); unset means no user cap.",
+        "--max-hessian-memory-gpu", type=parse_memory_size, default=None,
+        help="Maximum CUDA memory for one active Hessian group; accepts KB/MB/GB/TB or KiB/MiB/GiB/TiB (bare number means GB).",
     )
     parser.add_argument(
-        "--max-memory-cpu", default=None,
-        help="Optional CPU weight-placement limit (for example 16GiB); unset means no user cap.",
+        "--max-hessian-memory-cpu", type=parse_memory_size, default=None,
+        help="Maximum system RAM for stored Hessians; excess uses disk. Units KB/MB/GB/TB or KiB/MiB/GiB/TiB; bare number means GB.",
     )
     parser.add_argument(
-        "--hessian-ram-gib", type=float, default=None,
-        help="RAM budget for Hessian matrices; default None means unlimited, remaining matrices are disk-backed.",
+        "--max-hessian-memory-disk", type=parse_memory_size, default=None,
+        help="Maximum disk space for stored Hessians. Units KB/MB/GB/TB or KiB/MiB/GiB/TiB; bare number means GB.",
+    )
+    parser.add_argument(
+        "--max-model-memory-gpu", type=parse_memory_size, default=None,
+        help="Optional GPU weight-placement limit; supports KB/MB/GB/TB or KiB/MiB/GiB/TiB (bare number means GB).",
+    )
+    parser.add_argument(
+        "--max-model-memory-cpu", type=parse_memory_size, default=None,
+        help="Optional CPU weight-placement limit; supports KB/MB/GB/TB or KiB/MiB/GiB/TiB (bare number means GB).",
     )
     parser.add_argument("--offload-dir", type=Path, default=None, help="Scratch disk directory; defaults under output-dir.")
     parser.add_argument("--keep-hessians", action="store_true", help="Keep Hessian files after success for inspection/resume work.")
@@ -189,6 +232,7 @@ def allocate_hessians(
     blocks: Any,
     hessian_dir: Path,
     ram_budget_bytes: int | None,
+    disk_budget_bytes: int | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str], int, int]:
     """Allocate Hessian matrices greedily in RAM, then as disk memmaps."""
     linears_by_layer = [linear_layers(block) for block in blocks]
@@ -216,6 +260,11 @@ def allocate_hessians(
         raise OSError(
             f"Disk-backed Hessians need about {disk_bytes / 1024**3:.1f} GiB plus temporary space; "
             f"only {free_disk / 1024**3:.1f} GiB is free at {hessian_dir}"
+        )
+    if disk_budget_bytes is not None and disk_bytes > disk_budget_bytes:
+        raise OSError(
+            f"Disk-backed Hessians need {format_memory_gb(disk_bytes)}, exceeding "
+            f"--max-hessian-memory-disk={format_memory_gb(disk_budget_bytes)}"
         )
 
     hessians: dict[str, np.ndarray] = {}
@@ -431,8 +480,6 @@ def main() -> int:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
         raise ValueError("--hessian-group-layers must be positive")
-    if args.hessian_ram_gib is not None and args.hessian_ram_gib < 0:
-        raise ValueError("--hessian-ram-gib must be nonnegative")
     if args.damp < 0:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
@@ -451,7 +498,10 @@ def main() -> int:
     log(
         f"Configuration: bits={args.bits}, group_size={args.group_size}, samples={args.samples}, "
         f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, damp={args.damp}, "
-        f"Hessian RAM budget={args.hessian_ram_gib if args.hessian_ram_gib is not None else 'unlimited'} GiB"
+        f"Hessian memory limits GPU/CPU/disk="
+        f"{format_memory_gb(args.max_hessian_memory_gpu)}/"
+        f"{format_memory_gb(args.max_hessian_memory_cpu)}/"
+        f"{format_memory_gb(args.max_hessian_memory_disk)}"
     )
     log(
         f"Resolved configuration: model_config={args.model_config}, dataset_config={args.dataset_config}, "
@@ -476,10 +526,10 @@ def main() -> int:
     overlay_dir = output_dir / "layers"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     max_memory = {}
-    if args.max_memory_gpu is not None:
-        max_memory[0] = args.max_memory_gpu
-    if args.max_memory_cpu is not None:
-        max_memory["cpu"] = args.max_memory_cpu
+    if args.max_model_memory_gpu is not None:
+        max_memory[0] = args.max_model_memory_gpu
+    if args.max_model_memory_cpu is not None:
+        max_memory["cpu"] = args.max_model_memory_cpu
     log(
         f"Loading checkpoint with Accelerate offload; forward execution device is CUDA "
         f"(GPU 0), weights may be stored on GPU/CPU/disk; "
@@ -512,11 +562,10 @@ def main() -> int:
     for layer_index, linears in enumerate(linears_by_layer):
         if not linears:
             raise RuntimeError(f"Decoder layer {layer_index} contains no Linear modules")
-    ram_budget_bytes = (
-        None if args.hessian_ram_gib is None else int(args.hessian_ram_gib * (1024**3))
-    )
+    ram_budget_bytes = args.max_hessian_memory_cpu
+    disk_budget_bytes = args.max_hessian_memory_disk
     hessians, hessian_paths, hessian_placement, ram_bytes, disk_bytes = allocate_hessians(
-        blocks, hessian_dir, ram_budget_bytes
+        blocks, hessian_dir, ram_budget_bytes, disk_budget_bytes
     )
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
     token_selection: dict[str, torch.Tensor | None] = {"mask": None}  # CPU bool [batch, sequence] mask, or None.
@@ -564,6 +613,21 @@ def main() -> int:
             for layer_index in range(group_start, group_end)
             for name in linears_by_layer[layer_index]
         ]
+        group_hessian_bytes = sum(
+            linear.in_features**2 * np.dtype(np.float32).itemsize
+            for layer_index in range(group_start, group_end)
+            for linear in linears_by_layer[layer_index].values()
+        )
+        if (
+            args.max_hessian_memory_gpu is not None
+            and group_hessian_bytes > args.max_hessian_memory_gpu
+        ):
+            raise RuntimeError(
+                f"GPU Hessian group {group_start + 1}-{group_end} needs "
+                f"{format_memory_gb(group_hessian_bytes)}, exceeding "
+                f"--max-hessian-memory-gpu={format_memory_gb(args.max_hessian_memory_gpu)}; "
+                "reduce --hessian-group-layers"
+            )
         group_hessians = {
             key: torch.zeros(
                 (next(linear.in_features for layer_index in range(group_start, group_end)
@@ -767,8 +831,12 @@ def main() -> int:
         "bits": args.bits,
         "group_size": args.group_size,
         "hessian_token_scope": args.hessian_token_scope,
-        "hessian_ram_budget_gib": args.hessian_ram_gib,
-        "hessian_ram_used_gib": ram_bytes / (1024**3),
+        "hessian_memory_limits_gib": {
+            "gpu_bytes": args.max_hessian_memory_gpu,
+            "cpu_bytes": args.max_hessian_memory_cpu,
+            "disk_bytes": args.max_hessian_memory_disk,
+        },
+        "hessian_cpu_used_gib": ram_bytes / (1024**3),
         "hessian_disk_used_gib": disk_bytes / (1024**3),
         "hessian_disk_files": (
             [str(path.relative_to(offload_dir)) for path in hessian_paths.values()]
