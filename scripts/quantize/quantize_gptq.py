@@ -652,6 +652,8 @@ def main() -> int:
             index, start, end, keys, byte_count, disk_chunk = spec
             if active_hessians:
                 raise RuntimeError("A Hessian group is still active when the next group begins")
+            if LOG_LEVEL == "extensive":
+                torch.cuda.synchronize()
             load_started = time.monotonic()
             if disk_chunk is not None:
                 offset, elements = disk_chunk
@@ -671,37 +673,59 @@ def main() -> int:
                 for key in keys:
                     host_matrix = np.array(hessians[key], copy=True)
                     active_hessians[key] = torch.from_numpy(host_matrix).to(device="cuda")
+            if LOG_LEVEL == "extensive":
+                torch.cuda.synchronize()
+            load_elapsed = time.monotonic() - load_started
+            load_rate = byte_count / (1024**2) / max(load_elapsed, 1e-9)
             log(
                 f"Loaded Hessian group {start + 1}-{end}/{len(blocks)} "
                 f"({byte_count / 1024**3:.2f} GiB) "
                 f"{'as one contiguous disk chunk' if disk_chunk is not None else 'from configured RAM/disk backing'} to GPU "
-                f"in {time.monotonic() - load_started:.1f}s; {cuda_memory_summary()}",
+                f"in {load_elapsed:.1f}s ({load_rate:.1f} MiB/s end-to-end); {cuda_memory_summary()}",
                 level="extensive",
             )
 
         def save_group(_module, _inputs, _output, spec=group_specs[-1]):
             index, start, end, keys, _byte_count, disk_chunk = spec
-            save_started = time.monotonic()
             torch.cuda.synchronize()
+            save_started = time.monotonic()
+            device_copy_elapsed = 0.0
+            storage_write_elapsed = 0.0
             if disk_chunk is not None:
                 offset, elements = disk_chunk
+                copy_started = time.monotonic()
+                cpu_chunk = active_chunk["value"].cpu()
+                device_copy_elapsed = time.monotonic() - copy_started
                 disk_view = np.memmap(
                     hessian_paths[keys[0]], mode="r+", dtype=np.float32,
                     offset=offset, shape=(elements,),
                 )
-                disk_view[:] = active_chunk["value"].cpu().numpy()
+                write_started = time.monotonic()
+                disk_view[:] = cpu_chunk.numpy()
                 disk_view.flush()
+                storage_write_elapsed = time.monotonic() - write_started
                 del disk_view
+                del cpu_chunk
                 active_chunk["value"] = None
             else:
                 for key in keys:
-                    hessians[key][:] = active_hessians[key].cpu().numpy()
+                    copy_started = time.monotonic()
+                    cpu_matrix = active_hessians[key].cpu()
+                    device_copy_elapsed += time.monotonic() - copy_started
+                    write_started = time.monotonic()
+                    hessians[key][:] = cpu_matrix.numpy()
                     if isinstance(hessians[key], np.memmap):
                         hessians[key].flush()
+                    storage_write_elapsed += time.monotonic() - write_started
+                    del cpu_matrix
             active_hessians.clear()
+            save_elapsed = time.monotonic() - save_started
+            rate = _byte_count / (1024**2) / max(save_elapsed, 1e-9)
             log(
-                f"Saved Hessian group {start + 1}-{end}/{len(blocks)} to configured RAM/disk backing "
-                f"in {time.monotonic() - save_started:.1f}s; {cuda_memory_summary()}",
+                f"Saved Hessian group {start + 1}-{end}/{len(blocks)} "
+                f"({rate:.1f} MiB/s end-to-end): GPU-to-host={device_copy_elapsed:.1f}s, "
+                f"storage write/flush={storage_write_elapsed:.1f}s, total={save_elapsed:.1f}s; "
+                f"{cuda_memory_summary()}",
                 level="extensive",
             )
 

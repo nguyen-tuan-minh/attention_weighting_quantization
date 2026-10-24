@@ -53,6 +53,24 @@ tensor's device. Keep the original adapter tensors on their expected devices
 when passing inputs to the model. This avoids errors such as `Expected all
 tensors to be on the same device`.
 
+## Timing expensive operations
+
+Before implementing a script, identify operations likely to dominate runtime or
+resource use: dataset/model downloads and loading, preprocessing, model forwards,
+large tensor computations, CPU/GPU transfers, disk reads/writes, and serialization.
+Measure these stages separately with a monotonic clock and log their elapsed time
+at `extensive` verbosity. For long-running work, include periodic progress at
+`normal` verbosity so a run does not appear stalled.
+
+Include enough context to guide the next compute decision: item or layer range,
+shape or byte count, device or storage tier, completed/total work, and effective
+throughput when meaningful. Keep timings for unlike stages separate (for example,
+GPU-to-host copy versus disk flush) instead of reporting one combined duration.
+Synchronize CUDA around wall-clock measurements of asynchronous GPU work, or use
+CUDA events, so reported times include the operation being measured. Avoid adding
+extra synchronization to normal execution unless timing is enabled or the
+synchronization is required for correct progress reporting.
+
 ## Common command-line options
 
 Use consistent options when they apply; a script does not need to expose an
