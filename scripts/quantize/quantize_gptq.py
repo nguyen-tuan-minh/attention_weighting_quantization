@@ -236,8 +236,8 @@ def allocate_hessians(
     hessian_dir: Path,
     ram_budget_bytes: int | None,
     disk_budget_bytes: int | None,
-) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str], int, int]:
-    """Allocate Hessian matrices greedily in RAM, then as disk memmaps."""
+) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str], dict[str, tuple[int, int]], int, int]:
+    """Allocate Hessians in RAM, then in one contiguous disk-backed float32 file."""
     linears_by_layer = [linear_layers(block) for block in blocks]
     entries = [
         (f"{layer_index}:{name}", linear)
@@ -273,19 +273,25 @@ def allocate_hessians(
     hessians: dict[str, np.ndarray] = {}
     paths: dict[str, Path] = {}
     placement: dict[str, str] = {}
+    offsets: dict[str, tuple[int, int]] = {}
+    disk_path = hessian_dir / "hessians.f32"
+    disk_path.unlink(missing_ok=True)
+    if disk_bytes:
+        with disk_path.open("wb") as backing_file:
+            backing_file.truncate(disk_bytes)
+    disk_offset = 0
     for key, linear, _matrix_bytes, in_ram in planned:
         if in_ram:
             hessians[key] = np.zeros((linear.in_features, linear.in_features), dtype=np.float32)
             placement[key] = "ram"
             continue
-        layer_index, name = key.split(":", 1)
-        path = hessian_dir / f"layer-{int(layer_index):03d}-{name.replace('.', '_')}.f32"
-        path.unlink(missing_ok=True)
         hessians[key] = np.memmap(
-            path, mode="w+", dtype=np.float32,
+            disk_path, mode="r+", dtype=np.float32, offset=disk_offset,
             shape=(linear.in_features, linear.in_features),
         )
-        paths[key] = path
+        paths[key] = disk_path
+        offsets[key] = (disk_offset, linear.in_features**2)
+        disk_offset += _matrix_bytes
         placement[key] = "disk"
     ram_bytes = (
         sum(matrix_bytes for _, _, matrix_bytes, in_ram in planned if in_ram)
@@ -296,14 +302,11 @@ def allocate_hessians(
         f"Hessian storage: {ram_bytes / 1024**3:.2f} GiB RAM, "
         f"{disk_bytes / 1024**3:.2f} GiB disk"
     )
-    return hessians, paths, placement, ram_bytes, disk_bytes
-
-
-def flush_disk_hessians(hessians: dict[str, np.ndarray]) -> None:
-    """Flush all disk-backed Hessian arrays after calibration collection."""
-    for hessian in hessians.values():
-        if isinstance(hessian, np.memmap):
-            hessian.flush()
+    if disk_offset != disk_bytes:
+        raise RuntimeError(f"Hessian disk layout mismatch: allocated {disk_offset} of {disk_bytes} bytes")
+    if disk_bytes:
+        log(f"Disk Hessians use one contiguous file: {disk_path} ({disk_bytes / 1024**3:.2f} GiB)")
+    return hessians, paths, placement, offsets, ram_bytes, disk_bytes
 
 
 def release_hessian(key: str, hessians: dict[str, np.ndarray], paths: dict[str, Path], keep: bool) -> None:
@@ -314,7 +317,9 @@ def release_hessian(key: str, hessians: dict[str, np.ndarray], paths: dict[str, 
         hessian._mmap.close()
     path = paths.get(key)
     if path is not None and not keep:
-        path.unlink(missing_ok=True)
+        paths.pop(key, None)
+        if path not in paths.values():
+            path.unlink(missing_ok=True)
 
 
 def pack_codes(codes: torch.Tensor, bits: int) -> torch.Tensor:
@@ -567,7 +572,7 @@ def main() -> int:
             raise RuntimeError(f"Decoder layer {layer_index} contains no Linear modules")
     ram_budget_bytes = args.max_hessian_memory_cpu
     disk_budget_bytes = args.max_hessian_memory_disk
-    hessians, hessian_paths, hessian_placement, ram_bytes, disk_bytes = allocate_hessians(
+    hessians, hessian_paths, hessian_placement, hessian_offsets, ram_bytes, disk_bytes = allocate_hessians(
         blocks, hessian_dir, ram_budget_bytes, disk_budget_bytes
     )
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
@@ -610,6 +615,7 @@ def main() -> int:
     group_starts = list(range(0, len(blocks), args.hessian_group_layers))
     total_forwards = len(dataset)
     active_hessians: dict[str, torch.Tensor] = {}
+    active_chunk: dict[str, torch.Tensor | None] = {"value": None}
     group_hooks = []
     group_specs = []
     for group_index, group_start in enumerate(group_starts):
@@ -627,31 +633,71 @@ def main() -> int:
                 f"--max-hessian-memory-gpu={format_memory_gb(args.max_hessian_memory_gpu)}; "
                 "reduce --hessian-group-layers"
             )
-        group_specs.append((group_index, group_start, group_end, group_keys, group_bytes))
+        disk_layout = [hessian_offsets.get(key) for key in group_keys]
+        contiguous_disk_chunk = None
+        if disk_layout and all(item is not None for item in disk_layout):
+            chunk_start = disk_layout[0][0]
+            expected_offset = chunk_start
+            for offset, elements in disk_layout:
+                if offset != expected_offset:
+                    break
+                expected_offset += elements * np.dtype(np.float32).itemsize
+            else:
+                contiguous_disk_chunk = (chunk_start, sum(item[1] for item in disk_layout))
+        group_specs.append((
+            group_index, group_start, group_end, group_keys, group_bytes, contiguous_disk_chunk
+        ))
 
         def load_group(_module, _inputs, spec=group_specs[-1]):
-            index, start, end, keys, byte_count = spec
+            index, start, end, keys, byte_count, disk_chunk = spec
             if active_hessians:
                 raise RuntimeError("A Hessian group is still active when the next group begins")
             load_started = time.monotonic()
-            for key in keys:
-                host_matrix = np.array(hessians[key], copy=True)
-                active_hessians[key] = torch.from_numpy(host_matrix).to(device="cuda")
+            if disk_chunk is not None:
+                offset, elements = disk_chunk
+                disk_view = np.memmap(
+                    hessian_paths[keys[0]], mode="r+", dtype=np.float32,
+                    offset=offset, shape=(elements,),
+                )
+                active_chunk["value"] = torch.from_numpy(disk_view).to(device="cuda")
+                cursor = 0
+                for key in keys:
+                    matrix = hessians[key]
+                    matrix_elements = matrix.size
+                    active_hessians[key] = active_chunk["value"][cursor:cursor + matrix_elements].view(matrix.shape)
+                    cursor += matrix_elements
+                del disk_view
+            else:
+                for key in keys:
+                    host_matrix = np.array(hessians[key], copy=True)
+                    active_hessians[key] = torch.from_numpy(host_matrix).to(device="cuda")
             log(
                 f"Loaded Hessian group {start + 1}-{end}/{len(blocks)} "
-                f"({byte_count / 1024**3:.2f} GiB) from configured RAM/disk backing to GPU "
+                f"({byte_count / 1024**3:.2f} GiB) "
+                f"{'as one contiguous disk chunk' if disk_chunk is not None else 'from configured RAM/disk backing'} to GPU "
                 f"in {time.monotonic() - load_started:.1f}s; {cuda_memory_summary()}",
                 level="extensive",
             )
 
         def save_group(_module, _inputs, _output, spec=group_specs[-1]):
-            index, start, end, keys, _byte_count = spec
+            index, start, end, keys, _byte_count, disk_chunk = spec
             save_started = time.monotonic()
             torch.cuda.synchronize()
-            for key in keys:
-                hessians[key][:] = active_hessians[key].cpu().numpy()
-                if isinstance(hessians[key], np.memmap):
-                    hessians[key].flush()
+            if disk_chunk is not None:
+                offset, elements = disk_chunk
+                disk_view = np.memmap(
+                    hessian_paths[keys[0]], mode="r+", dtype=np.float32,
+                    offset=offset, shape=(elements,),
+                )
+                disk_view[:] = active_chunk["value"].cpu().numpy()
+                disk_view.flush()
+                del disk_view
+                active_chunk["value"] = None
+            else:
+                for key in keys:
+                    hessians[key][:] = active_hessians[key].cpu().numpy()
+                    if isinstance(hessians[key], np.memmap):
+                        hessians[key].flush()
             active_hessians.clear()
             log(
                 f"Saved Hessian group {start + 1}-{end}/{len(blocks)} to configured RAM/disk backing "
@@ -741,7 +787,6 @@ def main() -> int:
             handle.remove()
     for handle in execution_probe_handles:
         handle.remove()
-    flush_disk_hessians(hessians)
     token_counts = list(counts.values())
     log(
         f"Hessian collection finished in {time.monotonic() - collection_started:.1f}s; "
@@ -846,7 +891,7 @@ def main() -> int:
         "hessian_cpu_used_gib": ram_bytes / (1024**3),
         "hessian_disk_used_gib": disk_bytes / (1024**3),
         "hessian_disk_files": (
-            [str(path.relative_to(offload_dir)) for path in hessian_paths.values()]
+            sorted({str(path.relative_to(offload_dir)) for path in hessian_paths.values()})
             if args.keep_hessians else []
         ),
         "hessian_placement": hessian_placement,

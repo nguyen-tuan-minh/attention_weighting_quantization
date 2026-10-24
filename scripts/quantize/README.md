@@ -34,6 +34,11 @@ outputs are not used to collect Hessians.
 position. Set it to `text` to exclude image positions; this uses the adapter's
 vision mask and attention mask, so padding is excluded as well.
 
+Disk-backed Hessians share one contiguous `hessians.f32` file. When an active
+layer group is entirely disk-backed, the script reads and writes that group's
+Hessians as one contiguous chunk rather than issuing separate transfers for
+each Linear matrix. Mixed RAM/disk groups use per-matrix transfers.
+
 Example on a 15 GiB GPU:
 
 ```bash
