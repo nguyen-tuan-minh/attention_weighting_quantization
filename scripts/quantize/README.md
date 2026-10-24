@@ -12,11 +12,13 @@ and `--max-model-memory-cpu` constrain automatic placement; when weights do not 
 within those budgets, Accelerate can spill them to the disk cache in
 `--offload-dir` (or the output directory's temporary work folder). Disk access
 can make forwards substantially slower than GPU-resident weights. The script
-accumulates full float32 Hessians on GPU in groups of seven decoder layers,
-then copies each completed group to the configured RAM/disk backing. It replays
-the calibration set once per layer group (five passes for LLaVA 1.5's 32
-layers). `--hessian-group-layers` changes this tradeoff: larger groups need
-more VRAM; smaller groups require more forwards. GPU and CPU placement limits
+accumulates full float32 Hessians on GPU while forwarding each calibration
+sample through the model once. At each group of decoder layers, it loads that
+group's accumulated Hessians from configured RAM/disk backing to GPU, updates
+them, then writes them back before continuing. `--hessian-group-layers` is the
+number of decoder layers paged to GPU at once; larger groups need more VRAM.
+Because groups are loaded and saved for every sample, disk-backed Hessians can
+make calibration substantially slower. GPU and CPU placement limits
 default to unset, so Accelerate chooses placement automatically. If you set
 `--max-model-memory-gpu`, leave enough VRAM beyond the resident weights for the active
 Hessian group and forward workspace; reduce `--hessian-group-layers` if GPU
@@ -62,8 +64,11 @@ The script checks free disk space for disk-backed Hessians before calibration.
 Allow additional free space for the model disk-offload cache when the automatic
 device map places weights on disk; its size is reported after model loading.
 It does not write calibration activations to disk. For example,
-`--max-hessian-memory-cpu 500MB` limits stored Hessians in system RAM to 500 MB
-and places the remainder on disk, subject to the disk limit. Disk-backed Hessians and the
+`--max-hessian-memory-cpu 0` stores all persistent Hessians on disk. The active
+group is still temporarily present on GPU while being updated, and host memory
+is used briefly to transfer data between GPU and disk. For example,
+`--max-hessian-memory-cpu 500MB` keeps up to 500 MB of stored Hessians in system
+RAM and places the remainder on disk, subject to the disk limit. Disk-backed Hessians and the
 temporary model cache are removed after success. Pass
 `--keep-hessians` to retain disk-backed Hessians, or `--offload-dir` to choose a
 scratch location with sufficient free space. RAM-backed Hessians are released
