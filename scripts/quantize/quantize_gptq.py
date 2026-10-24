@@ -43,6 +43,14 @@ def summarize_device_map(device_map: dict[str, Any]) -> str:
     return ", ".join(f"{location}: {count} modules" for location, count in counts.items())
 
 
+def cuda_memory_summary() -> str:
+    if not torch.cuda.is_available():
+        return "CUDA memory unavailable"
+    allocated = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    return f"CUDA memory allocated/reserved={allocated:.2f}/{reserved:.2f} GiB"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the quantized weight overlay.")
@@ -474,6 +482,32 @@ def main() -> int:
                 )
             )
 
+    # These probes are registered after Accelerate's dispatch hooks, so their
+    # pre-forward observation shows where each layer's weights and activations
+    # reside when the layer is about to execute.
+    execution_probe_handles = []
+    for layer_index, block in enumerate(blocks):
+        def log_layer_execution(module, inputs, layer_index=layer_index):
+            if getattr(module, "_gptq_execution_logged", False):
+                return
+            module._gptq_execution_logged = True
+            input_device = (
+                str(inputs[0].device)
+                if inputs and torch.is_tensor(inputs[0])
+                else "unavailable"
+            )
+            first_parameter = next(module.parameters(), None)
+            weight_device = str(first_parameter.device) if first_parameter is not None else "none"
+            hook = getattr(module, "_hf_hook", None)
+            execution_device = getattr(hook, "execution_device", "not exposed")
+            log(
+                f"Forward execution probe decoder {layer_index + 1}/{len(blocks)}: "
+                f"input_device={input_device}, parameter_device={weight_device}, "
+                f"accelerate_execution_device={execution_device}"
+            )
+
+        execution_probe_handles.append(block.register_forward_pre_hook(log_layer_execution))
+
     # One unquantized full-model forward per sample accumulates every layer's
     # Hessian online. Only Hessian matrices are retained; token activations are
     # consumed by the hooks and discarded immediately.
@@ -482,6 +516,11 @@ def main() -> int:
     try:
         for sample_index, sample in enumerate(dataset):
             sample_started = time.monotonic()
+            log(
+                f"Sample {sample_index + 1}/{len(dataset)} starting; "
+                f"elapsed={sample_started - collection_started:.1f}s; {cuda_memory_summary()}"
+            )
+            preparation_started = time.monotonic()
             image_value = sample["image"]
             if isinstance(image_value, dict):
                 image_value = Image.open(image_value["path"]).convert("RGB")
@@ -495,6 +534,7 @@ def main() -> int:
             prepared = adapter.preprocess_data([image_value], row)
             batch = adapter.data_collator([prepared])
             inputs, kwargs = adapter.generate_input(batch)
+            preparation_elapsed = time.monotonic() - preparation_started
             # mask: bool[batch, sequence], optionally selecting text tokens only.
             vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
             attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
@@ -507,6 +547,16 @@ def main() -> int:
                 int((attention_mask & ~vision_mask).sum().item())
                 if args.hessian_token_scope == "text" else valid_tokens
             )
+            log(
+                f"Sample {sample_index + 1}/{len(dataset)} prepared in {preparation_elapsed:.1f}s; "
+                f"sequence={attention_mask.shape[-1]} tokens, valid={valid_tokens}, "
+                f"image={vision_tokens}, selected={selected_tokens}; {cuda_memory_summary()}"
+            )
+            forward_started = time.monotonic()
+            log(
+                f"Sample {sample_index + 1}/{len(dataset)} model forward starting; "
+                f"{cuda_memory_summary()}"
+            )
             try:
                 with torch.inference_mode():
                     model(
@@ -515,18 +565,25 @@ def main() -> int:
                         use_cache=False,
                         return_dict=True,
                     )
+                torch.cuda.synchronize()
             finally:
                 token_selection["mask"] = None
+            forward_elapsed = time.monotonic() - forward_started
             del inputs, kwargs, batch, prepared, image_value
+            elapsed = time.monotonic() - collection_started
+            average = elapsed / (sample_index + 1)
+            remaining = average * (len(dataset) - sample_index - 1)
             log(
-                f"Hessian sample {sample_index + 1}/{len(dataset)} complete in "
-                f"{time.monotonic() - sample_started:.1f}s; sequence={attention_mask.shape[-1]} tokens, "
-                f"valid={valid_tokens}, image={vision_tokens}, selected={selected_tokens}; "
-                f"elapsed={time.monotonic() - collection_started:.1f}s"
+                f"Sample {sample_index + 1}/{len(dataset)} complete; "
+                f"forward={forward_elapsed:.1f}s, total={time.monotonic() - sample_started:.1f}s, "
+                f"run elapsed={elapsed:.1f}s, average={average:.1f}s/sample, "
+                f"estimated remaining={remaining / 60:.1f} min; {cuda_memory_summary()}"
             )
     finally:
         token_selection["mask"] = None
         for handle in collect_handles:
+            handle.remove()
+        for handle in execution_probe_handles:
             handle.remove()
     flush_disk_hessians(hessians)
     token_counts = list(counts.values())
