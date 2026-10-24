@@ -4,8 +4,14 @@
 
 `quantize_gptq.py` is a standalone implementation of layerwise GPTQ for the
 configured LLaVA 1.5 checkpoint. It does not call QIG's GPTQ quantizer and does
-not modify LMMS-Eval. Accelerate places model weights across GPU, CPU, and the
-specified disk offload directory. It accumulates each layer's Hessian online
+not modify LMMS-Eval. Accelerate handles CPU and disk weight offload: those are
+storage locations, and offloaded decoder weights are staged onto GPU 0 for
+forward execution. The script logs the storage map separately from the
+execution device and reports the size of the disk-offload cache. `--max-memory-gpu`
+and `--max-memory-cpu` constrain automatic placement; when weights do not fit
+within those budgets, Accelerate can spill them to the disk cache in
+`--offload-dir` (or the output directory's temporary work folder). Disk access
+can make forwards substantially slower than GPU-resident weights. It accumulates each layer's Hessian online
 during unquantized base-model forwards; activations are discarded and never
 saved to disk. Hessian matrices use a configurable RAM budget, with the rest in
 disk-backed float32 memmaps; each matrix is copied to the GPU only when its
@@ -29,6 +35,8 @@ Example on a 15 GiB GPU:
 ```
 
 The script checks free disk space for disk-backed Hessians before calibration.
+Allow additional free space for the model disk-offload cache when the automatic
+device map places weights on disk; its size is reported after model loading.
 It does not write calibration activations to disk. The Hessian RAM budget
 defaults to `None` (unlimited), so all Hessians stay in RAM unless you set
 `--hessian-ram-gib`. For example, `--hessian-ram-gib 0.5` limits Hessians in

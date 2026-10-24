@@ -13,6 +13,8 @@ import json
 import os
 import shutil
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,16 @@ from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset 
 
 
 def log(message: str) -> None:
-    print(f"[gptq] {message}", flush=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"[{timestamp}] [gptq] {message}", flush=True)
+
+
+def summarize_device_map(device_map: dict[str, Any]) -> str:
+    counts: dict[str, int] = {}
+    for location in device_map.values():
+        key = str(location)
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join(f"{location}: {count} modules" for location, count in counts.items())
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,6 +384,7 @@ def apply_overlay(model: nn.Module, overlay_dir: str | Path) -> list[Any]:
 
 def main() -> int:
     args = parse_args()
+    run_started = time.monotonic()
     if args.samples < 1:
         raise ValueError("--samples must be positive")
     if args.group_size < 1:
@@ -383,6 +395,11 @@ def main() -> int:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires CUDA for layer execution and Hessian factorization")
+    log(
+        f"Configuration: bits={args.bits}, group_size={args.group_size}, samples={args.samples}, "
+        f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, damp={args.damp}, "
+        f"Hessian RAM budget={args.hessian_ram_gib if args.hessian_ram_gib is not None else 'unlimited'} GiB"
+    )
     output_dir = repository_path(args.output_dir)
     if output_dir.exists():
         if not args.overwrite:
@@ -404,8 +421,12 @@ def main() -> int:
     overlay_dir = output_dir / "layers"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     dataset = sample_records(args, data_cfg, args.dataset_config)
+    log(f"Selected {len(dataset)} calibration records from source={data_cfg.get('calibration_source', 'coco')!r}")
     max_memory = {0: args.max_memory_gpu, "cpu": args.max_memory_cpu}
-    log(f"Loading checkpoint with automatic GPU/CPU/disk placement: {checkpoint}")
+    log(
+        f"Loading checkpoint with Accelerate offload; forward execution device is CUDA "
+        f"(GPU 0), weights may be stored on GPU/CPU/disk: {checkpoint}"
+    )
     tokenizer, model, image_processor, _ = builder(
         str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
         torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
@@ -414,7 +435,21 @@ def main() -> int:
     model.eval()
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
     blocks = model.model.layers
-    log(f"Model has {len(blocks)} decoder layers; device map: {getattr(model, 'hf_device_map', {})}")
+    device_map = getattr(model, "hf_device_map", {})
+    log(
+        f"Model has {len(blocks)} decoder layers; Accelerate storage map: "
+        f"{summarize_device_map(device_map)}"
+    )
+    log(f"Full storage map: {device_map}")
+    model_offload_dir = offload_dir / "model"
+    model_offload_dir.mkdir(parents=True, exist_ok=True)
+    model_disk_bytes = sum(
+        path.stat().st_size for path in model_offload_dir.rglob("*") if path.is_file()
+    )
+    log(
+        f"Model disk-offload cache: {model_disk_bytes / 1024**3:.2f} GiB currently present "
+        f"under {model_offload_dir}; CPU and disk weights are staged to CUDA for forward execution"
+    )
     linears_by_layer = [linear_layers(block) for block in blocks]
     for layer_index, linears in enumerate(linears_by_layer):
         if not linears:
@@ -443,8 +478,10 @@ def main() -> int:
     # Hessian online. Only Hessian matrices are retained; token activations are
     # consumed by the hooks and discarded immediately.
     log(f"Collecting original-model Hessians from {len(dataset)} samples")
+    collection_started = time.monotonic()
     try:
         for sample_index, sample in enumerate(dataset):
+            sample_started = time.monotonic()
             image_value = sample["image"]
             if isinstance(image_value, dict):
                 image_value = Image.open(image_value["path"]).convert("RGB")
@@ -464,6 +501,12 @@ def main() -> int:
             token_selection["mask"] = (
                 attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
             )
+            valid_tokens = int(attention_mask.sum().item())
+            vision_tokens = int((attention_mask & vision_mask).sum().item())
+            selected_tokens = (
+                int((attention_mask & ~vision_mask).sum().item())
+                if args.hessian_token_scope == "text" else valid_tokens
+            )
             try:
                 with torch.inference_mode():
                     model(
@@ -475,12 +518,24 @@ def main() -> int:
             finally:
                 token_selection["mask"] = None
             del inputs, kwargs, batch, prepared, image_value
-            log(f"Accumulated Hessians from sample {sample_index + 1}/{len(dataset)}")
+            log(
+                f"Hessian sample {sample_index + 1}/{len(dataset)} complete in "
+                f"{time.monotonic() - sample_started:.1f}s; sequence={attention_mask.shape[-1]} tokens, "
+                f"valid={valid_tokens}, image={vision_tokens}, selected={selected_tokens}; "
+                f"elapsed={time.monotonic() - collection_started:.1f}s"
+            )
     finally:
         token_selection["mask"] = None
         for handle in collect_handles:
             handle.remove()
     flush_disk_hessians(hessians)
+    token_counts = list(counts.values())
+    log(
+        f"Hessian collection finished in {time.monotonic() - collection_started:.1f}s; "
+        f"captured {sum(token_counts):,} activation rows across {len(counts):,} Linear modules "
+        f"(per-module min/median/max={min(token_counts, default=0):,}/"
+        f"{int(np.median(token_counts)) if token_counts else 0:,}/{max(token_counts, default=0):,})"
+    )
     if args.hessian_token_scope == "text":
         empty_linears = [key for key in hessians if counts.get(key, 0) == 0]
         if empty_linears:
@@ -498,9 +553,12 @@ def main() -> int:
             linears=linears,
             overlay_path=overlay_path,
         ):
+            layer_started = time.monotonic()
+            log(f"Starting decoder layer {layer_index + 1}/{len(blocks)} ({len(linears)} Linear modules)")
             state = {}
             for name, linear in linears.items():
                 key = f"{layer_index}:{name}"
+                linear_started = time.monotonic()
                 state[name] = quantize_linear_gptq(
                     linear,
                     hessians[key],
@@ -509,12 +567,21 @@ def main() -> int:
                     group_size=args.group_size,
                     damp=args.damp,
                 )
-                log(f"Quantized layer {layer_index + 1}/{len(blocks)}: {name}")
+                log(
+                    f"Quantized decoder {layer_index + 1}/{len(blocks)} {name}: "
+                    f"shape={tuple(linear.weight.shape)}, Hessian tokens={counts.get(key, 0):,}, "
+                    f"storage={hessian_placement[key]}, elapsed={time.monotonic() - linear_started:.1f}s"
+                )
                 release_hessian(key, hessians, hessian_paths, args.keep_hessians)
             temporary = overlay_path.with_suffix(".tmp")
             torch.save(state, temporary)
             os.replace(temporary, overlay_path)
             quantized_layers.add(layer_index)
+            log(
+                f"Saved {overlay_path.name} ({overlay_path.stat().st_size / 1024**2:.1f} MiB); "
+                f"decoder layer elapsed={time.monotonic() - layer_started:.1f}s, "
+                f"completed={len(quantized_layers)}/{len(blocks)}"
+            )
 
         quantize_handles.append(block.register_forward_pre_hook(quantize_layer))
 
@@ -579,6 +646,7 @@ def main() -> int:
     if args.offload_dir is None and not args.keep_hessians:
         shutil.rmtree(offload_dir, ignore_errors=True)
     log(f"Saved GPTQ overlay: {output_dir}")
+    log(f"Run completed in {time.monotonic() - run_started:.1f}s")
     return 0
 
 
@@ -586,5 +654,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, ImportError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error ({type(exc).__name__}): {exc}", file=sys.stderr, flush=True)
         raise SystemExit(1)
