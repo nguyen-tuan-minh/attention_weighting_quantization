@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,13 +30,20 @@ sys.path.insert(0, str(ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
 
+LOG_LEVEL = "normal"
+SHOW_TIMING = False
 
-def log(message: str) -> None:
+
+def log(message: str, *, level: str = "normal") -> None:
+    levels = {"none": 0, "normal": 1, "extensive": 2}
+    if levels[level] > levels[LOG_LEVEL]:
+        return
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     print(f"[{timestamp}] [gptq] {message}", flush=True)
 
 
 def summarize_device_map(device_map: dict[str, Any]) -> str:
+    """Summarize how many modules Accelerate stores on each device."""
     counts: dict[str, int] = {}
     for location in device_map.values():
         key = str(location)
@@ -44,6 +52,7 @@ def summarize_device_map(device_map: dict[str, Any]) -> str:
 
 
 def cuda_memory_summary() -> str:
+    """Return allocated and reserved CUDA memory in GiB for progress logs."""
     if not torch.cuda.is_available():
         return "CUDA memory unavailable"
     allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -54,13 +63,19 @@ def cuda_memory_summary() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the quantized weight overlay.")
-    parser.add_argument("--model-config", type=Path, default=ROOT / "configs/model.yaml")
-    parser.add_argument("--dataset-config", type=Path, default=ROOT / "configs/dataset.yaml")
+    parser.add_argument("--model-config", type=Path, default=ROOT / "configs/model.yaml", help="Model YAML configuration.")
+    parser.add_argument("--dataset-config", type=Path, default=ROOT / "configs/dataset.yaml", help="Dataset YAML configuration.")
     parser.add_argument("--base-model", default=None, help="Override model.yaml's local checkpoint path.")
-    parser.add_argument("--samples", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4)
-    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--samples", type=int, default=None, help="Override dataset.yaml calibration_samples.")
+    parser.add_argument("--seed", type=int, default=None, help="Override dataset.yaml calibration_seed.")
+    parser.add_argument(
+        "--log-level", choices=("none", "normal", "extensive"), default="normal",
+        help="none suppresses progress; extensive adds resolved settings and execution diagnostics.",
+    )
+    parser.add_argument("--quiet-warnings", action="store_true", help="Suppress noisy Python and dependency warnings.")
+    parser.add_argument("--timing", action="store_true", help="Show timing details at normal verbosity.")
+    parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4, help="Weight precision in bits.")
+    parser.add_argument("--group-size", type=int, default=128, help="Input columns per quantization group.")
     parser.add_argument(
         "--hessian-group-layers", type=int, default=7,
         help="Decoder layers whose full Hessians stay on GPU together; calibration forwards are repeated per group.",
@@ -69,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         "--hessian-token-scope", choices=("all", "text"), default="all",
         help="Accumulate Hessians from all valid tokens or only non-image text tokens.",
     )
-    parser.add_argument("--damp", type=float, default=0.01)
+    parser.add_argument("--damp", type=float, default=0.01, help="Relative diagonal damping for Hessian factorization.")
     parser.add_argument(
         "--max-memory-gpu", default=None,
         help="Optional GPU weight-placement limit (for example 5GiB); unset means no user cap.",
@@ -84,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--offload-dir", type=Path, default=None, help="Scratch disk directory; defaults under output-dir.")
     parser.add_argument("--keep-hessians", action="store_true", help="Keep Hessian files after success for inspection/resume work.")
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--overwrite", action="store_true", help="Remove and recreate an existing output directory.")
     return parser.parse_args()
 
 
@@ -101,6 +116,7 @@ def load_runtime(qig_root: Path):
 
 
 def resolve_checkpoint(args: argparse.Namespace, model_config: dict[str, Any]) -> Path:
+    """Resolve and validate the local base-model checkpoint path."""
     configured = args.base_model or model_config.get("model_dir")
     if not configured:
         raise ValueError("Set model_dir in model.yaml or pass --base-model")
@@ -111,6 +127,7 @@ def resolve_checkpoint(args: argparse.Namespace, model_config: dict[str, Any]) -
 
 
 def sample_records(args: argparse.Namespace, data_config: dict[str, Any], dataset_config_path: Path):
+    """Load local-image calibration records and return the configured random subset."""
     source = data_config.get("calibration_source", "coco")
     data = load_sharegpt4v_dataset(
         source=source,
@@ -130,47 +147,8 @@ def sample_records(args: argparse.Namespace, data_config: dict[str, Any], datase
 
 
 def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
+    """Return decoder Linear modules keyed by their names within one block."""
     return {name: module for name, module in block.named_modules() if isinstance(module, nn.Linear)}
-
-
-def hessian_hook(
-    hessian: np.ndarray,
-    width: int,
-    tile: int,
-    counts: dict[str, int],
-    key: str,
-    token_selection: dict[str, torch.Tensor | None],
-):
-    """Accumulate X'X into a RAM array or disk memmap using bounded GPU tiles."""
-    def capture(_module: nn.Module, inputs: tuple[Any, ...], _output: Any) -> None:
-        if not inputs or not torch.is_tensor(inputs[0]):
-            return
-        x = inputs[0].detach().reshape(-1, width).float()
-        # mask: bool[batch, sequence], selecting only token rows used in H.
-        mask = token_selection["mask"]
-        if mask is not None:
-            flat_mask = mask.reshape(-1)
-            if flat_mask.numel() != x.shape[0]:
-                raise RuntimeError(
-                    f"Hessian token mask has {flat_mask.numel()} positions but {key} received {x.shape[0]} tokens"
-                )
-            x = x[flat_mask.to(device=x.device)]
-            if x.shape[0] == 0:
-                return
-        counts[key] = counts.get(key, 0) + x.shape[0]
-        x = x.to(device="cuda", dtype=torch.float32)
-        for row_start in range(0, width, tile):
-            row_end = min(row_start + tile, width)
-            left = x[:, row_start:row_end]
-            for col_start in range(row_start, width, tile):
-                col_end = min(col_start + tile, width)
-                gram = (left.T @ x[:, col_start:col_end]).cpu().numpy()
-                hessian[row_start:row_end, col_start:col_end] += gram
-                if col_start != row_start:
-                    hessian[col_start:col_end, row_start:row_end] += gram.T
-        del x
-
-    return capture
 
 
 def gpu_hessian_hook(
@@ -180,7 +158,12 @@ def gpu_hessian_hook(
     key: str,
     token_selection: dict[str, torch.Tensor | None],
 ):
-    """Accumulate the complete X'X matrix on CUDA without copying tiles to the host."""
+    """Capture a Linear input and accumulate its selected-token X'X on CUDA.
+
+    ``token_selection['mask']`` is CPU bool [batch, sequence] or None. It is
+    moved to the activation device before indexing. ``counts[key]`` accumulates
+    selected activation rows across samples for this decoder Linear.
+    """
     def capture(_module: nn.Module, inputs: tuple[Any, ...], _output: Any) -> None:
         if not inputs or not torch.is_tensor(inputs[0]):
             return
@@ -430,10 +413,20 @@ def apply_overlay(model: nn.Module, overlay_dir: str | Path) -> list[Any]:
 
 
 def main() -> int:
+    """Validate inputs, collect grouped GPU Hessians, and write the GPTQ overlay."""
+    global LOG_LEVEL, SHOW_TIMING
     args = parse_args()
+    LOG_LEVEL = args.log_level
+    SHOW_TIMING = args.timing or args.log_level == "extensive"
+    if args.quiet_warnings:
+        warnings.filterwarnings("ignore")
+        for module_name in ("transformers.utils.logging", "datasets.utils.logging", "huggingface_hub.utils.logging"):
+            try:
+                module = __import__(module_name, fromlist=["set_verbosity_error"])
+                module.set_verbosity_error()
+            except ImportError:
+                pass
     run_started = time.monotonic()
-    if args.samples < 1:
-        raise ValueError("--samples must be positive")
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
@@ -444,20 +437,33 @@ def main() -> int:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires CUDA for layer execution and Hessian factorization")
+    output_dir = repository_path(args.output_dir)
+    if output_dir.exists() and not args.overwrite:
+        raise FileExistsError(f"Output exists: {output_dir}; pass --overwrite")
+    model_cfg = read_yaml(args.model_config)
+    data_cfg = read_yaml(args.dataset_config)
+    args.samples = args.samples if args.samples is not None else data_cfg.get("calibration_samples", 128)
+    args.seed = args.seed if args.seed is not None else data_cfg.get("calibration_seed")
+    if args.samples is None:
+        args.samples = 128
+    if args.samples < 1:
+        raise ValueError("--samples must be positive")
     log(
         f"Configuration: bits={args.bits}, group_size={args.group_size}, samples={args.samples}, "
         f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, damp={args.damp}, "
         f"Hessian RAM budget={args.hessian_ram_gib if args.hessian_ram_gib is not None else 'unlimited'} GiB"
     )
-    output_dir = repository_path(args.output_dir)
+    log(
+        f"Resolved configuration: model_config={args.model_config}, dataset_config={args.dataset_config}, "
+        f"samples={args.samples}, seed={args.seed}",
+        level="extensive",
+    )
+    checkpoint = resolve_checkpoint(args, model_cfg)
+    dataset = sample_records(args, data_cfg, args.dataset_config)
+    log(f"Selected {len(dataset)} calibration records from source={data_cfg.get('calibration_source', 'coco')!r}")
     if output_dir.exists():
-        if not args.overwrite:
-            raise FileExistsError(f"Output exists: {output_dir}; pass --overwrite")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_cfg = read_yaml(args.model_config)
-    data_cfg = read_yaml(args.dataset_config)
-    checkpoint = resolve_checkpoint(args, model_cfg)
     qig_root = repository_path(model_cfg.get("implementation_source_dir", "third_party/QIG"))
     builder, get_process_model = load_runtime(qig_root)
     offload_dir = repository_path(args.offload_dir) if args.offload_dir else output_dir / ".gptq-work"
@@ -469,8 +475,6 @@ def main() -> int:
     hessian_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir = output_dir / "layers"
     overlay_dir.mkdir(parents=True, exist_ok=True)
-    dataset = sample_records(args, data_cfg, args.dataset_config)
-    log(f"Selected {len(dataset)} calibration records from source={data_cfg.get('calibration_source', 'coco')!r}")
     max_memory = {}
     if args.max_memory_gpu is not None:
         max_memory[0] = args.max_memory_gpu
@@ -494,7 +498,7 @@ def main() -> int:
         f"Model has {len(blocks)} decoder layers; Accelerate storage map: "
         f"{summarize_device_map(device_map)}"
     )
-    log(f"Full storage map: {device_map}")
+    log(f"Full storage map: {device_map}", level="extensive")
     model_offload_dir = offload_dir / "model"
     model_offload_dir.mkdir(parents=True, exist_ok=True)
     model_disk_bytes = sum(
@@ -514,8 +518,8 @@ def main() -> int:
     hessians, hessian_paths, hessian_placement, ram_bytes, disk_bytes = allocate_hessians(
         blocks, hessian_dir, ram_budget_bytes
     )
-    counts: dict[str, int] = {}
-    token_selection: dict[str, torch.Tensor | None] = {"mask": None}
+    counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
+    token_selection: dict[str, torch.Tensor | None] = {"mask": None}  # CPU bool [batch, sequence] mask, or None.
     # These probes are registered after Accelerate's dispatch hooks, so their
     # pre-forward observation shows where each layer's weights and activations
     # reside when the layer is about to execute.
@@ -537,7 +541,8 @@ def main() -> int:
             log(
                 f"Forward execution probe decoder {layer_index + 1}/{len(blocks)}: "
                 f"input_device={input_device}, parameter_device={weight_device}, "
-                f"accelerate_execution_device={execution_device}"
+                f"accelerate_execution_device={execution_device}",
+                level="extensive",
             )
 
         execution_probe_handles.append(block.register_forward_pre_hook(log_layer_execution))
@@ -783,7 +788,8 @@ def main() -> int:
     if args.offload_dir is None and not args.keep_hessians:
         shutil.rmtree(offload_dir, ignore_errors=True)
     log(f"Saved GPTQ overlay: {output_dir}")
-    log(f"Run completed in {time.monotonic() - run_started:.1f}s")
+    if SHOW_TIMING:
+        log(f"Run completed in {time.monotonic() - run_started:.1f}s")
     return 0
 
 

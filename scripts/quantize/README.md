@@ -33,13 +33,23 @@ Example on a 15 GiB GPU:
 .venv/bin/python scripts/quantize/quantize_gptq.py \
   --output-dir outputs/quantized/llava-gptq-w4g128 \
   --samples 128 \
+  --seed 42 \
   --bits 4 \
   --group-size 128 \
   --hessian-token-scope text \
   --hessian-ram-gib 0.5 \
   --max-memory-gpu 10GiB \
-  --max-memory-cpu 2GiB
+  --max-memory-cpu 2GiB \
+  --log-level extensive
 ```
+
+Without `--samples` or `--seed`, the script uses `calibration_samples` and
+`calibration_seed` from the dataset config (currently 2 and null). Use
+`--log-level none|normal|extensive` for routine, concise, or diagnostic output;
+`--timing` adds the total runtime at normal verbosity, and
+`--quiet-warnings` suppresses Python and dependency warnings without hiding
+errors. This script requires CUDA for execution, so it does not expose a
+`--device` option.
 
 The script checks free disk space for disk-backed Hessians before calibration.
 Allow additional free space for the model disk-offload cache when the automatic
