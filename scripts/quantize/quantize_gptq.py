@@ -62,12 +62,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4)
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument(
+        "--hessian-group-layers", type=int, default=7,
+        help="Decoder layers whose full Hessians stay on GPU together; calibration forwards are repeated per group.",
+    )
+    parser.add_argument(
         "--hessian-token-scope", choices=("all", "text"), default="all",
         help="Accumulate Hessians from all valid tokens or only non-image text tokens.",
     )
     parser.add_argument("--damp", type=float, default=0.01)
-    parser.add_argument("--max-memory-gpu", default="10GiB")
-    parser.add_argument("--max-memory-cpu", default="2GiB")
+    parser.add_argument(
+        "--max-memory-gpu", default=None,
+        help="Optional GPU weight-placement limit (for example 5GiB); unset means no user cap.",
+    )
+    parser.add_argument(
+        "--max-memory-cpu", default=None,
+        help="Optional CPU weight-placement limit (for example 16GiB); unset means no user cap.",
+    )
     parser.add_argument(
         "--hessian-ram-gib", type=float, default=None,
         help="RAM budget for Hessian matrices; default None means unlimited, remaining matrices are disk-backed.",
@@ -159,6 +169,35 @@ def hessian_hook(
                 if col_start != row_start:
                     hessian[col_start:col_end, row_start:row_end] += gram.T
         del x
+
+    return capture
+
+
+def gpu_hessian_hook(
+    hessian: torch.Tensor,
+    width: int,
+    counts: dict[str, int],
+    key: str,
+    token_selection: dict[str, torch.Tensor | None],
+):
+    """Accumulate the complete X'X matrix on CUDA without copying tiles to the host."""
+    def capture(_module: nn.Module, inputs: tuple[Any, ...], _output: Any) -> None:
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return
+        x = inputs[0].detach().reshape(-1, width).float()
+        mask = token_selection["mask"]
+        if mask is not None:
+            flat_mask = mask.reshape(-1)
+            if flat_mask.numel() != x.shape[0]:
+                raise RuntimeError(
+                    f"Hessian token mask has {flat_mask.numel()} positions but {key} received {x.shape[0]} tokens"
+                )
+            x = x[flat_mask.to(device=x.device)]
+            if x.shape[0] == 0:
+                return
+        counts[key] = counts.get(key, 0) + x.shape[0]
+        x = x.to(device=hessian.device, dtype=torch.float32)
+        hessian.addmm_(x.T, x)
 
     return capture
 
@@ -397,6 +436,8 @@ def main() -> int:
         raise ValueError("--samples must be positive")
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
+    if args.hessian_group_layers < 1:
+        raise ValueError("--hessian-group-layers must be positive")
     if args.hessian_ram_gib is not None and args.hessian_ram_gib < 0:
         raise ValueError("--hessian-ram-gib must be nonnegative")
     if args.damp < 0:
@@ -430,15 +471,20 @@ def main() -> int:
     overlay_dir.mkdir(parents=True, exist_ok=True)
     dataset = sample_records(args, data_cfg, args.dataset_config)
     log(f"Selected {len(dataset)} calibration records from source={data_cfg.get('calibration_source', 'coco')!r}")
-    max_memory = {0: args.max_memory_gpu, "cpu": args.max_memory_cpu}
+    max_memory = {}
+    if args.max_memory_gpu is not None:
+        max_memory[0] = args.max_memory_gpu
+    if args.max_memory_cpu is not None:
+        max_memory["cpu"] = args.max_memory_cpu
     log(
         f"Loading checkpoint with Accelerate offload; forward execution device is CUDA "
-        f"(GPU 0), weights may be stored on GPU/CPU/disk: {checkpoint}"
+        f"(GPU 0), weights may be stored on GPU/CPU/disk; "
+        f"placement limits={max_memory or 'unset (automatic)'}: {checkpoint}"
     )
     tokenizer, model, image_processor, _ = builder(
         str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
         torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-        max_memory=max_memory, offload_folder=str(offload_dir / "model"), offload_state_dict=True,
+        max_memory=max_memory or None, offload_folder=str(offload_dir / "model"), offload_state_dict=True,
     )
     model.eval()
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
@@ -470,18 +516,6 @@ def main() -> int:
     )
     counts: dict[str, int] = {}
     token_selection: dict[str, torch.Tensor | None] = {"mask": None}
-    collect_handles = []
-    for layer_index, linears in enumerate(linears_by_layer):
-        for name, linear in linears.items():
-            key = f"{layer_index}:{name}"
-            collect_handles.append(
-                linear.register_forward_hook(
-                    hessian_hook(
-                        hessians[key], linear.in_features, 1024, counts, key, token_selection
-                    )
-                )
-            )
-
     # These probes are registered after Accelerate's dispatch hooks, so their
     # pre-forward observation shows where each layer's weights and activations
     # reside when the layer is about to execute.
@@ -508,16 +542,50 @@ def main() -> int:
 
         execution_probe_handles.append(block.register_forward_pre_hook(log_layer_execution))
 
-    # One unquantized full-model forward per sample accumulates every layer's
-    # Hessian online. Only Hessian matrices are retained; token activations are
-    # consumed by the hooks and discarded immediately.
-    log(f"Collecting original-model Hessians from {len(dataset)} samples")
+    # Keep a layer group of complete Hessian matrices on CUDA. The model is
+    # replayed once per group so inactive groups do not need CPU/disk updates.
+    log(
+        f"Collecting GPU-resident Hessians for {len(dataset)} samples in groups of "
+        f"{args.hessian_group_layers} decoder layers; full calibration passes="
+        f"{(len(blocks) + args.hessian_group_layers - 1) // args.hessian_group_layers}"
+    )
     collection_started = time.monotonic()
-    try:
-        for sample_index, sample in enumerate(dataset):
+    group_starts = list(range(0, len(blocks), args.hessian_group_layers))
+    total_forwards = len(group_starts) * len(dataset)
+    for group_index, group_start in enumerate(group_starts):
+        group_end = min(group_start + args.hessian_group_layers, len(blocks))
+        group_keys = [
+            f"{layer_index}:{name}"
+            for layer_index in range(group_start, group_end)
+            for name in linears_by_layer[layer_index]
+        ]
+        group_hessians = {
+            key: torch.zeros(
+                (next(linear.in_features for layer_index in range(group_start, group_end)
+                      for name, linear in linears_by_layer[layer_index].items()
+                      if f"{layer_index}:{name}" == key),) * 2,
+                dtype=torch.float32, device="cuda",
+            )
+            for key in group_keys
+        }
+        collect_handles = []
+        for layer_index in range(group_start, group_end):
+            for name, linear in linears_by_layer[layer_index].items():
+                key = f"{layer_index}:{name}"
+                collect_handles.append(linear.register_forward_hook(
+                    gpu_hessian_hook(group_hessians[key], linear.in_features, counts, key, token_selection)
+                ))
+        log(
+            f"GPU Hessian group {group_start + 1}-{group_end}/{len(blocks)} allocated "
+            f"{sum(h.numel() * h.element_size() for h in group_hessians.values()) / (1024**3):.2f} GiB; "
+            f"{cuda_memory_summary()}"
+        )
+        group_started = time.monotonic()
+        try:
+          for sample_index, sample in enumerate(dataset):
             sample_started = time.monotonic()
             log(
-                f"Sample {sample_index + 1}/{len(dataset)} starting; "
+                f"Hessian group {group_start + 1}-{group_end}, sample {sample_index + 1}/{len(dataset)} starting; "
                 f"elapsed={sample_started - collection_started:.1f}s; {cuda_memory_summary()}"
             )
             preparation_started = time.monotonic()
@@ -548,13 +616,15 @@ def main() -> int:
                 if args.hessian_token_scope == "text" else valid_tokens
             )
             log(
-                f"Sample {sample_index + 1}/{len(dataset)} prepared in {preparation_elapsed:.1f}s; "
+                f"Hessian group {group_start + 1}-{group_end}, sample {sample_index + 1}/{len(dataset)} prepared "
+                f"in {preparation_elapsed:.1f}s; "
                 f"sequence={attention_mask.shape[-1]} tokens, valid={valid_tokens}, "
                 f"image={vision_tokens}, selected={selected_tokens}; {cuda_memory_summary()}"
             )
             forward_started = time.monotonic()
             log(
-                f"Sample {sample_index + 1}/{len(dataset)} model forward starting; "
+                f"Hessian group {group_start + 1}-{group_end}, sample {sample_index + 1}/{len(dataset)} "
+                f"model forward starting; "
                 f"{cuda_memory_summary()}"
             )
             try:
@@ -571,20 +641,30 @@ def main() -> int:
             forward_elapsed = time.monotonic() - forward_started
             del inputs, kwargs, batch, prepared, image_value
             elapsed = time.monotonic() - collection_started
-            average = elapsed / (sample_index + 1)
-            remaining = average * (len(dataset) - sample_index - 1)
+            completed_forwards = group_index * len(dataset) + sample_index + 1
+            average = elapsed / completed_forwards
+            remaining = average * (total_forwards - completed_forwards)
             log(
-                f"Sample {sample_index + 1}/{len(dataset)} complete; "
+                f"Hessian group {group_start + 1}-{group_end}, sample {sample_index + 1}/{len(dataset)} complete; "
                 f"forward={forward_elapsed:.1f}s, total={time.monotonic() - sample_started:.1f}s, "
-                f"run elapsed={elapsed:.1f}s, average={average:.1f}s/sample, "
+                f"run elapsed={elapsed:.1f}s, average={average:.1f}s/forward, "
+                f"completed forwards={completed_forwards}/{total_forwards}, "
                 f"estimated remaining={remaining / 60:.1f} min; {cuda_memory_summary()}"
             )
-    finally:
-        token_selection["mask"] = None
-        for handle in collect_handles:
-            handle.remove()
-        for handle in execution_probe_handles:
-            handle.remove()
+        finally:
+            token_selection["mask"] = None
+            for handle in collect_handles:
+                handle.remove()
+        for key, gpu_hessian in group_hessians.items():
+            hessians[key][:] = gpu_hessian.cpu().numpy()
+        del group_hessians
+        flush_disk_hessians(hessians)
+        log(
+            f"Saved Hessian group {group_start + 1}-{group_end} to configured RAM/disk backing "
+            f"in {time.monotonic() - group_started:.1f}s; {cuda_memory_summary()}"
+        )
+    for handle in execution_probe_handles:
+        handle.remove()
     flush_disk_hessians(hessians)
     token_counts = list(counts.values())
     log(

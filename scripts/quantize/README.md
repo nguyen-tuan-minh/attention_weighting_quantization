@@ -11,11 +11,18 @@ execution device and reports the size of the disk-offload cache. `--max-memory-g
 and `--max-memory-cpu` constrain automatic placement; when weights do not fit
 within those budgets, Accelerate can spill them to the disk cache in
 `--offload-dir` (or the output directory's temporary work folder). Disk access
-can make forwards substantially slower than GPU-resident weights. It accumulates each layer's Hessian online
-during unquantized base-model forwards; activations are discarded and never
-saved to disk. Hessian matrices use a configurable RAM budget, with the rest in
-disk-backed float32 memmaps; each matrix is copied to the GPU only when its
-layer is quantized. Quantized outputs are not used to collect later Hessians.
+can make forwards substantially slower than GPU-resident weights. The script
+accumulates full float32 Hessians on GPU in groups of seven decoder layers,
+then copies each completed group to the configured RAM/disk backing. It replays
+the calibration set once per layer group (five passes for LLaVA 1.5's 32
+layers). `--hessian-group-layers` changes this tradeoff: larger groups need
+more VRAM; smaller groups require more forwards. GPU and CPU placement limits
+default to unset, so Accelerate chooses placement automatically. If you set
+`--max-memory-gpu`, leave enough VRAM beyond the resident weights for the active
+Hessian group and forward workspace; reduce `--hessian-group-layers` if GPU
+allocation fails.
+`--hessian-ram-gib` controls storage after GPU accumulation. Quantized outputs
+are not used to collect Hessians.
 `--hessian-token-scope all` (the default) uses every valid image and text token
 position. Set it to `text` to exclude image positions; this uses the adapter's
 vision mask and attention mask, so padding is excluded as well.
