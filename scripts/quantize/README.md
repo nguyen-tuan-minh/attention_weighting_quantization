@@ -23,13 +23,18 @@ and `--max-model-memory-cpu` constrain automatic placement; when weights do not 
 within those budgets, Accelerate can spill them to the disk cache in
 `--offload-dir` (or the output directory's temporary work folder). Disk access
 can make forwards substantially slower than GPU-resident weights. The script
-accumulates full float32 Hessians on GPU while forwarding each calibration
-sample through the model once. At each group of decoder layers, it loads that
-group's accumulated Hessians from configured RAM/disk backing to GPU, updates
-them, then writes them back before continuing. `--hessian-group-layers` is the
-number of decoder layers paged to GPU at once; larger groups need more VRAM.
-Because groups are loaded and saved for every sample, disk-backed Hessians can
-make calibration substantially slower. GPU and CPU placement limits
+accumulates exact float32 Hessians on GPU in group passes. For each group of
+selected decoder layers, it loads that group's Hessians once, forwards all
+calibration samples while keeping the group on GPU, then saves the group once.
+It repeats model forwards for each group. With all 32 layers and the default
+`--hessian-group-layers 7`, this is 5 passes over the samples (640 forwards for
+128 samples), with a final partial group. This reduces Hessian disk writes from
+once per sample to once per group, at the cost of rereading offloaded model
+weights during repeated forwards. `--hessian-group-layers` controls the number
+of adjacent decoder layers in a group; larger groups reduce the number of
+passes and Hessian saves, but need more VRAM for active Hessians and forward
+workspace. Extensive logs report planned forwards, per-group progress, and
+load/save/forward timings. GPU and CPU placement limits
 default to unset, so Accelerate chooses placement automatically. If you set
 `--max-model-memory-gpu`, leave enough VRAM beyond the resident weights for the active
 Hessian group and forward workspace; reduce `--hessian-group-layers` if GPU
@@ -48,9 +53,12 @@ vision mask and attention mask, so padding is excluded as well.
 Disk-backed Hessians share one contiguous `hessians.f32` file. When an active
 layer group is entirely disk-backed, the script reads and writes that group's
 Hessians as one contiguous chunk rather than issuing separate transfers for
-each Linear matrix. Mixed RAM/disk groups use per-matrix transfers.
+each Linear matrix. Mixed RAM/disk groups use per-matrix transfers. Disk flush
+latency can vary by backing filesystem; group save timing separates GPU-to-host
+copy from storage write and flush time.
 
-Example on a 15 GiB GPU:
+Example for a 12 GB RAM / 15 GB GPU machine (keeps Hessian backing off CPU and
+uses four-layer GPU groups to leave room for model weights and forward workspace):
 
 ```bash
 .venv/bin/python scripts/quantize/quantize_gptq.py \
@@ -60,11 +68,12 @@ Example on a 15 GiB GPU:
   --bits 4 \
   --group-size 128 \
   --hessian-token-scope text \
-  --max-hessian-memory-gpu 7GB \
-  --max-hessian-memory-cpu 500MB \
+  --hessian-group-layers 4 \
+  --max-hessian-memory-gpu 4GB \
+  --max-hessian-memory-cpu 0GB \
   --max-hessian-memory-disk 30GB \
-  --max-model-memory-gpu 10GB \
-  --max-model-memory-cpu 2GB \
+  --max-model-memory-gpu 7GB \
+  --max-model-memory-cpu 7GB \
   --log-level extensive
 ```
 

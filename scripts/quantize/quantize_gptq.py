@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hessian-group-layers", type=int, default=7,
-        help="Decoder layers whose Hessians are paged to GPU together during each single-pass calibration forward.",
+        help="Selected decoder layers kept on GPU together for a complete pass over calibration samples.",
     )
     parser.add_argument(
         "--hessian-token-scope", choices=("all", "text"), default="all",
@@ -783,38 +783,24 @@ def main() -> int:
 
         execution_probe_handles.append(register_after_weights_loaded(block, log_layer_execution))
 
-    # The model is forwarded once per sample. Group hooks page each group's
-    # accumulated Hessians from RAM/disk to CUDA just before those layers run,
-    # then write them back immediately afterward.
-    log(
-        f"Collecting Hessians in one model pass per sample; groups of "
-        f"{args.hessian_group_layers} decoder layers are staged on GPU during their layer execution"
-    )
+    # Keep one group's exact Hessians on CUDA for its complete calibration pass.
+    # This trades repeated model forwards for one disk save per group instead
+    # of loading and flushing every group for every sample.
     collection_started = time.monotonic()
-    group_starts = list(range(0, len(blocks), args.hessian_group_layers))
     total_forwards = len(dataset)
-    active_hessians: dict[str, torch.Tensor] = {}
-    active_chunk: dict[str, torch.Tensor | None] = {"value": None}
-    group_hooks = []
     group_specs = []
-    for group_index, group_start in enumerate(group_starts):
+    for group_index, group_start in enumerate(range(0, len(blocks), args.hessian_group_layers)):
         group_end = min(group_start + args.hessian_group_layers, len(blocks))
+        group_layers = [
+            index for index in range(group_start, group_end) if index in selected_layers
+        ]
+        if not group_layers:
+            continue
         group_keys = [
             f"{layer_index}:{name}"
-            for layer_index in range(group_start, group_end)
-            if layer_index in selected_layers
+            for layer_index in group_layers
             for name in linears_by_layer[layer_index]
         ]
-        if not group_keys:
-            continue
-        active_start = min(
-            layer_index for layer_index in range(group_start, group_end)
-            if layer_index in selected_layers
-        )
-        active_end = max(
-            layer_index for layer_index in range(group_start, group_end)
-            if layer_index in selected_layers
-        ) + 1
         group_bytes = sum(hessians[key].nbytes for key in group_keys)
         if args.max_hessian_memory_gpu is not None and group_bytes > args.max_hessian_memory_gpu:
             raise RuntimeError(
@@ -824,189 +810,191 @@ def main() -> int:
                 "reduce --hessian-group-layers"
             )
         disk_layout = [hessian_offsets.get(key) for key in group_keys]
-        contiguous_disk_chunk = None
+        disk_chunk = None
         if disk_layout and all(item is not None for item in disk_layout):
-            chunk_start = disk_layout[0][0]
-            expected_offset = chunk_start
-            for offset, elements in disk_layout:
-                if offset != expected_offset:
+            offset = disk_layout[0][0]
+            expected = offset
+            for item_offset, elements in disk_layout:
+                if item_offset != expected:
                     break
-                expected_offset += elements * np.dtype(np.float32).itemsize
+                expected += elements * np.dtype(np.float32).itemsize
             else:
-                contiguous_disk_chunk = (chunk_start, sum(item[1] for item in disk_layout))
-        group_specs.append((
-            group_index, active_start, active_end, group_keys, group_bytes, contiguous_disk_chunk
-        ))
+                disk_chunk = (offset, sum(item[1] for item in disk_layout))
+        group_specs.append((group_index, group_layers, group_keys, group_bytes, disk_chunk))
 
-        def load_group(_module, _inputs, spec=group_specs[-1]):
-            index, start, end, keys, byte_count, disk_chunk = spec
+    total_forwards *= len(group_specs)
+    log(
+        f"Collecting exact Hessians in {len(group_specs)} group passes; "
+        f"{len(dataset)} samples/group, {total_forwards} total model forwards, "
+        f"{disk_bytes / 10**9:.2f} GB Hessians disk-backed and written in "
+        f"at most {len(group_specs)} group saves, up to "
+        f"{args.hessian_group_layers} selected decoder layers resident on GPU"
+    )
+    completed_forwards = 0
+    active_hessians: dict[str, torch.Tensor] = {}
+    active_chunk: dict[str, torch.Tensor | None] = {"value": None}
+    try:
+        for group_pass, (group_index, group_layers, group_keys, group_bytes, disk_chunk) in enumerate(group_specs, 1):
+            group_start, group_end = min(group_layers), max(group_layers) + 1
             if active_hessians:
-                raise RuntimeError("A Hessian group is still active when the next group begins")
+                raise RuntimeError("A Hessian group is still active before the next group pass")
+
             if LOG_LEVEL == "extensive":
                 torch.cuda.synchronize()
             load_started = time.monotonic()
             if disk_chunk is not None:
                 offset, elements = disk_chunk
                 disk_view = np.memmap(
-                    hessian_paths[keys[0]], mode="r+", dtype=np.float32,
+                    hessian_paths[group_keys[0]], mode="r+", dtype=np.float32,
                     offset=offset, shape=(elements,),
                 )
                 active_chunk["value"] = torch.from_numpy(disk_view).to(device="cuda")
                 cursor = 0
-                for key in keys:
+                for key in group_keys:
                     matrix = hessians[key]
                     matrix_elements = matrix.size
                     active_hessians[key] = active_chunk["value"][cursor:cursor + matrix_elements].view(matrix.shape)
                     cursor += matrix_elements
                 del disk_view
             else:
-                for key in keys:
+                for key in group_keys:
                     host_matrix = np.array(hessians[key], copy=True)
                     active_hessians[key] = torch.from_numpy(host_matrix).to(device="cuda")
             if LOG_LEVEL == "extensive":
                 torch.cuda.synchronize()
             load_elapsed = time.monotonic() - load_started
             record_timing("Hessian group backing-to-GPU load", load_elapsed)
-            load_rate = byte_count / (1024**2) / max(load_elapsed, 1e-9)
             log(
-                f"Loaded Hessian group {start + 1}-{end}/{len(blocks)} "
-                f"({byte_count / 1024**3:.2f} GiB) "
-                f"{'as one contiguous disk chunk' if disk_chunk is not None else 'from configured RAM/disk backing'} to GPU "
-                f"in {load_elapsed:.1f}s ({load_rate:.1f} MiB/s end-to-end); {cuda_memory_summary()}",
+                f"Group pass {group_pass}/{len(group_specs)}: layers="
+                f"{','.join(str(index + 1) for index in group_layers)}, Hessian="
+                f"{group_bytes / 1024**3:.2f} GiB loaded in {load_elapsed:.1f}s; "
+                f"{cuda_memory_summary()}",
                 level="extensive",
             )
 
-        def save_group(_module, _inputs, _output, spec=group_specs[-1]):
-            index, start, end, keys, _byte_count, disk_chunk = spec
-            torch.cuda.synchronize()
-            save_started = time.monotonic()
-            device_copy_elapsed = 0.0
-            storage_write_elapsed = 0.0
-            if disk_chunk is not None:
-                offset, elements = disk_chunk
+            collect_handles = []
+            for layer_index in group_layers:
+                for name, linear in linears_by_layer[layer_index].items():
+                    key = f"{layer_index}:{name}"
+                    collect_handles.append(linear.register_forward_hook(
+                        gpu_hessian_hook(active_hessians, linear.in_features, counts, key, token_selection)
+                    ))
+
+            group_started = time.monotonic()
+            try:
+                for sample_index, sample in enumerate(dataset):
+                    sample_started = time.monotonic()
+                    preparation_started = time.monotonic()
+                    image_value = sample["image"]
+                    if isinstance(image_value, dict):
+                        image_value = Image.open(image_value["path"]).convert("RGB")
+                    elif hasattr(image_value, "convert"):
+                        image_value = image_value.convert("RGB")
+                    row = {
+                        "conversations": sample["conversations"],
+                        "id": str(sample.get("id", sample_index)),
+                        "image": "local",
+                    }
+                    prepared = adapter.preprocess_data([image_value], row)
+                    batch = adapter.data_collator([prepared])
+                    inputs, kwargs = adapter.generate_input(batch)
+                    preparation_elapsed = time.monotonic() - preparation_started
+                    record_timing("calibration sample preprocessing", preparation_elapsed)
+                    vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
+                    attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
+                    token_selection["mask"] = (
+                        attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
+                    )
+                    valid_tokens = int(attention_mask.sum().item())
+                    vision_tokens = int((attention_mask & vision_mask).sum().item())
+                    selected_tokens = (
+                        int((attention_mask & ~vision_mask).sum().item())
+                        if args.hessian_token_scope == "text" else valid_tokens
+                    )
+                    log(
+                        f"Group pass {group_pass}/{len(group_specs)}, sample "
+                        f"{sample_index + 1}/{len(dataset)} prepared in {preparation_elapsed:.1f}s; "
+                        f"sequence={attention_mask.shape[-1]}, valid={valid_tokens}, "
+                        f"image={vision_tokens}, selected={selected_tokens} tokens"
+                    )
+                    forward_started = time.monotonic()
+                    try:
+                        with torch.inference_mode():
+                            model(
+                                inputs_embeds=inputs["inputs_embeds"],
+                                attention_mask=kwargs.get("attention_mask"),
+                                use_cache=False,
+                                return_dict=True,
+                            )
+                        torch.cuda.synchronize()
+                    finally:
+                        token_selection["mask"] = None
+                    forward_elapsed = time.monotonic() - forward_started
+                    completed_forwards += 1
+                    record_timing("calibration model forward with active Hessian group", forward_elapsed)
+                    del inputs, kwargs, batch, prepared, image_value
+                    elapsed = time.monotonic() - collection_started
+                    average = elapsed / completed_forwards
+                    remaining = average * (total_forwards - completed_forwards)
+                    log(
+                        f"Group pass {group_pass}/{len(group_specs)}, sample "
+                        f"{sample_index + 1}/{len(dataset)} complete; forward={forward_elapsed:.1f}s, "
+                        f"total={time.monotonic() - sample_started:.1f}s, "
+                        f"completed forwards={completed_forwards}/{total_forwards}, "
+                        f"estimated remaining={remaining / 60:.1f} min; {cuda_memory_summary()}"
+                    )
+            finally:
+                token_selection["mask"] = None
+                for handle in collect_handles:
+                    handle.remove()
+
+            if active_chunk["value"] is not None:
+                torch.cuda.synchronize()
+                save_started = time.monotonic()
                 copy_started = time.monotonic()
                 cpu_chunk = active_chunk["value"].cpu()
-                device_copy_elapsed = time.monotonic() - copy_started
+                copy_elapsed = time.monotonic() - copy_started
+                offset, elements = disk_chunk
                 disk_view = np.memmap(
-                    hessian_paths[keys[0]], mode="r+", dtype=np.float32,
+                    hessian_paths[group_keys[0]], mode="r+", dtype=np.float32,
                     offset=offset, shape=(elements,),
                 )
                 write_started = time.monotonic()
                 disk_view[:] = cpu_chunk.numpy()
                 disk_view.flush()
-                storage_write_elapsed = time.monotonic() - write_started
-                del disk_view
-                del cpu_chunk
+                write_elapsed = time.monotonic() - write_started
+                del disk_view, cpu_chunk
                 active_chunk["value"] = None
             else:
-                for key in keys:
+                save_started = time.monotonic()
+                copy_elapsed = 0.0
+                write_elapsed = 0.0
+                for key in group_keys:
                     copy_started = time.monotonic()
                     cpu_matrix = active_hessians[key].cpu()
-                    device_copy_elapsed += time.monotonic() - copy_started
+                    copy_elapsed += time.monotonic() - copy_started
                     write_started = time.monotonic()
                     hessians[key][:] = cpu_matrix.numpy()
                     if isinstance(hessians[key], np.memmap):
                         hessians[key].flush()
-                    storage_write_elapsed += time.monotonic() - write_started
+                    write_elapsed += time.monotonic() - write_started
                     del cpu_matrix
             active_hessians.clear()
             save_elapsed = time.monotonic() - save_started
             record_timing("Hessian group save total", save_elapsed)
-            record_timing("Hessian GPU-to-host copy", device_copy_elapsed)
-            record_timing("Hessian storage write and flush", storage_write_elapsed)
-            rate = _byte_count / (1024**2) / max(save_elapsed, 1e-9)
+            record_timing("Hessian GPU-to-host copy", copy_elapsed)
+            record_timing("Hessian storage write and flush", write_elapsed)
             log(
-                f"Saved Hessian group {start + 1}-{end}/{len(blocks)} "
-                f"({rate:.1f} MiB/s end-to-end): GPU-to-host={device_copy_elapsed:.1f}s, "
-                f"storage write/flush={storage_write_elapsed:.1f}s, total={save_elapsed:.1f}s; "
-                f"{cuda_memory_summary()}",
-                level="extensive",
-            )
-
-        group_hooks.append(blocks[active_start].register_forward_pre_hook(load_group))
-        group_hooks.append(blocks[active_end - 1].register_forward_hook(save_group))
-
-    collect_handles = []
-    for layer_index, linears in enumerate(linears_by_layer):
-        if layer_index not in selected_layers:
-            continue
-        for name, linear in linears.items():
-            key = f"{layer_index}:{name}"
-            collect_handles.append(linear.register_forward_hook(
-                gpu_hessian_hook(active_hessians, linear.in_features, counts, key, token_selection)
-            ))
-
-    try:
-        for sample_index, sample in enumerate(dataset):
-            sample_started = time.monotonic()
-            log(
-                f"Sample {sample_index + 1}/{len(dataset)} starting; "
-                f"elapsed={sample_started - collection_started:.1f}s; {cuda_memory_summary()}"
-            )
-            preparation_started = time.monotonic()
-            image_value = sample["image"]
-            if isinstance(image_value, dict):
-                image_value = Image.open(image_value["path"]).convert("RGB")
-            elif hasattr(image_value, "convert"):
-                image_value = image_value.convert("RGB")
-            row = {
-                "conversations": sample["conversations"],
-                "id": str(sample.get("id", sample_index)),
-                "image": "local",
-            }
-            prepared = adapter.preprocess_data([image_value], row)
-            batch = adapter.data_collator([prepared])
-            inputs, kwargs = adapter.generate_input(batch)
-            preparation_elapsed = time.monotonic() - preparation_started
-            record_timing("calibration sample preprocessing", preparation_elapsed)
-            vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
-            attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
-            token_selection["mask"] = (
-                attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
-            )
-            valid_tokens = int(attention_mask.sum().item())
-            vision_tokens = int((attention_mask & vision_mask).sum().item())
-            selected_tokens = (
-                int((attention_mask & ~vision_mask).sum().item())
-                if args.hessian_token_scope == "text" else valid_tokens
-            )
-            log(
-                f"Sample {sample_index + 1}/{len(dataset)} prepared in {preparation_elapsed:.1f}s; "
-                f"sequence={attention_mask.shape[-1]} tokens, valid={valid_tokens}, "
-                f"image={vision_tokens}, selected={selected_tokens}; {cuda_memory_summary()}"
-            )
-            forward_started = time.monotonic()
-            log(f"Sample {sample_index + 1}/{len(dataset)} model forward starting; {cuda_memory_summary()}")
-            try:
-                with torch.inference_mode():
-                    model(
-                        inputs_embeds=inputs["inputs_embeds"],
-                        attention_mask=kwargs.get("attention_mask"),
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                torch.cuda.synchronize()
-            finally:
-                token_selection["mask"] = None
-            if active_hessians:
-                raise RuntimeError("Forward completed with an unflushed GPU Hessian group")
-            forward_elapsed = time.monotonic() - forward_started
-            record_timing("calibration model forward (includes Hessian hooks)", forward_elapsed)
-            del inputs, kwargs, batch, prepared, image_value
-            elapsed = time.monotonic() - collection_started
-            average = elapsed / (sample_index + 1)
-            remaining = average * (total_forwards - sample_index - 1)
-            log(
-                f"Sample {sample_index + 1}/{len(dataset)} complete; "
-                f"forward={forward_elapsed:.1f}s, total={time.monotonic() - sample_started:.1f}s, "
-                f"run elapsed={elapsed:.1f}s, average={average:.1f}s/forward, "
-                f"completed forwards={sample_index + 1}/{total_forwards}, "
-                f"estimated remaining={remaining / 60:.1f} min; {cuda_memory_summary()}"
+                f"Group pass {group_pass}/{len(group_specs)} completed for layers "
+                f"{','.join(str(index + 1) for index in group_layers)} in "
+                f"{time.monotonic() - group_started:.1f}s; saved Hessians once: "
+                f"GPU-to-host={copy_elapsed:.1f}s, write/flush={write_elapsed:.1f}s, "
+                f"total={save_elapsed:.1f}s; {cuda_memory_summary()}"
             )
     finally:
         token_selection["mask"] = None
-        for handle in collect_handles + group_hooks:
-            handle.remove()
+        active_hessians.clear()
+        active_chunk["value"] = None
     for handle in execution_probe_handles:
         handle.remove()
     token_counts = list(counts.values())
