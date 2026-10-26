@@ -135,6 +135,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4, help="Weight precision in bits.")
     parser.add_argument("--group-size", type=int, default=128, help="Input columns per quantization group.")
     parser.add_argument(
+        "--layers", default=None,
+        help="1-based decoder layers to quantize, as comma-separated numbers/ranges (for example 1-4,8); default: all.",
+    )
+    parser.add_argument(
         "--hessian-group-layers", type=int, default=7,
         help="Decoder layers whose Hessians are paged to GPU together during each single-pass calibration forward.",
     )
@@ -217,6 +221,25 @@ def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
     return {name: module for name, module in block.named_modules() if isinstance(module, nn.Linear)}
 
 
+def parse_layer_selection(value: str | None, layer_count: int) -> set[int]:
+    """Parse 1-based decoder layer numbers/ranges into zero-based indexes."""
+    if value is None:
+        return set(range(layer_count))
+    selected: set[int] = set()
+    for part in value.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
+        if not match:
+            raise ValueError(f"Invalid --layers item {part!r}; use numbers and ranges such as 1-4,8")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end < start or end > layer_count:
+            raise ValueError(f"--layers range {part!r} must be within 1-{layer_count}")
+        selected.update(range(start - 1, end))
+    if not selected:
+        raise ValueError("--layers must select at least one decoder layer")
+    return selected
+
+
 def gpu_hessian_hook(
     active_hessians: dict[str, torch.Tensor],
     width: int,
@@ -259,12 +282,13 @@ def allocate_hessians(
     hessian_dir: Path,
     ram_budget_bytes: int | None,
     disk_budget_bytes: int | None,
+    selected_layers: set[int],
 ) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str], dict[str, tuple[int, int]], int, int]:
     """Allocate Hessians in RAM, then in one contiguous disk-backed float32 file."""
     linears_by_layer = [linear_layers(block) for block in blocks]
     entries = [
         (f"{layer_index}:{name}", linear)
-        for layer_index, linears in enumerate(linears_by_layer)
+        for layer_index, linears in enumerate(linears_by_layer) if layer_index in selected_layers
         for name, linear in linears.items()
     ]
     planned: list[tuple[str, nn.Linear, int, bool]] = []
@@ -584,6 +608,11 @@ def main() -> int:
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
     record_timing("checkpoint load and model dispatch", time.monotonic() - model_load_started)
     blocks = model.model.layers
+    selected_layers = parse_layer_selection(args.layers, len(blocks))
+    log(
+        f"Quantizing {len(selected_layers)}/{len(blocks)} decoder layers: "
+        f"{','.join(str(index + 1) for index in sorted(selected_layers))}"
+    )
     device_map = getattr(model, "hf_device_map", {})
     log(
         f"Model has {len(blocks)} decoder layers; Accelerate storage map: "
@@ -607,7 +636,7 @@ def main() -> int:
     disk_budget_bytes = args.max_hessian_memory_disk
     hessian_allocation_started = time.monotonic()
     hessians, hessian_paths, hessian_placement, hessian_offsets, ram_bytes, disk_bytes = allocate_hessians(
-        blocks, hessian_dir, ram_budget_bytes, disk_budget_bytes
+        blocks, hessian_dir, ram_budget_bytes, disk_budget_bytes, selected_layers
     )
     record_timing("Hessian backing allocation", time.monotonic() - hessian_allocation_started)
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
@@ -658,8 +687,19 @@ def main() -> int:
         group_keys = [
             f"{layer_index}:{name}"
             for layer_index in range(group_start, group_end)
+            if layer_index in selected_layers
             for name in linears_by_layer[layer_index]
         ]
+        if not group_keys:
+            continue
+        active_start = min(
+            layer_index for layer_index in range(group_start, group_end)
+            if layer_index in selected_layers
+        )
+        active_end = max(
+            layer_index for layer_index in range(group_start, group_end)
+            if layer_index in selected_layers
+        ) + 1
         group_bytes = sum(hessians[key].nbytes for key in group_keys)
         if args.max_hessian_memory_gpu is not None and group_bytes > args.max_hessian_memory_gpu:
             raise RuntimeError(
@@ -680,7 +720,7 @@ def main() -> int:
             else:
                 contiguous_disk_chunk = (chunk_start, sum(item[1] for item in disk_layout))
         group_specs.append((
-            group_index, group_start, group_end, group_keys, group_bytes, contiguous_disk_chunk
+            group_index, active_start, active_end, group_keys, group_bytes, contiguous_disk_chunk
         ))
 
         def load_group(_module, _inputs, spec=group_specs[-1]):
@@ -768,11 +808,13 @@ def main() -> int:
                 level="extensive",
             )
 
-        group_hooks.append(blocks[group_start].register_forward_pre_hook(load_group))
-        group_hooks.append(blocks[group_end - 1].register_forward_hook(save_group))
+        group_hooks.append(blocks[active_start].register_forward_pre_hook(load_group))
+        group_hooks.append(blocks[active_end - 1].register_forward_hook(save_group))
 
     collect_handles = []
     for layer_index, linears in enumerate(linears_by_layer):
+        if layer_index not in selected_layers:
+            continue
         for name, linear in linears.items():
             key = f"{layer_index}:{name}"
             collect_handles.append(linear.register_forward_hook(
@@ -867,6 +909,8 @@ def main() -> int:
     quantized_layers: set[int] = set()
     quantize_handles = []
     for layer_index, (block, linears) in enumerate(zip(blocks, linears_by_layer)):
+        if layer_index not in selected_layers:
+            continue
         overlay_path = overlay_dir / f"decoder-{layer_index:03d}.pt"
 
         def quantize_layer(
@@ -907,7 +951,7 @@ def main() -> int:
             log(
                 f"Saved {overlay_path.name} ({overlay_path.stat().st_size / 1024**2:.1f} MiB); "
                 f"decoder layer elapsed={time.monotonic() - layer_started:.1f}s, "
-                f"completed={len(quantized_layers)}/{len(blocks)}"
+                f"completed={len(quantized_layers)}/{len(selected_layers)}"
             )
 
         quantize_handles.append(block.register_forward_pre_hook(quantize_layer))
@@ -944,9 +988,9 @@ def main() -> int:
         for handle in quantize_handles:
             handle.remove()
     del inputs, kwargs, batch, prepared, image_value
-    if len(quantized_layers) != len(blocks):
+    if len(quantized_layers) != len(selected_layers):
         raise RuntimeError(
-            f"Quantized {len(quantized_layers)} of {len(blocks)} decoder layers during finalization"
+            f"Quantized {len(quantized_layers)} of {len(selected_layers)} selected decoder layers during finalization"
         )
 
     metadata = {
@@ -955,6 +999,7 @@ def main() -> int:
         "model_family": "llava-v1.5",
         "bits": args.bits,
         "group_size": args.group_size,
+        "selected_layers_1based": sorted(index + 1 for index in selected_layers),
         "hessian_token_scope": args.hessian_token_scope,
         "hessian_memory_limits_gib": {
             "gpu_bytes": args.max_hessian_memory_gpu,
@@ -971,7 +1016,7 @@ def main() -> int:
         "damp": args.damp,
         "calibration_samples": len(dataset),
         "seed": args.seed,
-        "overlay_files": [f"layers/decoder-{i:03d}.pt" for i in range(len(blocks))],
+        "overlay_files": [f"layers/decoder-{i:03d}.pt" for i in sorted(selected_layers)],
         "load_note": "Load the base model with the same architecture, then call apply_overlay(model, output_dir / 'layers').",
     }
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

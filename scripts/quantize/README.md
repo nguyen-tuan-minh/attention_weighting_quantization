@@ -2,6 +2,17 @@
 
 ## Disk-backed GPTQ for LLaVA 1.5
 
+### Layer selection convention
+
+Quantization scripts should allow targeting a subset of decoder layers while
+defaulting to all layers. Layer numbers exposed to users are 1-based and should
+accept comma-separated individual numbers and inclusive ranges. For example,
+`--layers 1-4,8` selects layers 1, 2, 3, 4, and 8. The script validates the
+selection against the model's decoder layer count. Subset runs should compute
+statistics and write overlays only for selected layers, and record the selected
+layer numbers in output metadata. GPTQ implements this as `--layers`; omitting
+the option quantizes every decoder layer.
+
 `quantize_gptq.py` is a standalone implementation of layerwise GPTQ for the
 configured LLaVA 1.5 checkpoint. It does not call QIG's GPTQ quantizer and does
 not modify LMMS-Eval. Accelerate handles CPU and disk weight offload: those are
