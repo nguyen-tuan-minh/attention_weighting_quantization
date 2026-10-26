@@ -65,7 +65,8 @@ at `extensive` verbosity. For long-running work, include periodic progress at
 Include enough context to guide the next compute decision: item or layer range,
 shape or byte count, device or storage tier, completed/total work, and effective
 throughput when meaningful. Keep timings for unlike stages separate (for example,
-GPU-to-host copy versus disk flush) instead of reporting one combined duration.
+GPU-to-host copy, assignment into a memory-mapped file, and flushing that mapping)
+instead of reporting one combined duration.
 Synchronize CUDA around wall-clock measurements of asynchronous GPU work, or use
 CUDA events, so reported times include the operation being measured. Avoid adding
 extra synchronization to normal execution unless timing is enabled or the

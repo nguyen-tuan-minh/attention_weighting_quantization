@@ -55,7 +55,7 @@ layer group is entirely disk-backed, the script reads and writes that group's
 Hessians as one contiguous chunk rather than issuing separate transfers for
 each Linear matrix. Mixed RAM/disk groups use per-matrix transfers. Disk flush
 latency can vary by backing filesystem; group save timing separates GPU-to-host
-copy from storage write and flush time.
+copy, assignment into the memory-mapped file, and flushing that mapping.
 
 Example for a 12 GB RAM / 15 GB GPU machine (keeps Hessian backing off CPU and
 uses four-layer GPU groups to leave room for model weights and forward workspace):

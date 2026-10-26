@@ -959,36 +959,44 @@ def main() -> int:
                     hessian_paths[group_keys[0]], mode="r+", dtype=np.float32,
                     offset=offset, shape=(elements,),
                 )
-                write_started = time.monotonic()
+                assignment_started = time.monotonic()
                 disk_view[:] = cpu_chunk.numpy()
+                assignment_elapsed = time.monotonic() - assignment_started
+                flush_started = time.monotonic()
                 disk_view.flush()
-                write_elapsed = time.monotonic() - write_started
+                flush_elapsed = time.monotonic() - flush_started
                 del disk_view, cpu_chunk
                 active_chunk["value"] = None
             else:
                 save_started = time.monotonic()
                 copy_elapsed = 0.0
-                write_elapsed = 0.0
+                assignment_elapsed = 0.0
+                flush_elapsed = 0.0
                 for key in group_keys:
                     copy_started = time.monotonic()
                     cpu_matrix = active_hessians[key].cpu()
                     copy_elapsed += time.monotonic() - copy_started
-                    write_started = time.monotonic()
+                    assignment_started = time.monotonic()
                     hessians[key][:] = cpu_matrix.numpy()
+                    assignment_elapsed += time.monotonic() - assignment_started
                     if isinstance(hessians[key], np.memmap):
+                        flush_started = time.monotonic()
                         hessians[key].flush()
-                    write_elapsed += time.monotonic() - write_started
+                        flush_elapsed += time.monotonic() - flush_started
                     del cpu_matrix
+            write_elapsed = assignment_elapsed + flush_elapsed
             active_hessians.clear()
             save_elapsed = time.monotonic() - save_started
             record_timing("Hessian group save total", save_elapsed)
             record_timing("Hessian GPU-to-host copy", copy_elapsed)
-            record_timing("Hessian storage write and flush", write_elapsed)
+            record_timing("Hessian memmap assignment", assignment_elapsed)
+            record_timing("Hessian memmap flush", flush_elapsed)
             log(
                 f"Group pass {group_pass}/{len(group_specs)} completed for layers "
                 f"{','.join(str(index + 1) for index in group_layers)} in "
                 f"{time.monotonic() - group_started:.1f}s; saved Hessians once: "
-                f"GPU-to-host={copy_elapsed:.1f}s, write/flush={write_elapsed:.1f}s, "
+                f"GPU-to-host={copy_elapsed:.1f}s, memmap assignment={assignment_elapsed:.1f}s, "
+                f"flush={flush_elapsed:.1f}s, write/flush total={write_elapsed:.1f}s, "
                 f"total={save_elapsed:.1f}s; {cuda_memory_summary()}"
             )
     finally:
