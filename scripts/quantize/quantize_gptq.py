@@ -33,6 +33,29 @@ from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset 
 
 LOG_LEVEL = "normal"
 SHOW_TIMING = False
+RUN_STARTED: float | None = None
+TIMING_SAMPLES: dict[str, list[float]] = {}
+
+
+def record_timing(stage: str, elapsed: float) -> None:
+    """Keep elapsed samples for the extensive end-of-run timing summary."""
+    TIMING_SAMPLES.setdefault(stage, []).append(elapsed)
+
+
+def log_timing_summary() -> None:
+    """Report accumulated stage timing, including partial work on process exit."""
+    if LOG_LEVEL != "extensive":
+        return
+    log("Timing summary (stage totals may overlap when one includes another):")
+    for stage, samples in TIMING_SAMPLES.items():
+        total = sum(samples)
+        average = total / len(samples)
+        log(
+            f"Timing {stage}: count={len(samples)}, total={total:.1f}s, "
+            f"avg={average:.2f}s, min={min(samples):.2f}s, max={max(samples):.2f}s"
+        )
+    if RUN_STARTED is not None:
+        log(f"Timing total process wall time: {time.monotonic() - RUN_STARTED:.1f}s")
 
 
 def log(message: str, *, level: str = "normal") -> None:
@@ -471,10 +494,14 @@ def apply_overlay(model: nn.Module, overlay_dir: str | Path) -> list[Any]:
 
 def main() -> int:
     """Validate inputs, collect grouped GPU Hessians, and write the GPTQ overlay."""
-    global LOG_LEVEL, SHOW_TIMING
+    global LOG_LEVEL, SHOW_TIMING, RUN_STARTED
     args = parse_args()
     LOG_LEVEL = args.log_level
     SHOW_TIMING = args.timing or args.log_level == "extensive"
+    RUN_STARTED = time.monotonic()
+    TIMING_SAMPLES.clear()
+    if LOG_LEVEL == "extensive":
+        atexit.register(log_timing_summary)
     if args.quiet_warnings:
         warnings.filterwarnings("ignore")
         for module_name in ("transformers.utils.logging", "datasets.utils.logging", "huggingface_hub.utils.logging"):
@@ -483,7 +510,7 @@ def main() -> int:
                 module.set_verbosity_error()
             except ImportError:
                 pass
-    run_started = time.monotonic()
+    run_started = RUN_STARTED
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
@@ -517,13 +544,17 @@ def main() -> int:
         level="extensive",
     )
     checkpoint = resolve_checkpoint(args, model_cfg)
+    dataset_started = time.monotonic()
     dataset = sample_records(args, data_cfg, args.dataset_config)
+    record_timing("dataset loading and sample selection", time.monotonic() - dataset_started)
     log(f"Selected {len(dataset)} calibration records from source={data_cfg.get('calibration_source', 'coco')!r}")
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     qig_root = repository_path(model_cfg.get("implementation_source_dir", "third_party/QIG"))
+    runtime_started = time.monotonic()
     builder, get_process_model = load_runtime(qig_root)
+    record_timing("runtime imports", time.monotonic() - runtime_started)
     offload_dir = repository_path(args.offload_dir) if args.offload_dir else output_dir / ".gptq-work"
     offload_dir.mkdir(parents=True, exist_ok=True)
     cleanup_default_scratch = args.offload_dir is None and not args.keep_hessians
@@ -543,6 +574,7 @@ def main() -> int:
         f"(GPU 0), weights may be stored on GPU/CPU/disk; "
         f"placement limits={max_memory or 'unset (automatic)'}: {checkpoint}"
     )
+    model_load_started = time.monotonic()
     tokenizer, model, image_processor, _ = builder(
         str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
         torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
@@ -550,6 +582,7 @@ def main() -> int:
     )
     model.eval()
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
+    record_timing("checkpoint load and model dispatch", time.monotonic() - model_load_started)
     blocks = model.model.layers
     device_map = getattr(model, "hf_device_map", {})
     log(
@@ -572,9 +605,11 @@ def main() -> int:
             raise RuntimeError(f"Decoder layer {layer_index} contains no Linear modules")
     ram_budget_bytes = args.max_hessian_memory_cpu
     disk_budget_bytes = args.max_hessian_memory_disk
+    hessian_allocation_started = time.monotonic()
     hessians, hessian_paths, hessian_placement, hessian_offsets, ram_bytes, disk_bytes = allocate_hessians(
         blocks, hessian_dir, ram_budget_bytes, disk_budget_bytes
     )
+    record_timing("Hessian backing allocation", time.monotonic() - hessian_allocation_started)
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
     token_selection: dict[str, torch.Tensor | None] = {"mask": None}  # CPU bool [batch, sequence] mask, or None.
     # These probes are registered after Accelerate's dispatch hooks, so their
@@ -676,6 +711,7 @@ def main() -> int:
             if LOG_LEVEL == "extensive":
                 torch.cuda.synchronize()
             load_elapsed = time.monotonic() - load_started
+            record_timing("Hessian group backing-to-GPU load", load_elapsed)
             load_rate = byte_count / (1024**2) / max(load_elapsed, 1e-9)
             log(
                 f"Loaded Hessian group {start + 1}-{end}/{len(blocks)} "
@@ -720,6 +756,9 @@ def main() -> int:
                     del cpu_matrix
             active_hessians.clear()
             save_elapsed = time.monotonic() - save_started
+            record_timing("Hessian group save total", save_elapsed)
+            record_timing("Hessian GPU-to-host copy", device_copy_elapsed)
+            record_timing("Hessian storage write and flush", storage_write_elapsed)
             rate = _byte_count / (1024**2) / max(save_elapsed, 1e-9)
             log(
                 f"Saved Hessian group {start + 1}-{end}/{len(blocks)} "
@@ -762,6 +801,7 @@ def main() -> int:
             batch = adapter.data_collator([prepared])
             inputs, kwargs = adapter.generate_input(batch)
             preparation_elapsed = time.monotonic() - preparation_started
+            record_timing("calibration sample preprocessing", preparation_elapsed)
             vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
             attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
             token_selection["mask"] = (
@@ -794,6 +834,7 @@ def main() -> int:
             if active_hessians:
                 raise RuntimeError("Forward completed with an unflushed GPU Hessian group")
             forward_elapsed = time.monotonic() - forward_started
+            record_timing("calibration model forward (includes Hessian hooks)", forward_elapsed)
             del inputs, kwargs, batch, prepared, image_value
             elapsed = time.monotonic() - collection_started
             average = elapsed / (sample_index + 1)
@@ -849,15 +890,19 @@ def main() -> int:
                     group_size=args.group_size,
                     damp=args.damp,
                 )
+                linear_elapsed = time.monotonic() - linear_started
+                record_timing("GPTQ Linear quantization", linear_elapsed)
                 log(
                     f"Quantized decoder {layer_index + 1}/{len(blocks)} {name}: "
                     f"shape={tuple(linear.weight.shape)}, Hessian tokens={counts.get(key, 0):,}, "
-                    f"storage={hessian_placement[key]}, elapsed={time.monotonic() - linear_started:.1f}s"
+                    f"storage={hessian_placement[key]}, elapsed={linear_elapsed:.1f}s"
                 )
                 release_hessian(key, hessians, hessian_paths, args.keep_hessians)
             temporary = overlay_path.with_suffix(".tmp")
+            save_started = time.monotonic()
             torch.save(state, temporary)
             os.replace(temporary, overlay_path)
+            record_timing("quantized layer serialization and save", time.monotonic() - save_started)
             quantized_layers.add(layer_index)
             log(
                 f"Saved {overlay_path.name} ({overlay_path.stat().st_size / 1024**2:.1f} MiB); "
@@ -870,6 +915,7 @@ def main() -> int:
     # This one forward loads each offloaded decoder layer, allowing its hook to
     # quantize and save it. The Hessians above all came from base-model forwards.
     first_sample = dataset[0]
+    finalization_preparation_started = time.monotonic()
     image_value = first_sample["image"]
     if isinstance(image_value, dict):
         image_value = Image.open(image_value["path"]).convert("RGB")
@@ -883,6 +929,8 @@ def main() -> int:
     prepared = adapter.preprocess_data([image_value], row)
     batch = adapter.data_collator([prepared])
     inputs, kwargs = adapter.generate_input(batch)
+    record_timing("finalization sample preprocessing", time.monotonic() - finalization_preparation_started)
+    finalization_started = time.monotonic()
     try:
         with torch.inference_mode():
             model(
@@ -892,6 +940,7 @@ def main() -> int:
                 return_dict=True,
             )
     finally:
+        record_timing("finalization forward and layer quantization hooks", time.monotonic() - finalization_started)
         for handle in quantize_handles:
             handle.remove()
     del inputs, kwargs, batch, prepared, image_value
@@ -926,11 +975,13 @@ def main() -> int:
         "load_note": "Load the base model with the same architecture, then call apply_overlay(model, output_dir / 'layers').",
     }
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    cleanup_started = time.monotonic()
     if not args.keep_hessians and hessian_dir.exists():
         shutil.rmtree(hessian_dir)
     shutil.rmtree(offload_dir / "model", ignore_errors=True)
     if args.offload_dir is None and not args.keep_hessians:
         shutil.rmtree(offload_dir, ignore_errors=True)
+    record_timing("temporary Hessian/model scratch cleanup", time.monotonic() - cleanup_started)
     log(f"Saved GPTQ overlay: {output_dir}")
     if SHOW_TIMING:
         log(f"Run completed in {time.monotonic() - run_started:.1f}s")

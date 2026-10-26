@@ -71,6 +71,14 @@ CUDA events, so reported times include the operation being measured. Avoid addin
 extra synchronization to normal execution unless timing is enabled or the
 synchronization is required for correct progress reporting.
 
+When `--log-level extensive` is enabled, finish the run with a timing summary
+for each measured process or stage. Report total elapsed time and, for repeated
+work, the operation count and useful aggregate statistics such as average,
+minimum, and maximum duration. Keep separate stages separate in the summary
+(for example, model forward, GPU-to-host transfer, and disk write/flush) so the
+results show where runtime went. Omit stages that did not run, and report a
+clear partial-run summary on failure or interruption when practical.
+
 ## Common command-line options
 
 Use consistent options when they apply; a script does not need to expose an
