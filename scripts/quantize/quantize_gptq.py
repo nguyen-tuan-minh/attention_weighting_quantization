@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime
@@ -73,6 +74,19 @@ def summarize_device_map(device_map: dict[str, Any]) -> str:
         key = str(location)
         counts[key] = counts.get(key, 0) + 1
     return ", ".join(f"{location}: {count} modules" for location, count in counts.items())
+
+
+def checkpoint_weight_summary(checkpoint: Path) -> tuple[int, list[tuple[str, int]]]:
+    """Return local checkpoint weight-file sizes, largest first."""
+    weight_files = [
+        path for path in checkpoint.iterdir()
+        if path.is_file() and (
+            path.suffix.lower() in {".safetensors", ".bin", ".pt", ".pth"}
+            or path.name in {"model.safetensors.index.json", "pytorch_model.bin.index.json"}
+        )
+    ]
+    sizes = sorted(((path.name, path.stat().st_size) for path in weight_files), key=lambda item: item[1], reverse=True)
+    return sum(size for _, size in sizes), sizes
 
 
 def cuda_memory_summary() -> str:
@@ -598,15 +612,70 @@ def main() -> int:
         f"(GPU 0), weights may be stored on GPU/CPU/disk; "
         f"placement limits={max_memory or 'unset (automatic)'}: {checkpoint}"
     )
+    if LOG_LEVEL == "extensive":
+        inventory_started = time.monotonic()
+        checkpoint_bytes, checkpoint_files = checkpoint_weight_summary(checkpoint)
+        checkpoint_disk = shutil.disk_usage(checkpoint)
+        offload_disk = shutil.disk_usage(offload_dir)
+        log(
+            f"Checkpoint inventory: weight files={len(checkpoint_files)}, "
+            f"total={checkpoint_bytes / 10**9:.2f} GB, "
+            f"largest={[(name, round(size / 10**9, 2)) for name, size in checkpoint_files[:8]]}; "
+            f"checkpoint filesystem free={checkpoint_disk.free / 10**9:.2f} GB, "
+            f"offload filesystem free={offload_disk.free / 10**9:.2f} GB; "
+            f"inventory scan={time.monotonic() - inventory_started:.2f}s",
+            level="extensive",
+        )
+        if torch.cuda.is_available():
+            free_cuda, total_cuda = torch.cuda.mem_get_info()
+            log(
+                f"Before checkpoint load: CUDA free/total={free_cuda / 10**9:.2f}/"
+                f"{total_cuda / 10**9:.2f} GB; dtype=float16, device_map=auto, "
+                f"offload_state_dict=True, attention={model_cfg.get('attn_implementation', 'sdpa')}",
+                level="extensive",
+            )
     model_load_started = time.monotonic()
-    tokenizer, model, image_processor, _ = builder(
-        str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
-        torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-        max_memory=max_memory or None, offload_folder=str(offload_dir / "model"), offload_state_dict=True,
-    )
+    load_heartbeat_stop = threading.Event()
+
+    def report_load_heartbeat() -> None:
+        while not load_heartbeat_stop.wait(30):
+            model_offload_dir = offload_dir / "model"
+            offload_files = list(model_offload_dir.iterdir()) if model_offload_dir.exists() else []
+            offload_bytes = sum(path.stat().st_size for path in offload_files if path.is_file())
+            log(
+                f"Checkpoint load still running; elapsed={time.monotonic() - model_load_started:.0f}s; "
+                f"top-level offload files={len(offload_files)}, "
+                f"offload bytes={offload_bytes / 10**9:.2f} GB; {cuda_memory_summary()}",
+                level="extensive",
+            )
+
+    load_heartbeat = None
+    if LOG_LEVEL == "extensive":
+        load_heartbeat = threading.Thread(target=report_load_heartbeat, daemon=True)
+        load_heartbeat.start()
+    try:
+        tokenizer, model, image_processor, _ = builder(
+            str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
+            torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
+            max_memory=max_memory or None, offload_folder=str(offload_dir / "model"), offload_state_dict=True,
+        )
+    finally:
+        load_heartbeat_stop.set()
+        if load_heartbeat is not None:
+            load_heartbeat.join()
+        record_timing("LLaVA builder checkpoint load and dispatch", time.monotonic() - model_load_started)
+        if LOG_LEVEL == "extensive":
+            log(
+                f"LLaVA builder call ended after {time.monotonic() - model_load_started:.1f}s; "
+                f"{cuda_memory_summary()}",
+                level="extensive",
+            )
+    model_eval_started = time.monotonic()
     model.eval()
+    record_timing("model eval mode setup", time.monotonic() - model_eval_started)
+    adapter_started = time.monotonic()
     adapter = get_process_model("llava")(model, tokenizer, image_processor)
-    record_timing("checkpoint load and model dispatch", time.monotonic() - model_load_started)
+    record_timing("multimodal adapter initialization", time.monotonic() - adapter_started)
     blocks = model.model.layers
     selected_layers = parse_layer_selection(args.layers, len(blocks))
     log(
@@ -628,6 +697,14 @@ def main() -> int:
         f"Model disk-offload cache: {model_disk_bytes / 1024**3:.2f} GiB currently present "
         f"under {model_offload_dir}; CPU and disk weights are staged to CUDA for forward execution"
     )
+    if LOG_LEVEL == "extensive":
+        offload_disk = shutil.disk_usage(model_offload_dir)
+        log(
+            f"After model dispatch: offload files={sum(1 for path in model_offload_dir.rglob('*') if path.is_file())}, "
+            f"offload bytes={model_disk_bytes / 10**9:.2f} GB, "
+            f"offload filesystem free={offload_disk.free / 10**9:.2f} GB; {cuda_memory_summary()}",
+            level="extensive",
+        )
     linears_by_layer = [linear_layers(block) for block in blocks]
     for layer_index, linears in enumerate(linears_by_layer):
         if not linears:

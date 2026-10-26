@@ -71,6 +71,16 @@ CUDA events, so reported times include the operation being measured. Avoid addin
 extra synchronization to normal execution unless timing is enabled or the
 synchronization is required for correct progress reporting.
 
+For expensive third-party calls, do not report only one opaque total. Instrument
+the distinct phases at the narrowest stable boundaries available (for example,
+tokenizer/config loading, checkpoint tensor loading, device dispatch, and adapter
+initialization). If the dependency exposes no suitable boundaries, log a useful
+input inventory before the call (file count and bytes, shard sizes, source and
+destination filesystem free space, device limits) and periodic elapsed-time
+heartbeats while it runs. Log resource and output sizes afterward. Keep
+diagnostic scans lightweight and time them separately; avoid repeatedly
+recursing through large directories just to produce heartbeats.
+
 When `--log-level extensive` is enabled, finish the run with a timing summary
 for each measured process or stage. Report total elapsed time and, for repeated
 work, the operation count and useful aggregate statistics such as average,
