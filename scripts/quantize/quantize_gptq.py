@@ -235,6 +235,45 @@ def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
     return {name: module for name, module in block.named_modules() if isinstance(module, nn.Linear)}
 
 
+class _MethodHookHandle:
+    """Restore a wrapped Accelerate hook method when its temporary callback ends."""
+
+    def __init__(self, owner: Any, method_name: str, original: Any, wrapper: Any):
+        self.owner = owner
+        self.method_name = method_name
+        self.original = original
+        self.wrapper = wrapper
+
+    def remove(self) -> None:
+        if getattr(self.owner, self.method_name, None) is self.wrapper:
+            setattr(self.owner, self.method_name, self.original)
+
+
+def register_after_weights_loaded(
+    module: nn.Module,
+    callback: Any,
+):
+    """Run a callback after Accelerate materializes offloaded weights, else as a pre-hook.
+
+    PyTorch module pre-hooks execute before Accelerate's wrapped ``forward``.
+    Wrapping the Accelerate hook's ``pre_forward`` places the callback after
+    CPU/disk weights are loaded and before the module's actual forward call.
+    """
+    accelerate_hook = getattr(module, "_hf_hook", None)
+    if accelerate_hook is None or not hasattr(accelerate_hook, "pre_forward"):
+        return module.register_forward_pre_hook(callback)
+
+    original = accelerate_hook.pre_forward
+
+    def pre_forward_with_callback(loaded_module, *args, **kwargs):
+        prepared = original(loaded_module, *args, **kwargs)
+        callback(loaded_module, args)
+        return prepared
+
+    accelerate_hook.pre_forward = pre_forward_with_callback
+    return _MethodHookHandle(accelerate_hook, "pre_forward", original, pre_forward_with_callback)
+
+
 def parse_layer_selection(value: str | None, layer_count: int) -> set[int]:
     """Parse 1-based decoder layer numbers/ranges into zero-based indexes."""
     if value is None:
@@ -512,7 +551,7 @@ def quantize_linear_gptq(
 
 
 def apply_overlay(model: nn.Module, overlay_dir: str | Path) -> list[Any]:
-    """Attach pre-forward hooks that reapply disk-saved quantized layers."""
+    """Attach callbacks that restore overlay weights after any offload load."""
     overlay_dir = Path(overlay_dir)
     handles = []
     layers = model.model.layers
@@ -526,7 +565,7 @@ def apply_overlay(model: nn.Module, overlay_dir: str | Path) -> list[Any]:
             for name, entry in state.items():
                 parameter = linears[name].weight
                 parameter.data.copy_(dequantize_entry(entry, parameter.device, parameter.dtype))
-        handles.append(block.register_forward_pre_hook(restore))
+        handles.append(register_after_weights_loaded(block, restore))
     return handles
 
 
@@ -718,9 +757,8 @@ def main() -> int:
     record_timing("Hessian backing allocation", time.monotonic() - hessian_allocation_started)
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
     token_selection: dict[str, torch.Tensor | None] = {"mask": None}  # CPU bool [batch, sequence] mask, or None.
-    # These probes are registered after Accelerate's dispatch hooks, so their
-    # pre-forward observation shows where each layer's weights and activations
-    # reside when the layer is about to execute.
+    # Probe after Accelerate materializes CPU/disk weights so the reported
+    # parameter device reflects execution, rather than the pre-forward meta state.
     execution_probe_handles = []
     for layer_index, block in enumerate(blocks):
         def log_layer_execution(module, inputs, layer_index=layer_index):
@@ -743,7 +781,7 @@ def main() -> int:
                 level="extensive",
             )
 
-        execution_probe_handles.append(block.register_forward_pre_hook(log_layer_execution))
+        execution_probe_handles.append(register_after_weights_loaded(block, log_layer_execution))
 
     # The model is forwarded once per sample. Group hooks page each group's
     # accumulated Hessians from RAM/disk to CUDA just before those layers run,
@@ -1031,10 +1069,11 @@ def main() -> int:
                 f"completed={len(quantized_layers)}/{len(selected_layers)}"
             )
 
-        quantize_handles.append(block.register_forward_pre_hook(quantize_layer))
+        quantize_handles.append(register_after_weights_loaded(block, quantize_layer))
 
-    # This one forward loads each offloaded decoder layer, allowing its hook to
-    # quantize and save it. The Hessians above all came from base-model forwards.
+    # This forward loads each selected offloaded decoder layer. Its callback
+    # runs after Accelerate materializes that layer, then quantizes and saves it.
+    # The Hessians above all came from base-model forwards.
     first_sample = dataset[0]
     finalization_preparation_started = time.monotonic()
     image_value = first_sample["image"]
