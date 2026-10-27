@@ -16,6 +16,51 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PAPER_TASKS = "vizwiz_vqa_val,mmmu_val,chartqa,ai2d,scienceqa_img"
+_LMMS_EVAL_LAUNCHER = r'''
+import ast
+import runpy
+import sys
+from lmms_eval import utils
+
+def parse_model_args(value):
+    items = []
+    start = depth = 0
+    quote = None
+    escaped = False
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in ("'", '\"'):
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            items.append(value[start:index].strip())
+            start = index + 1
+    items.append(value[start:].strip())
+    result = {}
+    for item in items:
+        if not item:
+            continue
+        key, raw = item.split("=", 1)
+        try:
+            parsed = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            parsed = utils.handle_arg_string(raw)
+        result[key.strip()] = parsed
+    return result
+
+utils.simple_parse_args_string = parse_model_args
+sys.argv[0] = "lmms_eval"
+runpy.run_module("lmms_eval.__main__", run_name="__main__")
+'''
 _MEMORY_UNITS = {
     "b": 1, "kb": 10**3, "mb": 10**6, "gb": 10**9, "tb": 10**12,
     "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
@@ -178,8 +223,8 @@ def main() -> int:
     if args.max_model_memory_cpu is not None:
         max_memory["cpu"] = args.max_model_memory_cpu
     if max_memory:
-        # LMMS-Eval model args support Python literals. The LMMS parser must
-        # preserve commas inside this mapping (handled in the companion patch).
+        # Pass Accelerate's placement limits as a mapping. The launcher below
+        # keeps nested commas intact while LMMS-Eval parses its model arguments.
         model_args = [arg for arg in model_args if not arg.startswith("device_map=")]
         model_args.append("device_map=auto")
         model_args.append(f"max_memory={max_memory!r}")
@@ -188,8 +233,8 @@ def main() -> int:
 
     command = [
         sys.executable,
-        "-m",
-        "lmms_eval",
+        "-c",
+        _LMMS_EVAL_LAUNCHER,
         "--model",
         args.model,
         "--model_args",
