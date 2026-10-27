@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -15,6 +16,20 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PAPER_TASKS = "vizwiz_vqa_val,mmmu_val,chartqa,ai2d,scienceqa_img"
+_MEMORY_UNITS = {
+    "b": 1, "kb": 10**3, "mb": 10**6, "gb": 10**9, "tb": 10**12,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+}
+
+
+def parse_memory_size(value: str) -> int:
+    """Parse a memory limit to bytes; an omitted unit means decimal GB."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*((?:[kmgt]i?b)|b)?\s*", value, re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid memory size {value!r}; use B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB (bare number means GB)"
+        )
+    return int(float(match.group(1)) * _MEMORY_UNITS[(match.group(2) or "GB").lower()])
 
 
 def repository_path(value: str | Path) -> Path:
@@ -37,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", default=PAPER_TASKS, help=f"Comma-separated LMMS-Eval task IDs (default: {PAPER_TASKS}).")
     parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size; use 1 for LLaVA 1.5 compatibility.")
     parser.add_argument("--device", default=None, help="Evaluation device, for example cuda:0.")
+    parser.add_argument(
+        "--max-model-memory-gpu", type=parse_memory_size, default=None,
+        help="Optional GPU model-placement limit. Units KB/MB/GB/TB or KiB/MiB/GiB/TiB; bare number means GB.",
+    )
+    parser.add_argument(
+        "--max-model-memory-cpu", type=parse_memory_size, default=None,
+        help="Optional CPU model-placement limit. Units KB/MB/GB/TB or KiB/MiB/GiB/TiB; bare number means GB.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: outputs/evaluations/<timestamp>).")
     parser.add_argument("--limit", type=float, default=None, help="Limit examples per task for a smoke run; do not use for reported metrics.")
     parser.add_argument("--seed", default="42", help="LMMS-Eval seed (single integer or four comma-separated seeds).")
@@ -149,6 +172,17 @@ def main() -> int:
         value = model_config.get(key)
         if value is not None:
             model_args.append(f"{key}={value}")
+    max_memory = {}
+    if args.max_model_memory_gpu is not None:
+        max_memory[0] = args.max_model_memory_gpu
+    if args.max_model_memory_cpu is not None:
+        max_memory["cpu"] = args.max_model_memory_cpu
+    if max_memory:
+        # LMMS-Eval model args support Python literals. The LMMS parser must
+        # preserve commas inside this mapping (handled in the companion patch).
+        model_args = [arg for arg in model_args if not arg.startswith("device_map=")]
+        model_args.append("device_map=auto")
+        model_args.append(f"max_memory={max_memory!r}")
     if args.model_args:
         model_args.append(args.model_args.strip().strip(","))
 
