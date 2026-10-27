@@ -50,6 +50,20 @@ outputs are not used to collect Hessians.
 position. Set it to `text` to exclude image positions; this uses the adapter's
 vision mask and attention mask, so padding is excluded as well.
 
+`--hessian-weighting uniform` (the default) gives every included token equal
+weight. Set `--hessian-weighting iga` to use the repository's IGA definition:
+for each layer, average post-softmax attention over heads and valid text queries
+after the image, producing one score per image token. Normalize image-token
+scores to mean 1, use them as weights for image-token activation rows, and keep
+valid text-token rows at weight 1 when accumulating `X'WX`. This requires
+`--hessian-token-scope all`; IGA cannot weight image-token rows when the text-only
+scope excludes them. The script requests attention weights for the calibration
+forward, reduces each layer's matrix immediately, and drops the full matrix
+instead of retaining matrices from all layers. This adds IGA computation and
+temporary attention memory. The selected weighting is recorded in
+`gptq_metadata.json`. To enable IGA, pass
+`--hessian-token-scope all --hessian-weighting iga`.
+
 Disk-backed Hessians share one contiguous `hessians.f32` file. When an active
 layer group is entirely disk-backed, the script reads and writes that group's
 Hessians as one contiguous chunk rather than issuing separate transfers for

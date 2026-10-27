@@ -160,6 +160,13 @@ def parse_args() -> argparse.Namespace:
         "--hessian-token-scope", choices=("all", "text"), default="all",
         help="Accumulate Hessians from all valid tokens or only non-image text tokens.",
     )
+    parser.add_argument(
+        "--hessian-weighting", choices=("uniform", "iga"), default="uniform",
+        help=(
+            "Use uniform token weights (default), or weight image-token activation rows by per-layer IGA; "
+            "IGA requires --hessian-token-scope all."
+        ),
+    )
     parser.add_argument("--damp", type=float, default=0.01, help="Relative diagonal damping for Hessian factorization.")
     parser.add_argument(
         "--max-hessian-memory-gpu", type=parse_memory_size, default=None,
@@ -328,6 +335,70 @@ def gpu_hessian_hook(
         hessian.addmm_(x.T, x)
 
     return capture
+
+
+def accumulate_weighted_hessian(
+    active_hessians: dict[str, torch.Tensor],
+    counts: dict[str, int],
+    key: str,
+    width: int,
+    activations: torch.Tensor,
+    valid_mask: torch.Tensor,
+    token_weights: torch.Tensor,
+) -> None:
+    """Add X'WX to a GPU Hessian for valid sequence rows."""
+    x = activations.detach().reshape(-1, width).float()
+    valid = valid_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
+    weights = token_weights.reshape(-1).to(device=x.device, dtype=torch.float32)
+    if valid.numel() != x.shape[0] or weights.numel() != x.shape[0]:
+        raise RuntimeError(
+            f"IGA masks/weights for {key} do not match its activation rows: "
+            f"rows={x.shape[0]}, valid={valid.numel()}, weights={weights.numel()}"
+        )
+    x = x[valid]
+    weights = weights[valid]
+    if x.shape[0] == 0:
+        return
+    hessian = active_hessians.get(key)
+    if hessian is None:
+        raise RuntimeError(f"GPU Hessian for {key} is not loaded for the active decoder group")
+    counts[key] = counts.get(key, 0) + x.shape[0]
+    weighted_x = x * weights.unsqueeze(1)
+    hessian.addmm_(x.T, weighted_x)
+
+
+def make_iga_token_weights(
+    attention_weights: torch.Tensor,
+    attention_mask: torch.Tensor,
+    vision_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return unit text weights and mean-one image-key weights from repository IGA."""
+    if attention_weights.ndim != 4 or attention_weights.shape[0] != 1:
+        raise RuntimeError(
+            f"IGA expects post-softmax attention shaped [1, heads, query, key], "
+            f"got {tuple(attention_weights.shape)}"
+        )
+    device = attention_weights.device
+    valid = attention_mask.reshape(-1).to(device=device, dtype=torch.bool)
+    image = vision_mask.reshape(-1).to(device=device, dtype=torch.bool)
+    if valid.numel() != attention_weights.shape[-1] or image.numel() != valid.numel():
+        raise RuntimeError("IGA attention length does not match the adapter's token masks")
+    image_positions = image & valid
+    image_end = torch.where(image_positions)[0][-1]
+    positions = torch.arange(valid.numel(), device=device)
+    text_queries = valid & ~image & (positions > image_end)
+
+    # Match investigate_attention.py: mean post-softmax attention over heads
+    # and post-image text queries, yielding one score for each image key.
+    scores = attention_weights[0][:, text_queries, :][:, :, image_positions]
+    iga = scores.float().mean(dim=(0, 1))
+    # Softmax attention is finite and nonnegative; clamp the denominator to
+    # avoid a host synchronization merely to check an all-zero edge case.
+    mean_iga = iga.mean().clamp_min(torch.finfo(torch.float32).tiny)
+
+    token_weights = torch.ones(valid.numel(), device=device, dtype=torch.float32)
+    token_weights[image_positions] = iga / mean_iga
+    return token_weights
 
 
 def allocate_hessians(
@@ -592,6 +663,8 @@ def main() -> int:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
         raise ValueError("--hessian-group-layers must be positive")
+    if args.hessian_weighting == "iga" and args.hessian_token_scope != "all":
+        raise ValueError("--hessian-weighting iga requires --hessian-token-scope all")
     if args.damp < 0:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
@@ -609,7 +682,8 @@ def main() -> int:
         raise ValueError("--samples must be positive")
     log(
         f"Configuration: bits={args.bits}, group_size={args.group_size}, samples={args.samples}, "
-        f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, damp={args.damp}, "
+        f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, "
+        f"Hessian weighting={args.hessian_weighting}, damp={args.damp}, "
         f"Hessian memory limits GPU/CPU/disk="
         f"{format_memory_gb(args.max_hessian_memory_gpu)}/"
         f"{format_memory_gb(args.max_hessian_memory_cpu)}/"
@@ -757,6 +831,16 @@ def main() -> int:
     record_timing("Hessian backing allocation", time.monotonic() - hessian_allocation_started)
     counts: dict[str, int] = {}  # Linear key -> selected activation rows accumulated across all groups' samples.
     token_selection: dict[str, torch.Tensor | None] = {"mask": None}  # CPU bool [batch, sequence] mask, or None.
+    iga_state: dict[str, Any] = {
+        "attention_mask": None,
+        "vision_mask": None,
+        "layer_weights": {},
+        "pending_activations": {},
+    }
+    iga_cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+    original_output_attentions = getattr(model.config, "output_attentions", False)
+    if args.hessian_weighting == "iga":
+        model.config.output_attentions = True
     # Probe after Accelerate materializes CPU/disk weights so the reported
     # parameter device reflects execution, rather than the pre-forward meta state.
     execution_probe_handles = []
@@ -873,12 +957,121 @@ def main() -> int:
             )
 
             collect_handles = []
-            for layer_index in group_layers:
-                for name, linear in linears_by_layer[layer_index].items():
-                    key = f"{layer_index}:{name}"
-                    collect_handles.append(linear.register_forward_hook(
-                        gpu_hessian_hook(active_hessians, linear.in_features, counts, key, token_selection)
-                    ))
+            if args.hessian_weighting == "uniform":
+                for layer_index in group_layers:
+                    for name, linear in linears_by_layer[layer_index].items():
+                        key = f"{layer_index}:{name}"
+                        collect_handles.append(linear.register_forward_hook(
+                            gpu_hessian_hook(active_hessians, linear.in_features, counts, key, token_selection)
+                        ))
+            else:
+                active_layer_set = set(group_layers)
+                for layer_index in group_layers:
+                    for name, linear in linears_by_layer[layer_index].items():
+                        key = f"{layer_index}:{name}"
+
+                        def capture_iga_activation(
+                            _module,
+                            inputs,
+                            _output,
+                            *,
+                            layer_index=layer_index,
+                            name=name,
+                            key=key,
+                            width=linear.in_features,
+                        ):
+                            if not inputs or not torch.is_tensor(inputs[0]):
+                                raise RuntimeError(f"Could not capture activation rows for IGA Hessian {key}")
+                            activations = inputs[0].detach()
+                            if name.startswith("self_attn."):
+                                # IGA is returned by self_attn after q/k/v/o
+                                # projections execute, so defer these four X'WX updates.
+                                iga_state["pending_activations"][key] = activations
+                                return
+                            token_weights = iga_state["layer_weights"].get(layer_index)
+                            if token_weights is None:
+                                raise RuntimeError(f"IGA scores are unavailable before MLP activation {key}")
+                            started_event = torch.cuda.Event(enable_timing=True) if SHOW_TIMING else None
+                            if started_event is not None:
+                                started_event.record()
+                            accumulate_weighted_hessian(
+                                active_hessians,
+                                counts,
+                                key,
+                                width,
+                                activations,
+                                iga_state["attention_mask"],
+                                token_weights,
+                            )
+                            if started_event is not None:
+                                ended_event = torch.cuda.Event(enable_timing=True)
+                                ended_event.record()
+                                iga_cuda_events.append(("IGA weighted Hessian accumulation", started_event, ended_event))
+
+                        collect_handles.append(linear.register_forward_hook(capture_iga_activation))
+
+                for layer_index, block in enumerate(blocks):
+                    attention_module = getattr(block, "self_attn", None)
+                    if attention_module is None:
+                        raise RuntimeError(f"Decoder layer {layer_index + 1} has no self_attn module for IGA")
+
+                    def capture_layer_iga(_module, _inputs, output, *, layer_index=layer_index):
+                        if not isinstance(output, tuple) or len(output) < 2:
+                            if layer_index in active_layer_set:
+                                raise RuntimeError(
+                                    f"Decoder layer {layer_index + 1} did not return attention weights for IGA; "
+                                    "check that the model uses eager attention"
+                                )
+                            return
+                        attention_weights = output[1]
+                        if layer_index in active_layer_set:
+                            if not torch.is_tensor(attention_weights):
+                                raise RuntimeError(
+                                    f"Decoder layer {layer_index + 1} returned no attention weights for IGA; "
+                                    "check that the model uses eager attention"
+                                )
+                            iga_started_event = torch.cuda.Event(enable_timing=True) if SHOW_TIMING else None
+                            if iga_started_event is not None:
+                                iga_started_event.record()
+                            token_weights = make_iga_token_weights(
+                                attention_weights,
+                                iga_state["attention_mask"],
+                                iga_state["vision_mask"],
+                            )
+                            if iga_started_event is not None:
+                                iga_ended_event = torch.cuda.Event(enable_timing=True)
+                                iga_ended_event.record()
+                                iga_cuda_events.append(("IGA attention score calculation", iga_started_event, iga_ended_event))
+                            iga_state["layer_weights"][layer_index] = token_weights
+                            for name, linear in linears_by_layer[layer_index].items():
+                                if not name.startswith("self_attn."):
+                                    continue
+                                key = f"{layer_index}:{name}"
+                                activations = iga_state["pending_activations"].pop(key, None)
+                                if activations is None:
+                                    raise RuntimeError(f"No saved attention-projection activations for IGA Hessian {key}")
+                                started_event = torch.cuda.Event(enable_timing=True) if SHOW_TIMING else None
+                                if started_event is not None:
+                                    started_event.record()
+                                accumulate_weighted_hessian(
+                                    active_hessians,
+                                    counts,
+                                    key,
+                                    linear.in_features,
+                                    activations,
+                                    iga_state["attention_mask"],
+                                    token_weights,
+                                )
+                                if started_event is not None:
+                                    ended_event = torch.cuda.Event(enable_timing=True)
+                                    ended_event.record()
+                                    iga_cuda_events.append(("IGA weighted Hessian accumulation", started_event, ended_event))
+                        # Prevent the model output from retaining a full attention
+                        # matrix for every decoder layer.
+                        if torch.is_tensor(attention_weights):
+                            return (output[0], None, *output[2:])
+
+                    collect_handles.append(attention_module.register_forward_hook(capture_layer_iga))
 
             group_started = time.monotonic()
             try:
@@ -902,6 +1095,23 @@ def main() -> int:
                     record_timing("calibration sample preprocessing", preparation_elapsed)
                     vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
                     attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
+                    if args.hessian_weighting == "iga":
+                        iga_state["attention_mask"] = attention_mask[0].to(device="cuda")
+                        iga_state["vision_mask"] = vision_mask[0].to(device="cuda")
+                        image_positions = attention_mask[0] & vision_mask[0]
+                        if not image_positions.any():
+                            raise RuntimeError("IGA weighting requires at least one valid image token")
+                        image_end = image_positions.nonzero(as_tuple=True)[0][-1]
+                        text_queries = (
+                            attention_mask[0]
+                            & ~vision_mask[0]
+                            & (torch.arange(attention_mask.shape[-1]) > image_end)
+                        )
+                        if not text_queries.any():
+                            raise RuntimeError("IGA weighting requires a valid text query after the image tokens")
+                        iga_state["layer_weights"].clear()
+                        iga_state["pending_activations"].clear()
+                        iga_cuda_events.clear()
                     token_selection["mask"] = (
                         attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
                     )
@@ -924,11 +1134,18 @@ def main() -> int:
                                 inputs_embeds=inputs["inputs_embeds"],
                                 attention_mask=kwargs.get("attention_mask"),
                                 use_cache=False,
+                                output_attentions=args.hessian_weighting == "iga",
                                 return_dict=True,
                             )
                         torch.cuda.synchronize()
                     finally:
                         token_selection["mask"] = None
+                    for stage, started_event, ended_event in iga_cuda_events:
+                        record_timing(stage, started_event.elapsed_time(ended_event) / 1000.0)
+                    if args.hessian_weighting == "iga" and iga_state["pending_activations"]:
+                        missing = ", ".join(iga_state["pending_activations"])
+                        iga_state["pending_activations"].clear()
+                        raise RuntimeError(f"IGA attention hooks did not consume captured activations: {missing}")
                     forward_elapsed = time.monotonic() - forward_started
                     completed_forwards += 1
                     record_timing("calibration model forward with active Hessian group", forward_elapsed)
@@ -945,6 +1162,8 @@ def main() -> int:
                     )
             finally:
                 token_selection["mask"] = None
+                iga_state["layer_weights"].clear()
+                iga_state["pending_activations"].clear()
                 for handle in collect_handles:
                     handle.remove()
 
@@ -1003,6 +1222,8 @@ def main() -> int:
         token_selection["mask"] = None
         active_hessians.clear()
         active_chunk["value"] = None
+        if args.hessian_weighting == "iga":
+            model.config.output_attentions = original_output_attentions
     for handle in execution_probe_handles:
         handle.remove()
     token_counts = list(counts.values())
@@ -1113,6 +1334,7 @@ def main() -> int:
         "group_size": args.group_size,
         "selected_layers_1based": sorted(index + 1 for index in selected_layers),
         "hessian_token_scope": args.hessian_token_scope,
+        "hessian_weighting": args.hessian_weighting,
         "hessian_memory_limits_gib": {
             "gpu_bytes": args.max_hessian_memory_gpu,
             "cpu_bytes": args.max_hessian_memory_cpu,
