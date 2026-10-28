@@ -696,7 +696,6 @@ def main() -> int:
         atexit.register(shutil.rmtree, offload_dir, ignore_errors=True)
     hessian_dir = offload_dir / "hessians"
     hessian_dir.mkdir(parents=True, exist_ok=True)
-    # Keep packed intermediates in scratch. The requested output directory is
     # Packed decoder files are temporary intermediates; output_dir is the final
     # standalone LLaVA checkpoint.
     packed_dir = offload_dir / "packed-layers"
@@ -1372,10 +1371,22 @@ def main() -> int:
     record_timing("standalone model packed-layer application", time.monotonic() - apply_started)
 
     serialization_started = time.monotonic()
-    export_model.save_pretrained(output_dir, safe_serialization=True, max_shard_size="5GB")
+    # Match the configured LLaVA base checkpoint format: PyTorch .bin shards.
+    # This keeps the standalone output directly usable by the existing LLaVA
+    # builder and makes the serialized format explicit instead of relying on
+    # Transformers' safetensors default.
+    export_model.save_pretrained(output_dir, safe_serialization=False, max_shard_size="5GB")
     tokenizer.save_pretrained(output_dir)
     if image_processor is not None:
         image_processor.save_pretrained(output_dir)
+    output_weight_files = [
+        path for path in output_dir.glob("pytorch_model*.bin") if path.is_file()
+    ]
+    if not (output_dir / "config.json").is_file() or not output_weight_files:
+        raise RuntimeError(
+            "Standalone checkpoint export is incomplete: expected config.json and "
+            f"PyTorch weight shards under {output_dir}"
+        )
     serialization_elapsed = time.monotonic() - serialization_started
     record_timing("standalone model serialization and save", serialization_elapsed)
     if LOG_LEVEL == "extensive":
@@ -1395,7 +1406,7 @@ def main() -> int:
     record_timing("standalone model export", time.monotonic() - export_started)
 
     metadata = {
-        "format": "attention-quantization-gptq-standalone-dense-v1",
+        "format": "attention-quantization-gptq-standalone-pytorch-bin-dense-v1",
         "base_model": str(checkpoint),
         "model_family": "llava-v1.5",
         "bits": args.bits,
@@ -1418,7 +1429,7 @@ def main() -> int:
         "damp": args.damp,
         "calibration_samples": len(dataset),
         "seed": args.seed,
-        "storage": "dense float16 standalone checkpoint",
+        "storage": "dense float16 standalone checkpoint in PyTorch .bin format",
         "load_note": "Standalone LLaVA checkpoint; load directly from this output directory.",
     }
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

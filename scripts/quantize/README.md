@@ -124,13 +124,23 @@ present in that extracted subset. Local paths and file-existence checks are
 refreshed against the current `raw_dir`, rather than reused from a previous
 machine's dataset cache.
 
+### Standalone checkpoint format convention
+
+Quantization scripts must save a standalone checkpoint in the serialization
+format expected by the configured base model and existing inference loader.
+For the configured LLaVA 1.5 checkpoint, that means `config.json`, PyTorch
+`.bin` weight shards (`pytorch_model*.bin`), tokenizer files, and the image
+processor. Validate the config and at least one expected weight shard after
+export, before reporting success. Do not silently switch to another weight
+serialization format.
+
 The output is a **standalone LLaVA checkpoint**. `--output-dir` contains the
 model config, sharded FP16 weights, tokenizer, image processor, and
 `gptq_metadata.json`; load it directly with `scripts/evaluate_model.py
 --pretrained <output-dir>`. Selected GPTQ weights are dequantized to FP16 when
 the checkpoint is saved, while unselected layers retain their original base
-weights. This works with the current LLaVA inference adapter but is not a
-compact 4-bit checkpoint or a low-bit inference kernel. Packed overlay files
-are temporary and removed after export. Loading the base model again and
-serializing the complete checkpoint adds time and needs disk space close to the
-original FP16 checkpoint size.
+weights. This matches the current LLaVA inference adapter's checkpoint
+interface, but it is not a compact 4-bit checkpoint or a low-bit inference
+kernel. Packed layer files are temporary and removed after export. Loading the
+base model again and serializing the complete checkpoint adds time and needs
+disk space close to the original FP16 checkpoint size.
