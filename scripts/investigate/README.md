@@ -85,6 +85,31 @@ around these two screens as their features grow.
 Shared configuration and tensor device-safety conventions for scripts are in
 [`scripts/README.md`](../README.md).
 
+## Paired-model decoding investigations
+
+For a paired-model decoding comparison, use `--expert-model` and
+`--amateur-model` to name the roles. The expert defaults to `model.yaml`; the
+amateur is required. Keep the workflow model-agnostic in names and output
+metadata, even when a particular run uses a specially prepared checkpoint.
+Use `--decoding-modes expert contrastive` for the standard comparison, with
+`amateur` available as an optional baseline. Contrastive decoding compares
+expert and amateur token scores only after validating that tokenizer
+vocabularies, special token IDs, and image processing settings match.
+
+Give each checkpoint its own optional placement caps:
+`--max-expert-model-memory-gpu`, `--max-expert-model-memory-cpu`,
+`--max-amateur-model-memory-gpu`, and `--max-amateur-model-memory-cpu`.
+Omitted limits mean automatic/unlimited placement. Memory values accept B,
+KB, MB, GB, TB, KiB, MiB, GiB, or TiB; an unsuffixed number means decimal GB.
+The limits describe weight placement for each model, so choose values with
+their combined use and room for activations and generation caches in mind.
+
+Keep paired decoding single-sample initially. Use the same image and user
+prompt for each model, cap generation with `--max-new-tokens`, and save each
+mode's generated token IDs and decoded text alongside sample IDs and resolved
+run settings. Log model loading and each model's generation separately at
+extensive verbosity.
+
 ## Resource and memory conventions
 
 For new investigations that accumulate large CPU-side measurements, prefer a
@@ -204,6 +229,26 @@ optional reference override when the base path normally comes from
   hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
+- `contrastive_decoding.py`: compares expert-only and expert-amateur
+  contrastive decoding on identical multimodal prompts. It can also run the
+  amateur-only baseline and saves token IDs, decoded answers, and run settings
+  under `outputs/investigations/contrastive-decoding` by default.
+
+Example, comparing expert-only greedy decoding with contrastive decoding:
+
+```bash
+python scripts/investigate/contrastive_decoding.py \
+  --amateur-model models/llava-v1.5-7b-amateur \
+  --samples 2 \
+  --seed 42 \
+  --decoding-modes expert contrastive \
+  --contrastive-weight 0.5 \
+  --plausibility-threshold 0.1 \
+  --max-new-tokens 128 \
+  --max-expert-model-memory-gpu 10GB \
+  --max-amateur-model-memory-gpu 10GB \
+  --log-level extensive
+```
 
 For `investigate_assistant_attention.py`, assistant query positions come from
 the non-ignored answer labels. Image keys come from `vision_mask`; text keys are
