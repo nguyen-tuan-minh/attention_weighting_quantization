@@ -8,10 +8,11 @@ Quantization scripts should allow targeting a subset of decoder layers while
 defaulting to all layers. Layer numbers exposed to users are 1-based and should
 accept comma-separated individual numbers and inclusive ranges. For example,
 `--layers 1-4,8` selects layers 1, 2, 3, 4, and 8. The script validates the
-selection against the model's decoder layer count. Subset runs should compute
-statistics and write overlays only for selected layers, and record the selected
-layer numbers in output metadata. GPTQ implements this as `--layers`; omitting
-the option quantizes every decoder layer.
+selection against the model's decoder layer count. Subset runs compute Hessians
+and quantize only selected layers, while unselected layers keep their base
+weights in the standalone output. Record the selected layer numbers in output
+metadata. GPTQ implements this as `--layers`; omitting the option quantizes
+every decoder layer.
 
 `quantize_gptq.py` is a standalone implementation of layerwise GPTQ for the
 configured LLaVA 1.5 checkpoint. It does not call QIG's GPTQ quantizer and does
