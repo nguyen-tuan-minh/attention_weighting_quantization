@@ -61,6 +61,7 @@ def run_lmms_eval_with_overlay(arguments: list[str]) -> int:
     """Patch LMMS-Eval's LLaVA constructor in-process to apply a packed overlay."""
     qig_root = REPOSITORY_ROOT / "third_party" / "QIG"
     for source in (
+        REPOSITORY_ROOT,
         REPOSITORY_ROOT / "src",
         qig_root,
         qig_root / "3rdparty" / "LLaVA-NeXT",
