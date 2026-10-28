@@ -123,21 +123,13 @@ present in that extracted subset. Local paths and file-existence checks are
 refreshed against the current `raw_dir`, rather than reused from a previous
 machine's dataset cache.
 
-The output is a **packed weight overlay**, not a standalone Hugging Face
-checkpoint. It stores quantized decoder Linear weights and their scales/zero
-points under `layers/`; the original model checkpoint stays untouched. Load
-the base model using the same LLaVA implementation, then attach the overlay:
-
-```python
-from scripts.quantize.quantize_gptq import apply_overlay
-
-handles = apply_overlay(model, "outputs/quantized/llava-gptq-w4g128/layers")
-```
-
-The hook dequantizes a layer's packed weights after the model's offload hook
-loads that layer. This provides a reference path for inspecting/evaluating the
-quantized weights; it is not a low-bit inference kernel. The current script is
-limited to LLaVA 1.5 models exposing `model.layers` and uses dense GPTQ Hessian
-factorization, so one Hessian and its factorization workspace must fit on the
-GPU even though model weights are partially offloaded and Hessians are split
-between RAM and disk.
+The output is a **standalone LLaVA checkpoint**. `--output-dir` contains the
+model config, sharded FP16 weights, tokenizer, image processor, and
+`gptq_metadata.json`; load it directly with `scripts/evaluate_model.py
+--pretrained <output-dir>`. Selected GPTQ weights are dequantized to FP16 when
+the checkpoint is saved, while unselected layers retain their original base
+weights. This works with the current LLaVA inference adapter but is not a
+compact 4-bit checkpoint or a low-bit inference kernel. Packed overlay files
+are temporary and removed after export. Loading the base model again and
+serializing the complete checkpoint adds time and needs disk space close to the
+original FP16 checkpoint size.

@@ -1,14 +1,15 @@
-"""Disk-backed, layerwise GPTQ for the project's LLaVA 1.5 checkpoint.
+"""Disk-backed, layerwise GPTQ that writes a standalone LLaVA 1.5 checkpoint.
 
-The output is an overlay of quantized decoder Linear weights. It does not
-modify LMMS-Eval or rewrite/copy the base checkpoint. Use ``apply_overlay``
-from this module after loading the base model to run the quantized model.
+The requested output directory contains a complete dense FP16 model. GPTQ
+weights are stored in a temporary packed form during quantization, then applied
+to the selected decoder Linear layers before the complete checkpoint is saved.
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import gc
 import json
 import os
 import re
@@ -134,7 +135,7 @@ def format_memory_gb(memory_bytes: int | None) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the quantized weight overlay.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for the standalone quantized model checkpoint.")
     parser.add_argument("--model-config", type=Path, default=ROOT / "configs/model.yaml", help="Model YAML configuration.")
     parser.add_argument("--dataset-config", type=Path, default=ROOT / "configs/dataset.yaml", help="Dataset YAML configuration.")
     parser.add_argument("--base-model", default=None, help="Override model.yaml's local checkpoint path.")
@@ -713,7 +714,9 @@ def main() -> int:
         atexit.register(shutil.rmtree, offload_dir, ignore_errors=True)
     hessian_dir = offload_dir / "hessians"
     hessian_dir.mkdir(parents=True, exist_ok=True)
-    overlay_dir = output_dir / "layers"
+    # Keep packed intermediates in scratch. The requested output directory is
+    # the final standalone LLaVA checkpoint, not an overlay-only directory.
+    overlay_dir = offload_dir / "packed-overlay"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     max_memory = {}
     if args.max_model_memory_gpu is not None:
@@ -1326,8 +1329,77 @@ def main() -> int:
             f"Quantized {len(quantized_layers)} of {len(selected_layers)} selected decoder layers during finalization"
         )
 
+    # Release the offloaded calibration model before loading a complete CPU
+    # copy for serialization. The standalone checkpoint keeps the base model's
+    # unselected layers and replaces selected Linear weights with GPTQ values.
+    quantize_handles.clear()
+    execution_probe_handles.clear()
+    del adapter, model, blocks, linears_by_layer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    export_started = time.monotonic()
+    log(f"Loading base checkpoint on CPU to write standalone model: {checkpoint}")
+    tokenizer, export_model, image_processor, _ = builder(
+        str(checkpoint), None, "llava-v1.5-7b", device_map="cpu",
+        torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
+    )
+    # This builder moves the vision tower to CUDA for non-auto device maps.
+    # Return the complete model to CPU before applying weights and serializing.
+    export_model.to("cpu")
+    export_model.eval()
+    export_blocks = export_model.model.layers
+    apply_started = time.monotonic()
+    applied_layers = 0
+    for overlay_path in sorted(overlay_dir.glob("decoder-*.pt")):
+        layer_index = int(overlay_path.stem.removeprefix("decoder-"))
+        if not 0 <= layer_index < len(export_blocks):
+            raise ValueError(f"Overlay layer {layer_index} is outside model with {len(export_blocks)} layers")
+        state = torch.load(overlay_path, map_location="cpu", weights_only=True)
+        export_linears = linear_layers(export_blocks[layer_index])
+        for name, entry in state.items():
+            if name not in export_linears:
+                raise ValueError(f"Overlay Linear {name!r} not found in decoder layer {layer_index + 1}")
+            parameter = export_linears[name].weight
+            dense_weight = dequantize_entry(entry, torch.device("cpu"), parameter.dtype)
+            if dense_weight.shape != parameter.shape:
+                raise ValueError(
+                    f"Shape mismatch for decoder {layer_index + 1} {name}: "
+                    f"overlay={tuple(dense_weight.shape)}, model={tuple(parameter.shape)}"
+                )
+            parameter.data.copy_(dense_weight)
+        applied_layers += 1
+        if LOG_LEVEL == "extensive":
+            log(f"Applied quantized weights for decoder {layer_index + 1}/{len(export_blocks)}")
+    if applied_layers != len(selected_layers):
+        raise RuntimeError(
+            f"Applied {applied_layers} packed decoder layers; expected {len(selected_layers)}"
+        )
+    record_timing("standalone model overlay application", time.monotonic() - apply_started)
+
+    serialization_started = time.monotonic()
+    export_model.save_pretrained(output_dir, safe_serialization=True, max_shard_size="5GB")
+    tokenizer.save_pretrained(output_dir)
+    if image_processor is not None:
+        image_processor.save_pretrained(output_dir)
+    serialization_elapsed = time.monotonic() - serialization_started
+    record_timing("standalone model serialization and save", serialization_elapsed)
+    if LOG_LEVEL == "extensive":
+        saved_weight_bytes, saved_weight_files = checkpoint_weight_summary(output_dir)
+        throughput = saved_weight_bytes / max(serialization_elapsed, 1e-9) / 10**6
+        log(
+            f"Standalone checkpoint saved: weight files={len(saved_weight_files)}, "
+            f"weight bytes={saved_weight_bytes / 10**9:.2f} GB, "
+            f"serialization throughput={throughput:.1f} MB/s",
+            level="extensive",
+        )
+    del export_model
+    gc.collect()
+    record_timing("standalone model export", time.monotonic() - export_started)
+
     metadata = {
-        "format": "attention-quantization-gptq-packed-overlay-v1",
+        "format": "attention-quantization-gptq-standalone-dense-v1",
         "base_model": str(checkpoint),
         "model_family": "llava-v1.5",
         "bits": args.bits,
@@ -1350,18 +1422,19 @@ def main() -> int:
         "damp": args.damp,
         "calibration_samples": len(dataset),
         "seed": args.seed,
-        "overlay_files": [f"layers/decoder-{i:03d}.pt" for i in sorted(selected_layers)],
-        "load_note": "Load the base model with the same architecture, then call apply_overlay(model, output_dir / 'layers').",
+        "storage": "dense float16 standalone checkpoint",
+        "load_note": "Standalone LLaVA checkpoint; load directly from this output directory.",
     }
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     cleanup_started = time.monotonic()
+    shutil.rmtree(overlay_dir, ignore_errors=True)
     if not args.keep_hessians and hessian_dir.exists():
         shutil.rmtree(hessian_dir)
     shutil.rmtree(offload_dir / "model", ignore_errors=True)
     if args.offload_dir is None and not args.keep_hessians:
         shutil.rmtree(offload_dir, ignore_errors=True)
     record_timing("temporary Hessian/model scratch cleanup", time.monotonic() - cleanup_started)
-    log(f"Saved GPTQ overlay: {output_dir}")
+    log(f"Saved standalone dense FP16 GPTQ model: {output_dir}")
     if SHOW_TIMING:
         log(f"Run completed in {time.monotonic() - run_started:.1f}s")
     return 0
