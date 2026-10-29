@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum generated tokens per answer.")
     parser.add_argument(
         "--preview-inputs", action=argparse.BooleanOptionalAction, default=True,
-        help="Display each sample image and the prepared expert/amateur prompts before decoding (default: on).",
+        help="Save each sample image and print the expert/amateur prompts before decoding (default: on).",
     )
     parser.add_argument("--device", default=None, help="CUDA device used for automatic placement, such as cuda:0; defaults to model.yaml.")
     for role in ("expert", "amateur"):
@@ -231,15 +231,14 @@ def prepare_prompt(
 def print_prompt_comparison(
     sample_index: int,
     image: Any,
+    image_path: Path,
     expert_prompt: str | None,
     amateur_prompt: str | None,
 ) -> None:
-    """Display the sample image with Matplotlib and print both prompts in two columns."""
-    import matplotlib.pyplot as plt
-
-    plt.imshow(image)
-    plt.axis("off")
-    plt.show()
+    """Save the sample image and print both model-formatted prompts in two columns."""
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(image_path)
+    log(f"Sample {sample_index} image saved to {image_path}", level="normal")
 
     columns = [
         ("EXPERT PROMPT", expert_prompt or "(not prepared for this run)"),
@@ -499,6 +498,7 @@ def main() -> int:
                     print_prompt_comparison(
                         sample_index,
                         image,
+                        output_dir / f"sample-{sample_index:04d}.png",
                         prepared_prompts.get("expert", (None, None, None))[2],
                         prepared_prompts.get("amateur", (None, None, None))[2],
                     )

@@ -115,10 +115,10 @@ finishes so long runs show visible results before the JSONL file is complete.
 Log model loading and each model's generation separately at extensive
 verbosity.
 
-Preview each prepared multimodal input before decoding with Matplotlib's
-`imshow` and `show`, then print the expert and amateur's model-formatted
-prompts in two columns. The preview is enabled by default; use
-`--no-preview-inputs` to disable it. The image is not saved to a file.
+Save each prepared input image in the run's output directory as
+`sample-NNNN.png`, then print the expert and amateur's model-formatted prompts
+in two columns. The image path is logged. Previews are enabled by default; use
+`--no-preview-inputs` to disable image saving and prompt display.
 
 ## Resource and memory conventions
 
