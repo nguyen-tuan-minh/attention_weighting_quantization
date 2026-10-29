@@ -6,8 +6,10 @@ import argparse
 import json
 import math
 import re
+import shutil
 import sys
 import time
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,10 @@ def parse_args() -> argparse.Namespace:
         help="Keep tokens whose expert probability is at least this fraction of the expert's top-token probability.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum generated tokens per answer.")
+    parser.add_argument(
+        "--preview-inputs", action=argparse.BooleanOptionalAction, default=True,
+        help="Display each sample image and the prepared expert/amateur prompts before decoding (default: on).",
+    )
     parser.add_argument("--device", default=None, help="CUDA device used for automatic placement, such as cuda:0; defaults to model.yaml.")
     for role in ("expert", "amateur"):
         for tier in ("gpu", "cpu"):
@@ -194,12 +200,93 @@ def validate_compatibility(expert_tokenizer: Any, amateur_tokenizer: Any, expert
             raise ValueError(f"Expert and amateur image processors differ in {name}")
 
 
-def prepare_prompt(adapter: Any, image: Any, prompt_row: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return multimodal prompt embeddings and an attention mask for one model."""
+def prepare_prompt(
+    adapter: Any, image: Any, prompt_row: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    """Return multimodal embeddings, attention mask, and readable model-formatted prompt."""
     prepared = adapter.preprocess_data([image], prompt_row)
+    input_ids = prepared["input_ids"].detach().cpu().reshape(-1).tolist()
+    text_parts: list[str] = []
+    text_token_ids: list[int] = []
+    for token_id in input_ids:
+        if token_id < 0:
+            if text_token_ids:
+                text_parts.append(adapter.tokenizer.decode(
+                    text_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False,
+                ))
+                text_token_ids.clear()
+            text_parts.append("[IMAGE]")
+        else:
+            text_token_ids.append(token_id)
+    if text_token_ids:
+        text_parts.append(adapter.tokenizer.decode(
+            text_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False,
+        ))
+    prompt_text = "".join(text_parts)
     batch = adapter.data_collator([prepared])
     prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
-    return prompt_inputs["inputs_embeds"], prompt_kwargs["attention_mask"]
+    return prompt_inputs["inputs_embeds"], prompt_kwargs["attention_mask"], prompt_text
+
+
+def print_prompt_comparison(
+    sample_index: int,
+    image: Any,
+    expert_prompt: str | None,
+    amateur_prompt: str | None,
+) -> None:
+    """Display the sample image where interactive display is available and print prompts in two columns."""
+    displayed_inline = False
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+
+        if get_ipython() is not None:
+            display(image)
+            displayed_inline = True
+    except ImportError:
+        pass
+
+    if not displayed_inline:
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+
+            backend = matplotlib.get_backend().lower()
+            if backend in {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}:
+                raise RuntimeError(f"matplotlib backend {backend!r} has no interactive display")
+            figure, axis = plt.subplots()
+            axis.imshow(image)
+            axis.axis("off")
+            manager = getattr(figure.canvas, "manager", None)
+            if manager is not None and hasattr(manager, "set_window_title"):
+                manager.set_window_title(f"Contrastive decoding sample {sample_index}")
+            plt.show(block=True)
+            plt.close(figure)
+        except (ImportError, RuntimeError, ValueError) as error:
+            print(
+                f"Sample {sample_index}: could not display the image in this process ({error}). "
+                "Run the script in a notebook kernel for inline display.",
+                flush=True,
+            )
+
+    columns = [
+        ("EXPERT PROMPT", expert_prompt or "(not prepared for this run)"),
+        ("AMATEUR PROMPT", amateur_prompt or "(not prepared for this run)"),
+    ]
+    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    column_width = max(24, min(72, (terminal_width - 3) // 2))
+    wrapped = [
+        textwrap.wrap(prompt, width=column_width, replace_whitespace=False, drop_whitespace=False)
+        or [""]
+        for _, prompt in columns
+    ]
+    print(f"Sample {sample_index} prompts (image token shown as [IMAGE]):", flush=True)
+    print(f"{columns[0][0]:<{column_width}} | {columns[1][0]}", flush=True)
+    print(f"{'-' * column_width}-+-{'-' * column_width}", flush=True)
+    for line_index in range(max(map(len, wrapped))):
+        left = wrapped[0][line_index] if line_index < len(wrapped[0]) else ""
+        right = wrapped[1][line_index] if line_index < len(wrapped[1]) else ""
+        print(f"{left:<{column_width}} | {right}", flush=True)
 
 
 def eos_token_ids(model: Any, tokenizer: Any) -> set[int]:
@@ -411,37 +498,46 @@ def main() -> int:
                 image = sample["image"].convert("RGB") if hasattr(sample["image"], "convert") else sample["image"]
                 outputs: dict[str, dict[str, Any]] = {}
                 modes_started = time.monotonic()
-                for mode in args.decoding_modes:
-                    adapter = amateur_adapter if mode == "amateur" else expert_adapter
-                    model = amateur if mode == "amateur" else expert
+                needed_roles = set()
+                if "expert" in args.decoding_modes or "contrastive" in args.decoding_modes:
+                    needed_roles.add("expert")
+                if "amateur" in args.decoding_modes or "contrastive" in args.decoding_modes:
+                    needed_roles.add("amateur")
+                prepared_prompts: dict[str, tuple[torch.Tensor, torch.Tensor, str]] = {}
+                for role in ("expert", "amateur"):
+                    if role not in needed_roles:
+                        continue
+                    role_adapter = expert_adapter if role == "expert" else amateur_adapter
                     prep_started = time.monotonic()
-                    prompt_embeds, prompt_mask = prepare_prompt(adapter, image, prompt_row)
+                    prompt_embeds, prompt_mask, prompt_text = prepare_prompt(role_adapter, image, prompt_row)
                     if args.timing and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     prep_elapsed = time.monotonic() - prep_started
-                    record_timing(f"{mode} sample preprocessing", prep_elapsed)
-                    report_timing(f"Prepare {mode} prompt", prep_elapsed, enabled=args.timing)
+                    record_timing(f"{role} sample preprocessing", prep_elapsed)
+                    report_timing(f"Prepare {role} prompt", prep_elapsed, enabled=args.timing)
                     log(
-                        f"Prepared {mode} prompt embeddings={tuple(prompt_embeds.shape)} "
+                        f"Prepared {role} prompt embeddings={tuple(prompt_embeds.shape)} "
                         f"dtype={prompt_embeds.dtype} device={prompt_embeds.device}; "
                         f"attention_mask={tuple(prompt_mask.shape)} device={prompt_mask.device}",
                         level="extensive",
                     )
-                    amateur_embeds = amateur_mask = None
+                    prepared_prompts[role] = (prompt_embeds, prompt_mask, prompt_text)
+
+                if args.preview_inputs:
+                    print_prompt_comparison(
+                        sample_index,
+                        image,
+                        prepared_prompts.get("expert", (None, None, None))[2],
+                        prepared_prompts.get("amateur", (None, None, None))[2],
+                    )
+
+                for mode in args.decoding_modes:
+                    model = amateur if mode == "amateur" else expert
+                    prompt_embeds, prompt_mask, _ = prepared_prompts[
+                        "amateur" if mode == "amateur" else "expert"
+                    ]
                     if mode == "contrastive":
-                        amateur_prep_started = time.monotonic()
-                        amateur_embeds, amateur_mask = prepare_prompt(amateur_adapter, image, prompt_row)
-                        if args.timing and torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        amateur_prep_elapsed = time.monotonic() - amateur_prep_started
-                        record_timing("contrastive amateur sample preprocessing", amateur_prep_elapsed)
-                        report_timing("Prepare amateur prompt for contrastive decoding", amateur_prep_elapsed, enabled=args.timing)
-                        log(
-                            f"Prepared amateur prompt embeddings={tuple(amateur_embeds.shape)} "
-                            f"dtype={amateur_embeds.dtype} device={amateur_embeds.device}; "
-                            f"attention_mask={tuple(amateur_mask.shape)} device={amateur_mask.device}",
-                            level="extensive",
-                        )
+                        amateur_embeds, amateur_mask, _ = prepared_prompts["amateur"]
                     forward_started = time.monotonic()
                     progress = lambda count: log(
                         f"Sample {sample_index}/{len(dataset)} mode={mode} generated "
@@ -455,7 +551,6 @@ def main() -> int:
                             plausibility_threshold=args.plausibility_threshold,
                             progress=progress,
                         )
-                        del amateur_embeds, amateur_mask
                     else:
                         token_ids, answer = decode_one(
                             model, amateur_tokenizer if mode == "amateur" else expert_tokenizer,
@@ -467,12 +562,12 @@ def main() -> int:
                     record_timing(f"{mode} generation", generation_elapsed)
                     report_timing(f"Generate {mode} answer", generation_elapsed, enabled=args.timing)
                     outputs[mode] = {"token_ids": token_ids, "text": answer}
-                    del prompt_embeds, prompt_mask
                     log(
                         f"Sample {sample_index}/{len(dataset)} mode={mode} generated {len(token_ids)} tokens; "
                         f"elapsed={time.monotonic() - modes_started:.1f}s",
                         level="normal",
                     )
+                del prepared_prompts
                 result = {
                     "sample_id": str(sample.get("id", sample_index)),
                     "prompt": prompt_row["conversations"],
