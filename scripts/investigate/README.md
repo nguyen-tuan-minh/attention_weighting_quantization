@@ -110,8 +110,10 @@ their combined use and room for activations and generation caches in mind.
 Keep paired decoding single-sample initially. Use the same image and user
 prompt for each model, cap generation with `--max-new-tokens`, and save each
 mode's generated token IDs and decoded text alongside sample IDs and resolved
-run settings. Log model loading and each model's generation separately at
-extensive verbosity.
+run settings. Print each decoded answer to stdout immediately after its mode
+finishes so long runs show visible results before the JSONL file is complete.
+Log model loading and each model's generation separately at extensive
+verbosity.
 
 Preview each prepared multimodal input before decoding with Matplotlib's
 `imshow` and `show`, then print the expert and amateur's model-formatted

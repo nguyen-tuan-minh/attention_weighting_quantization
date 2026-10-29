@@ -534,6 +534,10 @@ def main() -> int:
                     record_timing(f"{mode} generation", generation_elapsed)
                     report_timing(f"Generate {mode} answer", generation_elapsed, enabled=args.timing)
                     outputs[mode] = {"token_ids": token_ids, "text": answer}
+                    print(
+                        f"\n[Sample {sample_index}/{len(dataset)} | {mode} answer]\n{answer}\n",
+                        flush=True,
+                    )
                     log(
                         f"Sample {sample_index}/{len(dataset)} mode={mode} generated {len(token_ids)} tokens; "
                         f"elapsed={time.monotonic() - modes_started:.1f}s",
