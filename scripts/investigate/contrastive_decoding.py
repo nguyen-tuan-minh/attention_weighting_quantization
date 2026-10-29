@@ -74,7 +74,11 @@ def parse_args() -> argparse.Namespace:
         "--decoding-modes", nargs="+", choices=("expert", "amateur", "contrastive"),
         default=("expert", "contrastive"), help="Decoding runs to compare (default: expert contrastive).",
     )
-    parser.add_argument("--contrastive-weight", type=float, default=0.5, help="Amateur log-probability subtraction weight.")
+    parser.add_argument(
+        "--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits",
+        help="Scores to contrast; logits is raw-logit subtraction, log-probabilities preserves the previous method.",
+    )
+    parser.add_argument("--contrastive-weight", type=float, default=0.5, help="Amateur score subtraction weight.")
     parser.add_argument(
         "--plausibility-threshold", type=float, default=0.1,
         help="Keep tokens whose expert probability is at least this fraction of the expert's top-token probability.",
@@ -277,10 +281,11 @@ def decode_one(
     *,
     amateur: tuple[Any, torch.Tensor, torch.Tensor] | None = None,
     contrastive_weight: float = 0.5,
+    contrastive_score_type: str = "logits",
     plausibility_threshold: float = 0.1,
     progress: Any = None,
 ) -> tuple[list[int], str]:
-    """Greedily decode with one model or expert-minus-amateur token log scores."""
+    """Greedily decode with one model or expert-minus-amateur token logits."""
     embedding = model.get_input_embeddings()
     current_embeds = prompt_embeds
     attention = prompt_mask
@@ -310,10 +315,18 @@ def decode_one(
                 if expert_logits.shape[-1] != amateur_logits.shape[-1]:
                     raise RuntimeError("Expert and amateur output vocabulary sizes differ")
                 expert_log_probs = torch.log_softmax(expert_logits[0], dim=-1)
-                amateur_log_probs = torch.log_softmax(amateur_logits[0].to(expert_log_probs.device), dim=-1)
                 expert_probs = expert_log_probs.exp()
                 allowed = expert_probs >= (expert_probs.max() * plausibility_threshold)
-                scores = (expert_log_probs - contrastive_weight * amateur_log_probs).masked_fill(~allowed, -torch.inf)
+                amateur_logits = amateur_logits[0].to(expert_logits.device)
+                if contrastive_score_type == "logits":
+                    amateur_scores = amateur_logits
+                    expert_scores = expert_logits[0]
+                elif contrastive_score_type == "log-probabilities":
+                    expert_scores = expert_log_probs
+                    amateur_scores = torch.log_softmax(amateur_logits, dim=-1)
+                else:
+                    raise ValueError(f"Unsupported contrastive score type: {contrastive_score_type}")
+                scores = (expert_scores - contrastive_weight * amateur_scores).masked_fill(~allowed, -torch.inf)
 
             next_id = int(scores.argmax().item())
             generated.append(next_id)
@@ -428,7 +441,8 @@ def main() -> int:
         report_timing("Import model runtime", runtime_elapsed, enabled=args.timing)
         log(
             f"Expert={expert_checkpoint}; amateur={amateur_checkpoint}; device={device}; "
-            f"modes={','.join(args.decoding_modes)}; samples={len(dataset)}; max_new_tokens={args.max_new_tokens}",
+            f"modes={','.join(args.decoding_modes)}; contrastive_score_type={args.contrastive_score_type}; "
+            f"samples={len(dataset)}; max_new_tokens={args.max_new_tokens}",
             level="normal",
         )
         need_expert = "expert" in args.decoding_modes or "contrastive" in args.decoding_modes
@@ -520,6 +534,7 @@ def main() -> int:
                             expert, expert_tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
                             amateur=(amateur, amateur_embeds, amateur_mask),
                             contrastive_weight=args.contrastive_weight,
+                            contrastive_score_type=args.contrastive_score_type,
                             plausibility_threshold=args.plausibility_threshold,
                             progress=progress,
                         )
@@ -564,6 +579,7 @@ def main() -> int:
             "expert_model": str(expert_checkpoint), "amateur_model": str(amateur_checkpoint),
             "modes": list(args.decoding_modes), "samples": len(dataset), "seed": seed,
             "contrastive_weight": args.contrastive_weight,
+            "contrastive_score_type": args.contrastive_score_type,
             "plausibility_threshold": args.plausibility_threshold,
             "max_new_tokens": args.max_new_tokens, "device": device,
             "expert_memory_limits_bytes": {
