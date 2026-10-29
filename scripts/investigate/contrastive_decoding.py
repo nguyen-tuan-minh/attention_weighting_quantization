@@ -115,18 +115,28 @@ def load_runtime(qig_root: Path) -> tuple[Any, Any]:
 
 
 def make_max_memory(args: argparse.Namespace, role: str, device: str) -> dict[Any, int] | None:
-    """Build Accelerate's per-checkpoint placement caps for one model role."""
-    result: dict[Any, int] = {}
+    """Build a complete placement map, preserving automatic budgets for unset tiers."""
     gpu_limit = getattr(args, f"max_{role}_model_memory_gpu")
     cpu_limit = getattr(args, f"max_{role}_model_memory_cpu")
-    if gpu_limit is not None:
-        if device == "cpu":
-            raise ValueError(f"--max-{role}-model-memory-gpu requires a CUDA --device")
+    if gpu_limit is None and cpu_limit is None:
+        return None
+    if gpu_limit is not None and device == "cpu":
+        raise ValueError(f"--max-{role}-model-memory-gpu requires a CUDA --device")
+
+    # Accelerate treats a supplied max_memory mapping as the complete set of
+    # placement budgets. Leaving "cpu" out when the user only caps the GPU can
+    # make overflow go straight to disk. Start with detected free capacities,
+    # then override only the tiers the user explicitly capped.
+    from accelerate.utils import get_max_memory
+
+    available = get_max_memory()
+    result: dict[Any, int] = {"cpu": cpu_limit if cpu_limit is not None else available["cpu"]}
+    if device != "cpu":
         gpu_index = int(device.split(":", 1)[1]) if device.startswith("cuda:") else 0
-        result[gpu_index] = gpu_limit
-    if cpu_limit is not None:
-        result["cpu"] = cpu_limit
-    return result or None
+        if gpu_index not in available:
+            raise ValueError(f"CUDA device {gpu_index} is unavailable for {role} model placement")
+        result[gpu_index] = gpu_limit if gpu_limit is not None else available[gpu_index]
+    return result
 
 
 def load_model(
@@ -146,6 +156,10 @@ def load_model(
     offload_dir = output_dir / ".model-offload" / role
     offload_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    log(
+        f"Loading {role} model with max_memory={max_memory if max_memory is not None else 'automatic'}",
+        level="extensive",
+    )
     tokenizer, model, image_processor, _ = builder(
         str(checkpoint), None, "llava-v1.5-7b", device_map="cpu" if device == "cpu" else "auto",
         torch_dtype=model_config.get("torch_dtype", "float16"),

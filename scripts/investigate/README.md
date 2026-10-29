@@ -99,7 +99,10 @@ vocabularies, special token IDs, and image processing settings match.
 Give each checkpoint its own optional placement caps:
 `--max-expert-model-memory-gpu`, `--max-expert-model-memory-cpu`,
 `--max-amateur-model-memory-gpu`, and `--max-amateur-model-memory-cpu`.
-Omitted limits mean automatic/unlimited placement. Memory values accept B,
+If all caps are omitted, let Accelerate choose placement. If one tier is capped,
+the script supplies Accelerate's detected available capacity for the other
+unset tier, so a GPU-only cap can still use CPU RAM before disk offload. Set a
+tier to `0GB` to prohibit placement there. Memory values accept B,
 KB, MB, GB, TB, KiB, MiB, GiB, or TiB; an unsuffixed number means decimal GB.
 The limits describe weight placement for each model, so choose values with
 their combined use and room for activations and generation caches in mind.

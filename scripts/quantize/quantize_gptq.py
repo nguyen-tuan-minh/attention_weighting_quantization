@@ -703,10 +703,22 @@ def main() -> int:
         shutil.rmtree(packed_dir)
     packed_dir.mkdir(parents=True, exist_ok=True)
     max_memory = {}
-    if args.max_model_memory_gpu is not None:
-        max_memory[0] = args.max_model_memory_gpu
-    if args.max_model_memory_cpu is not None:
-        max_memory["cpu"] = args.max_model_memory_cpu
+    if args.max_model_memory_gpu is not None or args.max_model_memory_cpu is not None:
+        # When Accelerate receives a partial max_memory map, omitted devices
+        # can be excluded from placement and cause weights to spill to disk.
+        # Use its detected available capacities for unset tiers, then apply
+        # explicit user caps (including an intentional 0-byte cap).
+        from accelerate.utils import get_max_memory
+
+        available = get_max_memory()
+        max_memory[0] = (
+            args.max_model_memory_gpu
+            if args.max_model_memory_gpu is not None else available[0]
+        )
+        max_memory["cpu"] = (
+            args.max_model_memory_cpu
+            if args.max_model_memory_cpu is not None else available["cpu"]
+        )
     log(
         f"Loading checkpoint with Accelerate offload; forward execution device is CUDA "
         f"(GPU 0), weights may be stored on GPU/CPU/disk; "

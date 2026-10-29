@@ -36,7 +36,10 @@ of adjacent decoder layers in a group; larger groups reduce the number of
 passes and Hessian saves, but need more VRAM for active Hessians and forward
 workspace. Extensive logs report planned forwards, per-group progress, and
 load/save/forward timings. GPU and CPU placement limits
-default to unset, so Accelerate chooses placement automatically. If you set
+default to unset, so Accelerate chooses placement automatically. If you cap
+only one tier, the script fills the other tier with Accelerate's detected
+available capacity, so a GPU-only cap still allows CPU placement before disk
+offload. Set a tier to `0GB` to prohibit placement there. If you set
 `--max-model-memory-gpu`, leave enough VRAM beyond the resident weights for the active
 Hessian group and forward workspace; reduce `--hessian-group-layers` if GPU
 allocation fails.
