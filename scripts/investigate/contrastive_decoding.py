@@ -248,7 +248,7 @@ def print_prompt_comparison(
     terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
     column_width = max(24, min(72, (terminal_width - 3) // 2))
     wrapped = [
-        textwrap.wrap(prompt, width=column_width, replace_whitespace=False, drop_whitespace=False)
+        textwrap.wrap(" ".join(prompt.split()), width=column_width)
         or [""]
         for _, prompt in columns
     ]
