@@ -234,40 +234,12 @@ def print_prompt_comparison(
     expert_prompt: str | None,
     amateur_prompt: str | None,
 ) -> None:
-    """Display the sample image where interactive display is available and print prompts in two columns."""
-    displayed_inline = False
-    try:
-        from IPython import get_ipython
-        from IPython.display import display
+    """Display the sample image with Matplotlib and print both prompts in two columns."""
+    import matplotlib.pyplot as plt
 
-        if get_ipython() is not None:
-            display(image)
-            displayed_inline = True
-    except ImportError:
-        pass
-
-    if not displayed_inline:
-        try:
-            import matplotlib
-            import matplotlib.pyplot as plt
-
-            backend = matplotlib.get_backend().lower()
-            if backend in {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}:
-                raise RuntimeError(f"matplotlib backend {backend!r} has no interactive display")
-            figure, axis = plt.subplots()
-            axis.imshow(image)
-            axis.axis("off")
-            manager = getattr(figure.canvas, "manager", None)
-            if manager is not None and hasattr(manager, "set_window_title"):
-                manager.set_window_title(f"Contrastive decoding sample {sample_index}")
-            plt.show(block=True)
-            plt.close(figure)
-        except (ImportError, RuntimeError, ValueError) as error:
-            print(
-                f"Sample {sample_index}: could not display the image in this process ({error}). "
-                "Run the script in a notebook kernel for inline display.",
-                flush=True,
-            )
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show()
 
     columns = [
         ("EXPERT PROMPT", expert_prompt or "(not prepared for this run)"),

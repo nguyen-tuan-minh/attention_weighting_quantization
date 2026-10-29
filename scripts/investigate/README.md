@@ -113,12 +113,10 @@ mode's generated token IDs and decoded text alongside sample IDs and resolved
 run settings. Log model loading and each model's generation separately at
 extensive verbosity.
 
-Preview each prepared multimodal input before decoding: display the in-memory
-image inline in a notebook or in a desktop plotting window, then print the
-expert and amateur's model-formatted prompts in two columns. The preview is
-enabled by default; use `--no-preview-inputs` to disable it. To display inline
-in Colab, run the script in the notebook kernel; a `!python` child process
-cannot publish an inline image to the notebook output.
+Preview each prepared multimodal input before decoding with Matplotlib's
+`imshow` and `show`, then print the expert and amateur's model-formatted
+prompts in two columns. The preview is enabled by default; use
+`--no-preview-inputs` to disable it. The image is not saved to a file.
 
 ## Resource and memory conventions
 
