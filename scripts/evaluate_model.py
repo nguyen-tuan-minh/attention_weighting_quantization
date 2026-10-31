@@ -40,6 +40,24 @@ def parse_memory_size(value: str) -> int:
     return int(float(match.group(1)) * MEMORY_UNITS[unit])
 
 
+def lmms_subprocess_environment() -> dict[str, str]:
+    """Make the project and vendored evaluation packages importable by child Python processes."""
+    qig_root = REPOSITORY_ROOT / "third_party" / "QIG"
+    source_paths = (
+        REPOSITORY_ROOT / "src",
+        qig_root,
+        qig_root / "3rdparty" / "LLaVA-NeXT",
+        qig_root / "3rdparty" / "lmms-eval",
+    )
+    environment = os.environ.copy()
+    existing_paths = environment.get("PYTHONPATH", "").split(os.pathsep)
+    python_paths = [str(path) for path in source_paths if path.is_dir()]
+    python_paths.extend(path for path in existing_paths if path and path not in python_paths)
+    if python_paths:
+        environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+    return environment
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -554,6 +572,8 @@ def main() -> int:
     if args.model_args:
         model_args.append(args.model_args.strip().strip(","))
 
+    subprocess_environment = lmms_subprocess_environment()
+
     if args.contrastive_amateur is not None:
         if args.overlay_dir is not None:
             raise ValueError("Use a standalone expert checkpoint for contrastive evaluation; --overlay-dir is not supported here")
@@ -597,7 +617,9 @@ def main() -> int:
             print(f"Amateur model: {amateur}", flush=True)
             print(f"Contrastive weight: {weight}; score type: {args.contrastive_score_type}", flush=True)
             print(f"LMMS-Eval results: {weight_output_dir}", flush=True)
-            result = subprocess.run(command, cwd=REPOSITORY_ROOT, check=False)
+            result = subprocess.run(
+                command, cwd=REPOSITORY_ROOT, env=subprocess_environment, check=False
+            )
             if result.returncode != 0:
                 return result.returncode
         print(f"Completed contrastive weight sweep: {', '.join(map(str, contrastive_weights))}", flush=True)
@@ -638,7 +660,8 @@ def main() -> int:
         if not args.remove_new_task_data:
             print(f"Tasks: {args.tasks}", flush=True)
             return subprocess.run(
-                [*command, "--tasks", args.tasks], cwd=REPOSITORY_ROOT, check=False
+                [*command, "--tasks", args.tasks], cwd=REPOSITORY_ROOT,
+                env=subprocess_environment, check=False,
             ).returncode
 
         tasks = [task.strip() for task in args.tasks.split(",") if task.strip()]
@@ -660,7 +683,8 @@ def main() -> int:
             ]
             try:
                 task_result = subprocess.run(
-                    [*command, "--tasks", task], cwd=REPOSITORY_ROOT, check=False
+                    [*command, "--tasks", task], cwd=REPOSITORY_ROOT,
+                    env=subprocess_environment, check=False,
                 )
             finally:
                 removed = remove_new_cache_files(cache_state, hub_cache, model_cache_subtree)
