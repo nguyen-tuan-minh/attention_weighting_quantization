@@ -87,6 +87,10 @@ def parse_args() -> argparse.Namespace:
         help="Save each sample image and print the expert/amateur prompts before decoding (default: on).",
     )
     parser.add_argument(
+        "--display-images", action="store_true",
+        help="Display each sample image with matplotlib before prompt preparation (default: off).",
+    )
+    parser.add_argument(
         "--save-images-only", action="store_true",
         help="Save the selected local sample images to --output-dir, then exit without loading model code or weights.",
     )
@@ -527,6 +531,13 @@ def main() -> int:
                     "id": str(sample.get("id", sample_index)), "image": "local",
                 }
                 image = sample["image"].convert("RGB") if hasattr(sample["image"], "convert") else sample["image"]
+                if args.display_images:
+                    import matplotlib.pyplot as plt
+
+                    plt.imshow(image)
+                    plt.axis("off")
+                    plt.title(f"Sample {sample_index}/{len(dataset)}")
+                    plt.show()
                 outputs: dict[str, dict[str, Any]] = {}
                 modes_started = time.monotonic()
                 needed_roles = set()
