@@ -1,0 +1,22 @@
+# Minimal additions/compatibility fixes for the supplied GPU Colab image.
+# Keep Colab's existing CUDA PyTorch, torchvision, datasets, NumPy, and other
+# preinstalled packages; do not reinstall the large GPU wheels.
+
+# The vendored LLaVA/QIG code targets Transformers 4.49 and its tokenizer API.
+transformers==4.49.0
+tokenizers>=0.21.0,<0.22.0
+huggingface_hub>=0.26.0,<1.0
+
+# Missing runtime dependencies used by project scripts and LMMS-Eval/LLaVA.
+evaluate==0.4.1
+ftfy>=6.1.0
+loguru>=0.7.0
+sacrebleu>=1.5.0
+sqlitedict==2.1.0
+pytablewriter>=0.64.0
+av>=11.0.0
+decord>=0.6.0
+shortuuid>=1.0.11
+jsonlines>=4.0.0
+pycocoevalcap==1.2
+tqdm-multiprocess>=0.0.11
