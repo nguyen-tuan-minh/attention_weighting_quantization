@@ -76,7 +76,20 @@ def parse_args() -> argparse.Namespace:
         "--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits",
         help="Scores to contrast; logits is raw-logit subtraction, log-probabilities preserves the previous method.",
     )
-    parser.add_argument("--contrastive-weight", type=float, default=0.5, help="Amateur score subtraction weight.")
+    parser.add_argument(
+        "--generation-modes", nargs="+", choices=("greedy", "probabilistic"),
+        default=("greedy",), help="Generation strategy or strategies to run (default: greedy).",
+    )
+    parser.add_argument(
+        "--num-generations", type=int, default=1,
+        help="Number of independent responses per probabilistic setting (default: 1).",
+    )
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for probabilistic generation.")
+    parser.add_argument("--top-p", type=float, default=0.9, help="Nucleus probability threshold for probabilistic generation.")
+    parser.add_argument(
+        "--contrastive-weight", type=float, nargs="+", default=(0.5,),
+        help="One or more amateur score subtraction weights (default: 0.5).",
+    )
     parser.add_argument(
         "--plausibility-threshold", type=float, default=0.1,
         help="Keep tokens whose expert probability is at least this fraction of the expert's top-token probability.",
@@ -304,9 +317,12 @@ def decode_one(
     contrastive_weight: float = 0.5,
     contrastive_score_type: str = "logits",
     plausibility_threshold: float = 0.1,
+    generation_mode: str = "greedy",
+    temperature: float = 0.8,
+    top_p: float = 0.9,
     progress: Any = None,
 ) -> tuple[list[int], str]:
-    """Greedily decode with one model or expert-minus-amateur token logits."""
+    """Decode greedily or probabilistically with one model or contrastive scores."""
     import torch
 
     embedding = model.get_input_embeddings()
@@ -351,7 +367,18 @@ def decode_one(
                     raise ValueError(f"Unsupported contrastive score type: {contrastive_score_type}")
                 scores = (expert_scores - contrastive_weight * amateur_scores).masked_fill(~allowed, -torch.inf)
 
-            next_id = int(scores.argmax().item())
+            if generation_mode == "greedy":
+                next_id = int(scores.argmax().item())
+            elif generation_mode == "probabilistic":
+                probabilities = torch.softmax(scores / temperature, dim=-1)
+                sorted_probabilities, sorted_ids = torch.sort(probabilities, descending=True)
+                cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=0)
+                remove_after_nucleus = cumulative_probabilities - sorted_probabilities >= top_p
+                probabilities[sorted_ids[remove_after_nucleus]] = 0.0
+                probabilities /= probabilities.sum()
+                next_id = int(torch.multinomial(probabilities, num_samples=1).item())
+            else:
+                raise ValueError(f"Unsupported generation mode: {generation_mode}")
             generated.append(next_id)
             if progress is not None and (step + 1) % 16 == 0:
                 progress(step + 1)
@@ -406,12 +433,26 @@ def main() -> int:
             raise ValueError("--samples must be positive")
         if not args.save_images_only and args.max_new_tokens < 1:
             raise ValueError("--max-new-tokens must be positive")
-        if not args.save_images_only and (not math.isfinite(args.contrastive_weight) or args.contrastive_weight < 0):
-            raise ValueError("--contrastive-weight must be finite and non-negative")
+        if not args.save_images_only and args.num_generations < 1:
+            raise ValueError("--num-generations must be positive")
+        if not args.save_images_only and (
+            not math.isfinite(args.temperature) or args.temperature <= 0
+        ):
+            raise ValueError("--temperature must be finite and positive")
+        if not args.save_images_only and (
+            not math.isfinite(args.top_p) or not 0 < args.top_p <= 1
+        ):
+            raise ValueError("--top-p must be in (0, 1]")
+        if not args.save_images_only and any(
+            not math.isfinite(weight) or weight < 0 for weight in args.contrastive_weight
+        ):
+            raise ValueError("all --contrastive-weight values must be finite and non-negative")
         if not args.save_images_only and (not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1):
             raise ValueError("--plausibility-threshold must be in (0, 1]")
         if not args.save_images_only and len(set(args.decoding_modes)) != len(args.decoding_modes):
             raise ValueError("--decoding-modes cannot repeat a mode")
+        if not args.save_images_only and len(set(args.generation_modes)) != len(args.generation_modes):
+            raise ValueError("--generation-modes cannot repeat a mode")
         if not args.save_images_only and "amateur" in args.decoding_modes and not args.amateur_model:
             raise ValueError("--amateur-model is required when decoding with the amateur or contrastive mode")
         if not args.save_images_only and "contrastive" in args.decoding_modes and not args.amateur_model:
@@ -493,8 +534,12 @@ def main() -> int:
         report_timing("Import model runtime", runtime_elapsed, enabled=args.timing)
         log(
             f"Expert={expert_checkpoint}; amateur={amateur_checkpoint}; device={device}; "
-            f"modes={','.join(args.decoding_modes)}; contrastive_score_type={args.contrastive_score_type}; "
-            f"samples={len(dataset)}; max_new_tokens={args.max_new_tokens}",
+            f"decoding_modes={','.join(args.decoding_modes)}; "
+            f"generation_modes={','.join(args.generation_modes)}; "
+            f"contrastive_weights={','.join(map(str, args.contrastive_weight))}; "
+            f"contrastive_score_type={args.contrastive_score_type}; samples={len(dataset)}; "
+            f"probabilistic_generations={args.num_generations}; temperature={args.temperature}; "
+            f"top_p={args.top_p}; max_new_tokens={args.max_new_tokens}",
             level="normal",
         )
         need_expert = "expert" in args.decoding_modes or "contrastive" in args.decoding_modes
@@ -512,6 +557,11 @@ def main() -> int:
             if "contrastive" in args.decoding_modes:
                 validate_compatibility(expert_tokenizer, amateur_tokenizer, expert_adapter, amateur_adapter)
                 log("Expert and amateur tokenizers and image processors are compatible", level="extensive")
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         # ====================================================================
         # 3. REGISTER HOOKS
@@ -540,7 +590,7 @@ def main() -> int:
                     plt.axis("off")
                     plt.title(f"Sample {sample_index}/{len(dataset)}")
                     plt.show()
-                outputs: dict[str, dict[str, Any]] = {}
+                outputs: dict[str, list[dict[str, Any]]] = {}
                 modes_started = time.monotonic()
                 needed_roles = set()
                 if "expert" in args.decoding_modes or "contrastive" in args.decoding_modes:
@@ -578,47 +628,73 @@ def main() -> int:
 
                 for mode in args.decoding_modes:
                     model = amateur if mode == "amateur" else expert
-                    prompt_embeds, prompt_mask, _ = prepared_prompts[
-                        "amateur" if mode == "amateur" else "expert"
-                    ]
+                    prompt_role = "amateur" if mode == "amateur" else "expert"
+                    prompt_embeds, prompt_mask, _ = prepared_prompts[prompt_role]
                     if mode == "contrastive":
                         amateur_embeds, amateur_mask, _ = prepared_prompts["amateur"]
-                    forward_started = time.monotonic()
-                    progress = lambda count: log(
-                        f"Sample {sample_index}/{len(dataset)} mode={mode} generated "
-                        f"{count}/{args.max_new_tokens} tokens"
-                    )
-                    if mode == "contrastive":
-                        token_ids, answer = decode_one(
-                            expert, expert_tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
-                            amateur=(amateur, amateur_embeds, amateur_mask),
-                            contrastive_weight=args.contrastive_weight,
-                            contrastive_score_type=args.contrastive_score_type,
-                            plausibility_threshold=args.plausibility_threshold,
-                            progress=progress,
-                        )
+                        weights: list[float | None] = list(args.contrastive_weight)
                     else:
-                        token_ids, answer = decode_one(
-                            model, amateur_tokenizer if mode == "amateur" else expert_tokenizer,
-                            prompt_embeds, prompt_mask, args.max_new_tokens, progress=progress,
-                        )
-                    if args.timing and torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    generation_elapsed = time.monotonic() - forward_started
-                    record_timing(f"{mode} generation", generation_elapsed)
-                    report_timing(f"Generate {mode} answer", generation_elapsed, enabled=args.timing)
-                    outputs[mode] = {"token_ids": token_ids, "text": answer}
-                    answer_width = shutil.get_terminal_size(fallback=(100, 24)).columns
-                    print(
-                        f"\n[Sample {sample_index}/{len(dataset)} | {mode} answer]\n"
-                        f"{wrap_display_text(answer, answer_width)}\n",
-                        flush=True,
-                    )
-                    log(
-                        f"Sample {sample_index}/{len(dataset)} mode={mode} generated {len(token_ids)} tokens; "
-                        f"elapsed={time.monotonic() - modes_started:.1f}s",
-                        level="normal",
-                    )
+                        amateur_embeds = amateur_mask = None
+                        weights = [None]
+
+                    for weight in weights:
+                        for generation_mode in args.generation_modes:
+                            generation_count = args.num_generations if generation_mode == "probabilistic" else 1
+                            for generation_index in range(1, generation_count + 1):
+                                forward_started = time.monotonic()
+                                weight_label = f" weight={weight}" if weight is not None else ""
+                                progress = lambda count: log(
+                                    f"Sample {sample_index}/{len(dataset)} mode={mode}"
+                                    f"{weight_label} generation={generation_mode} #{generation_index} "
+                                    f"generated {count}/{args.max_new_tokens} tokens"
+                                )
+                                if mode == "contrastive":
+                                    token_ids, answer = decode_one(
+                                        expert, expert_tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
+                                        amateur=(amateur, amateur_embeds, amateur_mask),
+                                        contrastive_weight=float(weight),
+                                        contrastive_score_type=args.contrastive_score_type,
+                                        plausibility_threshold=args.plausibility_threshold,
+                                        generation_mode=generation_mode,
+                                        temperature=args.temperature,
+                                        top_p=args.top_p,
+                                        progress=progress,
+                                    )
+                                else:
+                                    token_ids, answer = decode_one(
+                                        model, amateur_tokenizer if mode == "amateur" else expert_tokenizer,
+                                        prompt_embeds, prompt_mask, args.max_new_tokens,
+                                        generation_mode=generation_mode,
+                                        temperature=args.temperature,
+                                        top_p=args.top_p,
+                                        progress=progress,
+                                    )
+                                if args.timing and torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                generation_elapsed = time.monotonic() - forward_started
+                                timing_label = f"{mode} {generation_mode} generation"
+                                record_timing(timing_label, generation_elapsed)
+                                report_timing(f"Generate {mode} {generation_mode} answer", generation_elapsed, enabled=args.timing)
+                                outputs.setdefault(mode, []).append({
+                                    "generation_mode": generation_mode,
+                                    "generation_index": generation_index,
+                                    "contrastive_weight": weight,
+                                    "token_ids": token_ids,
+                                    "text": answer,
+                                })
+                                answer_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+                                print(
+                                    f"\n[Sample {sample_index}/{len(dataset)} | {mode}{weight_label} | "
+                                    f"{generation_mode} #{generation_index}]\n"
+                                    f"{wrap_display_text(answer, answer_width)}\n",
+                                    flush=True,
+                                )
+                                log(
+                                    f"Sample {sample_index}/{len(dataset)} mode={mode}{weight_label} "
+                                    f"generation={generation_mode} #{generation_index} generated "
+                                    f"{len(token_ids)} tokens; elapsed={time.monotonic() - modes_started:.1f}s",
+                                    level="normal",
+                                )
                 del prepared_prompts
                 result = {
                     "sample_id": str(sample.get("id", sample_index)),
@@ -638,8 +714,12 @@ def main() -> int:
         # ====================================================================
         metadata = {
             "expert_model": str(expert_checkpoint), "amateur_model": str(amateur_checkpoint),
-            "modes": list(args.decoding_modes), "samples": len(dataset), "seed": seed,
-            "contrastive_weight": args.contrastive_weight,
+            "decoding_modes": list(args.decoding_modes),
+            "generation_modes": list(args.generation_modes),
+            "num_probabilistic_generations": args.num_generations,
+            "temperature": args.temperature, "top_p": args.top_p,
+            "samples": len(dataset), "seed": seed,
+            "contrastive_weights": list(args.contrastive_weight),
             "contrastive_score_type": args.contrastive_score_type,
             "plausibility_threshold": args.plausibility_threshold,
             "max_new_tokens": args.max_new_tokens, "device": device,

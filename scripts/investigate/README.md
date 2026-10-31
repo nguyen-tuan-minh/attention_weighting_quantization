@@ -246,10 +246,15 @@ optional reference override when the base path normally comes from
   correlates them with an answer-level divergence/loss metric.
 - `contrastive_decoding.py`: compares expert-only and expert-amateur
   contrastive decoding on identical multimodal prompts. It can also run the
-  amateur-only baseline and saves token IDs, decoded answers, and run settings
-  under `outputs/investigations/contrastive-decoding` by default.
+  amateur-only baseline, greedy or probabilistic generation, and multiple
+  contrastive weights. Probabilistic mode uses temperature and top-p sampling;
+  `--num-generations` sets the number of draws for each probabilistic setting.
+  Greedy mode generates one answer per setting. It saves token IDs, decoded
+  answers, and run settings under `outputs/investigations/contrastive-decoding`
+  by default.
 
-Example, comparing expert-only greedy decoding with contrastive decoding:
+Example, comparing expert and contrastive greedy decoding with five
+probabilistic generations per setting at three contrastive weights:
 
 ```bash
 python scripts/investigate/contrastive_decoding.py \
@@ -257,7 +262,11 @@ python scripts/investigate/contrastive_decoding.py \
   --samples 2 \
   --seed 42 \
   --decoding-modes expert contrastive \
-  --contrastive-weight 0.5 \
+  --generation-modes greedy probabilistic \
+  --num-generations 5 \
+  --temperature 0.8 \
+  --top-p 0.9 \
+  --contrastive-weight 0.1 0.5 1.0 \
   --plausibility-threshold 0.1 \
   --max-new-tokens 128 \
   --max-expert-model-memory-gpu 10GB \
