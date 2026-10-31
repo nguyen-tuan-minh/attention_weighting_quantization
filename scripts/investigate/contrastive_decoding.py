@@ -232,6 +232,22 @@ def prepare_prompt(
     return prompt_inputs["inputs_embeds"], prompt_kwargs["attention_mask"], prompt_text
 
 
+def wrap_display_text(text: str, width: int) -> str:
+    """Wrap text to a display width while preserving explicit paragraph breaks."""
+    paragraphs = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    wrapped_paragraphs = [
+        textwrap.fill(
+            paragraph,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if paragraph.strip() else ""
+        for paragraph in paragraphs
+    ]
+    return "\n".join(wrapped_paragraphs)
+
+
 def print_prompt_comparison(
     sample_index: int,
     image: Any,
@@ -251,8 +267,7 @@ def print_prompt_comparison(
     terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
     column_width = max(24, min(72, (terminal_width - 3) // 2))
     wrapped = [
-        textwrap.wrap(" ".join(prompt.split()), width=column_width)
-        or [""]
+        wrap_display_text(prompt, column_width).split("\n")
         for _, prompt in columns
     ]
     print(f"Sample {sample_index} prompts (image token shown as [IMAGE]):", flush=True)
@@ -549,8 +564,10 @@ def main() -> int:
                     record_timing(f"{mode} generation", generation_elapsed)
                     report_timing(f"Generate {mode} answer", generation_elapsed, enabled=args.timing)
                     outputs[mode] = {"token_ids": token_ids, "text": answer}
+                    answer_width = shutil.get_terminal_size(fallback=(100, 24)).columns
                     print(
-                        f"\n[Sample {sample_index}/{len(dataset)} | {mode} answer]\n{answer}\n",
+                        f"\n[Sample {sample_index}/{len(dataset)} | {mode} answer]\n"
+                        f"{wrap_display_text(answer, answer_width)}\n",
                         flush=True,
                     )
                     log(
