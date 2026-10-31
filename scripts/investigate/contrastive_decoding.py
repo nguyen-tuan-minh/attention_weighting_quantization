@@ -13,8 +13,6 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-import torch
-
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -67,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-config", type=Path, default=ROOT / "configs/model.yaml")
     parser.add_argument("--dataset-config", type=Path, default=ROOT / "configs/dataset.yaml")
     parser.add_argument("--expert-model", type=Path, default=None, help="Expert checkpoint; defaults to model.yaml.")
-    parser.add_argument("--amateur-model", type=Path, required=True, help="Amateur checkpoint used for contrastive scores.")
+    parser.add_argument("--amateur-model", type=Path, default=None, help="Amateur checkpoint used for contrastive scores.")
     parser.add_argument("--samples", type=int, default=None, help="Override dataset.yaml calibration_samples.")
     parser.add_argument("--seed", type=int, default=None, help="Override dataset.yaml calibration_seed.")
     parser.add_argument(
@@ -87,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preview-inputs", action=argparse.BooleanOptionalAction, default=True,
         help="Save each sample image and print the expert/amateur prompts before decoding (default: on).",
+    )
+    parser.add_argument(
+        "--save-images-only", action="store_true",
+        help="Save the selected local sample images to --output-dir, then exit without loading model code or weights.",
     )
     parser.add_argument("--device", default=None, help="CUDA device used for automatic placement, such as cuda:0; defaults to model.yaml.")
     for role in ("expert", "amateur"):
@@ -396,24 +398,20 @@ def main() -> int:
     try:
         if args.samples is not None and args.samples < 1:
             raise ValueError("--samples must be positive")
-        if args.max_new_tokens < 1:
+        if not args.save_images_only and args.max_new_tokens < 1:
             raise ValueError("--max-new-tokens must be positive")
-        if not math.isfinite(args.contrastive_weight) or args.contrastive_weight < 0:
+        if not args.save_images_only and (not math.isfinite(args.contrastive_weight) or args.contrastive_weight < 0):
             raise ValueError("--contrastive-weight must be finite and non-negative")
-        if not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1:
+        if not args.save_images_only and (not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1):
             raise ValueError("--plausibility-threshold must be in (0, 1]")
-        if len(set(args.decoding_modes)) != len(args.decoding_modes):
+        if not args.save_images_only and len(set(args.decoding_modes)) != len(args.decoding_modes):
             raise ValueError("--decoding-modes cannot repeat a mode")
-        if "contrastive" in args.decoding_modes and "amateur" not in args.decoding_modes and not args.amateur_model:
+        if not args.save_images_only and "amateur" in args.decoding_modes and not args.amateur_model:
+            raise ValueError("--amateur-model is required when decoding with the amateur or contrastive mode")
+        if not args.save_images_only and "contrastive" in args.decoding_modes and not args.amateur_model:
             raise ValueError("--amateur-model is required for contrastive decoding")
 
-        model_config = read_yaml(args.model_config)
         dataset_config = read_yaml(args.dataset_config)
-        expert_checkpoint = resolve_path(args.expert_model or model_config.get("model_dir") or model_config.get("model_id"))
-        amateur_checkpoint = resolve_path(args.amateur_model)
-        device = args.device or model_config.get("device_map", "cuda:0")
-        if device not in {"cpu", "cuda", "auto"} and not re.fullmatch(r"cuda:\d+", device):
-            raise ValueError("--device must be cpu, auto, cuda, or a CUDA device such as cuda:0")
         sample_count = args.samples if args.samples is not None else dataset_config.get("calibration_samples", 2)
         seed = args.seed if args.seed is not None else dataset_config.get("calibration_seed")
         if not isinstance(sample_count, int) or sample_count < 1:
@@ -422,6 +420,39 @@ def main() -> int:
             raise ValueError("dataset calibration_seed must be an integer or null")
         output_dir = resolve_path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        if args.save_images_only:
+            dataset_started = time.monotonic()
+            source = dataset_config.get("calibration_source", "coco")
+            dataset = load_sharegpt4v_dataset(
+                source=source, config_path=args.dataset_config,
+                download_images=False, existing_images_only=True,
+            )
+            if sample_count > len(dataset):
+                raise ValueError(f"Requested {sample_count} samples but only {len(dataset)} records have local images")
+            if seed is not None or sample_count < len(dataset):
+                dataset = dataset.shuffle(seed=seed).select(range(sample_count))
+            dataset_elapsed = time.monotonic() - dataset_started
+            record_timing("dataset loading and sample selection", dataset_elapsed)
+            report_timing("Load dataset and select examples", dataset_elapsed, enabled=args.timing)
+            for sample_index, sample in enumerate(dataset, start=1):
+                image = sample["image"]
+                if not hasattr(image, "save"):
+                    raise TypeError(f"Sample {sample.get('id', sample_index)} image is not a saveable image")
+                image_path = output_dir / f"sample-{sample_index:04d}.png"
+                image.convert("RGB").save(image_path)
+                log(f"Saved sample {sample_index}/{len(dataset)} image: {image_path}")
+            log(f"Saved {len(dataset)} sample images to {output_dir}")
+            emit_timing_summary(started, enabled=args.log_level == "extensive")
+            return 0
+
+        import torch
+
+        model_config = read_yaml(args.model_config)
+        expert_checkpoint = resolve_path(args.expert_model or model_config.get("model_dir") or model_config.get("model_id"))
+        amateur_checkpoint = resolve_path(args.amateur_model) if args.amateur_model else None
+        device = args.device or model_config.get("device_map", "cuda:0")
+        if device not in {"cpu", "cuda", "auto"} and not re.fullmatch(r"cuda:\d+", device):
+            raise ValueError("--device must be cpu, auto, cuda, or a CUDA device such as cuda:0")
         results_path = output_dir / "results.jsonl"
         metadata_path = output_dir / "run_config.json"
         if not args.overwrite and (results_path.exists() or metadata_path.exists()):
