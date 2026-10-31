@@ -307,6 +307,8 @@ def decode_one(
     progress: Any = None,
 ) -> tuple[list[int], str]:
     """Greedily decode with one model or expert-minus-amateur token logits."""
+    import torch
+
     embedding = model.get_input_embeddings()
     current_embeds = prompt_embeds
     attention = prompt_mask
