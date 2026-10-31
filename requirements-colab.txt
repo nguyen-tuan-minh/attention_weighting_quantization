@@ -8,6 +8,7 @@ tokenizers>=0.21.0,<0.22.0
 huggingface_hub>=0.26.0,<1.0
 
 # Missing runtime dependencies used by project scripts and LMMS-Eval/LLaVA.
+hf_transfer
 evaluate==0.4.1
 ftfy>=6.1.0
 loguru>=0.7.0
