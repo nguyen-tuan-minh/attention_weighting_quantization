@@ -35,6 +35,11 @@ Phase 4 normally runs inference without gradients. A gradient investigation can
 enable gradients deliberately; document which activations require gradients and
 which loss is differentiated so this exception is clear.
 
+`investigate_grad_important.py` accepts `--model-path` to run a local checkpoint
+without editing `configs/model.yaml`. Use `--answer-mode generate` to print a
+greedy answer for each selected image before the script computes its gradient
+analysis; the script still performs that analysis and displays its plots.
+
 Read CLI arguments and configs before phase 1, and validate them before loading
 large resources. These setup steps do not replace or renumber the five phases.
 

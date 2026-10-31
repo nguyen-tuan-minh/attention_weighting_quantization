@@ -906,6 +906,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPOSITORY_ROOT / "configs" / "model.yaml",
     )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=None,
+        help="Local checkpoint directory overriding model_dir in --model-config.",
+    )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
     parser.add_argument("--seed", type=int, default=None, help="Override configured sample seed.")
     parser.add_argument(
@@ -1056,12 +1062,20 @@ def main() -> int:
         # dataset: datasets.Dataset, selected COCO rows with local images.
         # model_config: dict[str, Any], model YAML values loaded during setup.
         model_started = time.perf_counter() if args.timing else None
-        model_id = model_config["model_id"]
-        model_dir = repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
+        model_id = model_config.get("model_id", "")
+        model_dir = (
+            repository_path(args.model_path)
+            if args.model_path is not None
+            else repository_path(model_config.get("model_dir", "models/llava-v1.5-7b"))
+        )
         has_weights = any(model_dir.glob("pytorch_model*.bin")) or any(
             model_dir.glob("model*.safetensors")
         )
         if not (model_dir / "config.json").is_file() or not has_weights:
+            if args.model_path is not None:
+                raise FileNotFoundError(
+                    f"--model-path must point to a local checkpoint with config.json and model weights: {model_dir}"
+                )
             model_dir.mkdir(parents=True, exist_ok=True)
             log(f"Downloading LLaVA checkpoint {model_id} to {model_dir}")
             snapshot_download(repo_id=model_id, local_dir=str(model_dir))
@@ -1076,7 +1090,7 @@ def main() -> int:
         model.requires_grad_(False)
         model_parameter = next(model.parameters())
         log(
-            f"Loaded model_id={model_id}, model_dir={model_dir}, "
+            f"Loaded model_id={model_id or model_dir.name}, model_dir={model_dir}, "
             f"device={model_parameter.device}, dtype={model_parameter.dtype}, "
             f"attn_implementation={model_config.get('attn_implementation', 'eager')}",
             level="extensive",

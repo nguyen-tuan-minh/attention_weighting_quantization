@@ -30,11 +30,13 @@ def load_qig_llava_model(
         raise FileNotFoundError(f"Complete LLaVA checkpoint files were not found under {checkpoint}")
     model_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
     architectures = model_config.get("architectures", [])
-    if model_config.get("model_type") != "llava" or (
-        architectures and not any(name == "LlavaLlamaForCausalLM" for name in architectures)
-    ):
+    supported_model_type = model_config.get("model_type") in {"llava", "llava_llama"}
+    supported_architecture = not architectures or any(
+        name == "LlavaLlamaForCausalLM" for name in architectures
+    )
+    if not supported_model_type or not supported_architecture:
         raise ValueError(
-            f"{checkpoint} is not the original LLaVA 1.5 checkpoint format expected by QIG; "
+            f"{checkpoint} is not a supported LLaVA 1.5 checkpoint format expected by QIG; "
             f"found model_type={model_config.get('model_type')!r}, architectures={architectures!r}"
         )
 
