@@ -280,6 +280,14 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
         )
         if self.tokenizer.get_vocab() != amateur_tokenizer.get_vocab():
             raise ValueError("Expert and amateur tokenizers have different vocabularies")
+        tokenizer_vocab_size = min(len(self.tokenizer), len(amateur_tokenizer))
+        print(
+            "Contrastive vocabulary sizes: "
+            f"shared_tokenizer={tokenizer_vocab_size}, "
+            f"expert_model={getattr(self.model.config, 'vocab_size', 'unknown')}, "
+            f"amateur_model={getattr(amateur_model.config, 'vocab_size', 'unknown')}",
+            flush=True,
+        )
         for name in ("size", "crop_size", "image_mean", "image_std"):
             if getattr(self._image_processor, name, None) != getattr(amateur_processor, name, None):
                 raise ValueError(f"Expert and amateur image processors differ in {name}")
@@ -377,6 +385,15 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     amateur_logits = amateur_output.logits[:, -1, :].float().to(expert_logits.device)
                     if expert_logits.shape[-1] != amateur_logits.shape[-1]:
                         raise RuntimeError("Expert and amateur output vocabulary sizes differ")
+                    valid_vocab_size = min(
+                        tokenizer_vocab_size,
+                        expert_logits.shape[-1],
+                        amateur_logits.shape[-1],
+                    )
+                    # Exclude padded output rows before normalization and the
+                    # plausibility filter, as well as before choosing a token.
+                    expert_logits = expert_logits[:, :valid_vocab_size]
+                    amateur_logits = amateur_logits[:, :valid_vocab_size]
                     expert_log_probs = functional.log_softmax(expert_logits[0], dim=-1)
                     expert_probabilities = expert_log_probs.exp()
                     allowed = expert_probabilities >= expert_probabilities.max() * threshold
