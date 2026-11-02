@@ -281,9 +281,22 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
         if self.tokenizer.get_vocab() != amateur_tokenizer.get_vocab():
             raise ValueError("Expert and amateur tokenizers have different vocabularies")
         tokenizer_vocab_size = min(len(self.tokenizer), len(amateur_tokenizer))
+        sentencepiece_size = getattr(
+            getattr(self.tokenizer, "sp_model", None), "get_piece_size", lambda: tokenizer_vocab_size
+        )()
+        added_token_ids = {
+            int(token_id)
+            for token_id in getattr(self.tokenizer, "added_tokens_decoder", {})
+        }
+        decodable_token_ids = set(range(sentencepiece_size)) | added_token_ids
+        decodable_token_ids = {
+            token_id for token_id in decodable_token_ids if 0 <= token_id < tokenizer_vocab_size
+        }
         print(
             "Contrastive vocabulary sizes: "
             f"shared_tokenizer={tokenizer_vocab_size}, "
+            f"sentencepiece={sentencepiece_size}, "
+            f"decodable_ids={len(decodable_token_ids)}, "
             f"expert_model={getattr(self.model.config, 'vocab_size', 'unknown')}, "
             f"amateur_model={getattr(amateur_model.config, 'vocab_size', 'unknown')}",
             flush=True,
@@ -394,6 +407,17 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     # plausibility filter, as well as before choosing a token.
                     expert_logits = expert_logits[:, :valid_vocab_size]
                     amateur_logits = amateur_logits[:, :valid_vocab_size]
+                    valid_ids = [
+                        token_id for token_id in decodable_token_ids if token_id < valid_vocab_size
+                    ]
+                    if not valid_ids:
+                        raise RuntimeError("Tokenizer exposes no decodable IDs within the model vocabulary")
+                    decodable_mask = torch.zeros(
+                        valid_vocab_size, dtype=torch.bool, device=expert_logits.device
+                    )
+                    decodable_mask[valid_ids] = True
+                    expert_logits = expert_logits.masked_fill(~decodable_mask.unsqueeze(0), -torch.inf)
+                    amateur_logits = amateur_logits.masked_fill(~decodable_mask.unsqueeze(0), -torch.inf)
                     expert_log_probs = functional.log_softmax(expert_logits[0], dim=-1)
                     expert_probabilities = expert_log_probs.exp()
                     allowed = expert_probabilities >= expert_probabilities.max() * threshold
@@ -425,6 +449,16 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     if int(next_token.item()) in eos_ids:
                         break
 
+            generated_ids = sequence[0, input_ids.shape[1] :].tolist()
+            invalid_ids = [
+                int(token_id) for token_id in generated_ids if int(token_id) not in decodable_token_ids
+            ]
+            if invalid_ids:
+                raise RuntimeError(
+                    "Contrastive decoding produced token IDs unsupported by the expert tokenizer: "
+                    f"{invalid_ids[:8]}; SentencePiece pieces={sentencepiece_size}, "
+                    f"tokenizer length={tokenizer_vocab_size}"
+                )
             return sequence
 
         expert_model.generate = types.MethodType(contrastive_generate, expert_model)
