@@ -449,7 +449,8 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     if int(next_token.item()) in eos_ids:
                         break
 
-            generated_ids = sequence[0, input_ids.shape[1] :].tolist()
+            generated_tokens = sequence[:, input_ids.shape[1] :]
+            generated_ids = generated_tokens[0].tolist()
             invalid_ids = [
                 int(token_id) for token_id in generated_ids if int(token_id) not in decodable_token_ids
             ]
@@ -459,7 +460,10 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     f"{invalid_ids[:8]}; SentencePiece pieces={sentencepiece_size}, "
                     f"tokenizer length={tokenizer_vocab_size}"
                 )
-            return sequence
+            # This LMMS-Eval adapter decodes the tensor returned by generate()
+            # directly. Return only continuation tokens so LLaVA's -200 image
+            # placeholder in the prompt is never passed to SentencePiece.
+            return generated_tokens
 
         expert_model.generate = types.MethodType(contrastive_generate, expert_model)
         print(
