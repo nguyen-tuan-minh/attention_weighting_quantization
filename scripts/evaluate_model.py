@@ -14,6 +14,9 @@ import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+from attention_quantization.models.qig_loader import resolve_llava_model_name  # noqa: E402
+
 PAPER_TASKS = "vizwiz_vqa_val,mmmu_val,chartqa,ai2d,scienceqa_img"
 
 
@@ -234,7 +237,10 @@ def main() -> int:
     output_dir = repository_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_args = [f"pretrained={pretrained}"]
+    model_args = [
+        f"pretrained={pretrained}",
+        f"model_name={resolve_llava_model_name(pretrained, configured_name=model_config.get('llava_model_name'))}",
+    ]
     if overlay_dir is not None:
         model_args.append(f"overlay_dir={overlay_dir}")
     for key in ("device_map", "attn_implementation"):

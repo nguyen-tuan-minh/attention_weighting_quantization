@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.models.qig_loader import resolve_llava_model_name  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
 
 
@@ -189,8 +190,11 @@ def load_model(
         f"Loading {role} model with max_memory={max_memory if max_memory is not None else 'automatic'}",
         level="extensive",
     )
+    model_name = resolve_llava_model_name(
+        checkpoint, configured_name=model_config.get("llava_model_name")
+    )
     tokenizer, model, image_processor, _ = builder(
-        str(checkpoint), None, "llava-v1.5-7b", device_map="cpu" if device == "cpu" else "auto",
+        str(checkpoint), None, model_name, device_map="cpu" if device == "cpu" else "auto",
         torch_dtype=model_config.get("torch_dtype", "float16"),
         attn_implementation=model_config.get("attn_implementation", "eager"),
         max_memory=max_memory, offload_folder=str(offload_dir), offload_state_dict=True,

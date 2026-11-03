@@ -35,5 +35,6 @@ def load_model(
         qig_source_dir=source_dir,
         device=model_config.get("device_map", "cuda:0"),
         attn_implementation=model_config.get("attn_implementation", "eager"),
+        configured_model_name=model_config.get("llava_model_name"),
     )
     return lm._model, input_adapter

@@ -28,8 +28,11 @@ Use the shared configs by default, with CLI paths available to override them:
 
 - `configs/model.yaml`: model ID and local directory, model family, QIG source,
   dtype, device map, and attention implementation. Common keys are `model_id`,
-  `model_dir`, `model_family`, `implementation_source_dir`, `torch_dtype`,
-  `device_map`, and `attn_implementation`.
+  `model_dir`, `model_family`, `llava_model_name`,
+  `implementation_source_dir`, `torch_dtype`, `device_map`, and
+  `attn_implementation`. Use `configs/model-llava-v1.5-13b.yaml` to select
+  LLaVA 1.5 13B across scripts that accept `--model-config`; the default
+  `configs/model.yaml` remains the 7B checkpoint.
 - `configs/dataset.yaml`: data/cache locations and the standard calibration
   subset. Common keys are `data_root`, `raw_dir`, `cache_dir`, `processed_dir`,
   `calibration_samples`, `calibration_seed`, `calibration_source`, and

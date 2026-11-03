@@ -213,6 +213,7 @@ def evaluate_sequential_batches(
     raw_dir: Path,
     device: str,
     attn_implementation: str,
+    llava_model_name: str | None,
     kl_chunk_size: int,
 ) -> tuple[list[dict[str, float | int]], float, int]:
     """Compare each batch immediately, holding only one model and batch at a time."""
@@ -228,6 +229,7 @@ def evaluate_sequential_batches(
             qig_source_dir=qig_source,
             device=device,
             attn_implementation=attn_implementation,
+            configured_model_name=llava_model_name,
         )
         batch_input = prepare_batch_inputs(baseline_adapter, record_batch, raw_dir)
         baseline_activations, baseline_logits = capture_forward(baseline_adapter, *batch_input)
@@ -241,6 +243,7 @@ def evaluate_sequential_batches(
             quantized_dir,
             device=device,
             qig_source_dir=qig_source,
+            configured_model_name=llava_model_name,
         )
         quantized_adapter = make_process_model(runtime, quantized_lm)
         quantized_activations, quantized_logits = capture_forward(quantized_adapter, *batch_input)
@@ -350,6 +353,7 @@ def main() -> int:
                 raw_dir=dataset_paths["raw_dir"],
                 device=args.device,
                 attn_implementation=model_config.get("attn_implementation", "eager"),
+                llava_model_name=model_config.get("llava_model_name"),
                 kl_chunk_size=args.kl_token_chunk_size,
             )
         else:
@@ -365,6 +369,7 @@ def main() -> int:
                 qig_source_dir=qig_source,
                 device=args.device,
                 attn_implementation=model_config.get("attn_implementation", "eager"),
+                configured_model_name=model_config.get("llava_model_name"),
             )
             batches = [records[start : start + args.batch_size] for start in range(0, sample_count, args.batch_size)]
             for batch_index, record_batch in enumerate(batches, start=1):
@@ -391,6 +396,7 @@ def main() -> int:
                 quantized_dir,
                 device=args.device,
                 qig_source_dir=qig_source,
+                configured_model_name=model_config.get("llava_model_name"),
             )
             quantized_adapter = make_process_model(runtime, quantized_lm)
             quantized_activations: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]

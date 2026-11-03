@@ -36,7 +36,9 @@ enable gradients deliberately; document which activations require gradients and
 which loss is differentiated so this exception is clear.
 
 `investigate_grad_important.py` accepts `--model-path` to run a local checkpoint
-without editing `configs/model.yaml`. Use `--answer-mode generate` to print a
+without editing the model config. To use LLaVA 1.5 13B across investigations,
+pass `--model-config configs/model-llava-v1.5-13b.yaml` to scripts that expose
+that option. `--answer-mode generate` prints a
 greedy answer for each selected image before the script computes its gradient
 analysis; the script still performs that analysis and displays its plots.
 

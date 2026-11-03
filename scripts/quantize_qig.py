@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.quantization.qig import load_qig_runtime  # noqa: E402
+from attention_quantization.models.qig_loader import resolve_llava_model_name  # noqa: E402
 
 
 def progress(message: str, started_at: float | None = None) -> float:
@@ -399,8 +400,11 @@ def main() -> int:
         else:
             base_model = resolve_base_model(args.base_model)
         attn_implementation = model_config.get("attn_implementation", "eager")
+        llava_model_name = resolve_llava_model_name(
+            base_model, configured_name=model_config.get("llava_model_name")
+        )
         model_args = (
-            f"pretrained={base_model},model_name=llava-v1.5-7b,"
+            f"pretrained={base_model},model_name={llava_model_name},"
             f"attn_implementation={attn_implementation}"
         )
         progress(f"Loading LLaVA model from {base_model}")

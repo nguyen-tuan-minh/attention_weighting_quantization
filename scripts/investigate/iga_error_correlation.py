@@ -537,6 +537,7 @@ def main() -> int:
                 qig_source_dir=qig_source,
                 device=args.device,
                 attn_implementation=model_config.get("attn_implementation", "eager"),
+                configured_model_name=model_config.get("llava_model_name"),
             )
             if args.timing:
                 log(f"[timing] Base model load: {time.perf_counter() - base_load_started:.2f} s", flush=True)
@@ -581,6 +582,7 @@ def main() -> int:
                 quantized_dir,
                 device=args.device,
                 qig_source_dir=qig_source,
+                configured_model_name=model_config.get("llava_model_name"),
             )
             if args.timing:
                 log(f"[timing] Quantized model load: {time.perf_counter() - quant_load_started:.2f} s", flush=True)

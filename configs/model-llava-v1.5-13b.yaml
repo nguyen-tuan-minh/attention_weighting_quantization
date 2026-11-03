@@ -1,0 +1,10 @@
+# LLaVA 1.5 13B uses the Vicuna v1.5 13B / LLaMA 2 13B language backbone.
+# Paths are relative to the repository root unless they are absolute.
+model_id: liuhaotian/llava-v1.5-13b
+model_dir: models/llava-v1.5-13b
+model_family: llava-v1.5
+llava_model_name: llava-v1.5-13b
+implementation_source_dir: third_party/QIG
+torch_dtype: float16
+device_map: cuda:0
+attn_implementation: eager

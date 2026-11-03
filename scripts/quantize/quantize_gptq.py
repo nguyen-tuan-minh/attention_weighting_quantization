@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.models.qig_loader import resolve_llava_model_name  # noqa: E402
 
 LOG_LEVEL = "normal"
 SHOW_TIMING = False
@@ -843,8 +844,11 @@ def main() -> int:
         load_heartbeat = threading.Thread(target=report_load_heartbeat, daemon=True)
         load_heartbeat.start()
     try:
+        llava_model_name = resolve_llava_model_name(
+            checkpoint, configured_name=model_cfg.get("llava_model_name")
+        )
         tokenizer, model, image_processor, _ = builder(
-            str(checkpoint), None, "llava-v1.5-7b", device_map="auto",
+            str(checkpoint), None, llava_model_name, device_map="auto",
             torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
             max_memory=max_memory or None, offload_folder=str(offload_dir / "model"), offload_state_dict=True,
         )
@@ -1627,7 +1631,7 @@ def main() -> int:
     export_started = time.monotonic()
     log(f"Loading base checkpoint on CPU to write standalone model: {checkpoint}")
     tokenizer, export_model, image_processor, _ = builder(
-        str(checkpoint), None, "llava-v1.5-7b", device_map="cpu",
+        str(checkpoint), None, llava_model_name, device_map="cpu",
         torch_dtype="float16", attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
     )
     # This builder moves the vision tower to CUDA for non-auto device maps.

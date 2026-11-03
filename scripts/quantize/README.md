@@ -2,6 +2,13 @@
 
 ## Disk-backed GPTQ for LLaVA 1.5
 
+The scripts support both LLaVA 1.5 7B and 13B checkpoints. Select
+`--model-config configs/model-llava-v1.5-13b.yaml` to use the 13B model in a
+quantization run; the same config option is available in evaluation and
+investigation scripts. The LLaVA loader resolves the correct upstream model
+identifier from the checkpoint config/path, including for renamed local
+checkpoint directories.
+
 ### Layer selection convention
 
 Quantization scripts should allow targeting a subset of decoder layers while

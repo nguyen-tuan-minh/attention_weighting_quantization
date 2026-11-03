@@ -2,6 +2,7 @@
 model_id: liuhaotian/llava-v1.5-7b
 model_dir: models/llava-v1.5-7b
 model_family: llava-v1.5
+llava_model_name: llava-v1.5-7b
 implementation_source_dir: third_party/QIG
 # The original checkpoint is loaded by QIG's companion LLaVA implementation,
 # not Transformers AutoModelForVision2Seq.
