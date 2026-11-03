@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits",
-        help="Subtract raw logits or log probabilities during contrastive decoding.",
+        help="Score type for (1 + weight) * expert - weight * amateur.",
     )
     parser.add_argument(
         "--plausibility-threshold", type=float, default=0.01,
@@ -427,7 +427,9 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     else:
                         expert_scores = expert_log_probs
                         amateur_scores = functional.log_softmax(amateur_logits[0], dim=-1)
-                    scores = (expert_scores - weight * amateur_scores).masked_fill(~allowed, -torch.inf)
+                    scores = ((1 + weight) * expert_scores - weight * amateur_scores).masked_fill(
+                        ~allowed, -torch.inf
+                    )
 
                     if do_sample and temperature > 0:
                         probabilities = torch.softmax(scores / temperature, dim=-1)

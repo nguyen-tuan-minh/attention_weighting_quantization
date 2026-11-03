@@ -94,12 +94,14 @@ metadata, even when a particular run uses a specially prepared checkpoint.
 Use `--decoding-modes expert contrastive` for the standard comparison, with
 `amateur` available as an optional baseline. Contrastive decoding compares
 expert and amateur scores only after validating that tokenizer vocabularies,
-special token IDs, and image processing settings match. The default is raw
-logit subtraction (`expert_logits - weight * amateur_logits`). Set
-`--contrastive-score-type log-probabilities` to use the previous behavior:
-subtract `weight * amateur_log_probability` from expert log probabilities.
-Both modes apply a plausibility mask derived from the expert's softmax
-probabilities.
+special token IDs, and image processing settings match. Contrastive decoding
+uses `(1 + weight) * expert_score - weight * amateur_score`. By default, scores
+are raw logits (`--contrastive-score-type logits`); set
+`--contrastive-score-type log-probabilities` to apply the same formula to each
+model's log probabilities. A weight of zero therefore uses only the expert
+score, while positive weights increase the expert contribution and subtract
+the amateur contribution. Both modes apply a plausibility mask derived from
+the expert's softmax probabilities.
 
 Give each checkpoint its own optional placement caps:
 `--max-expert-model-memory-gpu`, `--max-expert-model-memory-cpu`,
