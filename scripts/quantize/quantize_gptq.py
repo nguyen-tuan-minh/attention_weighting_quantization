@@ -922,8 +922,8 @@ def main() -> int:
     }
     grad_state: dict[str, Any] = {
         "layer_activations": {},
-        "linear_activations": {},
         "layer_weights": {},
+        "current_valid": None,
     }
     iga_cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
     original_output_attentions = getattr(model.config, "output_attentions", False)
@@ -1003,10 +1003,104 @@ def main() -> int:
     )
     if args.hessian_weighting == "grad":
         log(
-            "Gradient weighting uses sqrt(sum of squared gradients over assistant-answer CE targets "
-            "and hidden features) at each decoder block input, normalized to mean 1; "
-            "one gradient is computed per answer token and per sample/group forward"
+            "Gradient weighting runs in two phases: first compute and store mean-one "
+            "sqrt(sum of squared assistant-answer CE gradients) token weights; then "
+            "replay calibration forwards to accumulate weighted Hessians"
         )
+    grad_weight_store: dict[tuple[int, int], torch.Tensor] = {}
+    if args.hessian_weighting == "grad":
+        gradient_pass_started = time.monotonic()
+        gradient_forwards = len(dataset) * len(group_specs)
+        log(
+            f"Gradient-weight pass: {len(group_specs)} grouped passes, "
+            f"{len(dataset)} samples/group, {gradient_forwards} model forwards; "
+            "only per-token weights are retained between phases"
+        )
+        completed_gradient_forwards = 0
+        for group_pass, (group_layers, _group_keys, _group_bytes, _disk_chunk) in enumerate(group_specs, 1):
+            gradient_handles = []
+            for layer_index in group_layers:
+                def capture_gradient_layer_input(_module, inputs, *, layer_index=layer_index):
+                    if not inputs or not torch.is_tensor(inputs[0]):
+                        raise RuntimeError(
+                            f"Could not capture block input for gradient weighting at layer {layer_index + 1}"
+                        )
+                    grad_state["layer_activations"][layer_index] = inputs[0]
+
+                gradient_handles.append(
+                    blocks[layer_index].register_forward_pre_hook(capture_gradient_layer_input)
+                )
+            try:
+                for sample_index, sample in enumerate(dataset):
+                    preparation_started = time.monotonic()
+                    image_value = sample["image"]
+                    if isinstance(image_value, dict):
+                        image_value = Image.open(image_value["path"]).convert("RGB")
+                    elif hasattr(image_value, "convert"):
+                        image_value = image_value.convert("RGB")
+                    row = {
+                        "conversations": sample["conversations"],
+                        "id": str(sample.get("id", sample_index)),
+                        "image": "local",
+                    }
+                    prepared = adapter.preprocess_data([image_value], row)
+                    batch = adapter.data_collator([prepared])
+                    inputs, kwargs = adapter.generate_input(batch)
+                    record_timing("gradient-pass sample preprocessing", time.monotonic() - preparation_started)
+                    attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
+                    vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
+                    valid_for_weights = attention_mask[0].clone()
+                    if args.hessian_token_scope == "text":
+                        valid_for_weights &= ~vision_mask[0]
+                    labels = kwargs.get("labels")
+                    if labels is None:
+                        raise RuntimeError("Gradient Hessian weighting requires adapter-provided labels")
+                    grad_state["layer_activations"].clear()
+                    gradient_inputs_embeds = inputs["inputs_embeds"].detach().requires_grad_(True)
+                    forward_started = time.monotonic()
+                    with torch.enable_grad():
+                        outputs = model(
+                            inputs_embeds=gradient_inputs_embeds,
+                            attention_mask=kwargs.get("attention_mask"),
+                            use_cache=False,
+                            output_attentions=False,
+                            return_dict=True,
+                        )
+                        record_timing("gradient-weight model forward", time.monotonic() - forward_started)
+                        score_started = time.monotonic()
+                        layer_weights = make_gradient_token_weights(
+                            outputs.logits,
+                            labels[0],
+                            grad_state["layer_activations"],
+                            valid_for_weights,
+                        )
+                        record_timing(
+                            "assistant-token gradient score calculation",
+                            time.monotonic() - score_started,
+                        )
+                    for layer_index, weights in layer_weights.items():
+                        grad_weight_store[(sample_index, layer_index)] = weights.detach().to(
+                            device="cpu", dtype=torch.float32
+                        )
+                    completed_gradient_forwards += 1
+                    del outputs, gradient_inputs_embeds, inputs, kwargs, batch, prepared, image_value
+                    grad_state["layer_activations"].clear()
+                    log(
+                        f"Gradient-weight pass {group_pass}/{len(group_specs)}, sample "
+                        f"{sample_index + 1}/{len(dataset)} complete; "
+                        f"completed forwards={completed_gradient_forwards}/{gradient_forwards}"
+                    )
+            finally:
+                grad_state["layer_activations"].clear()
+                for handle in gradient_handles:
+                    handle.remove()
+        record_timing("gradient-weight collection phase", time.monotonic() - gradient_pass_started)
+        expected_weights = len(dataset) * len(selected_layers)
+        if len(grad_weight_store) != expected_weights:
+            raise RuntimeError(
+                f"Gradient phase stored {len(grad_weight_store)} sample/layer weight vectors; "
+                f"expected {expected_weights}"
+            )
     completed_forwards = 0
     active_hessians: dict[str, torch.Tensor] = {}
     active_chunk: torch.Tensor | None = None
@@ -1166,41 +1260,34 @@ def main() -> int:
 
                     collect_handles.append(attention_module.register_forward_hook(capture_layer_iga))
             else:
-                # Capture block inputs for gradient scoring and detached Linear
-                # inputs on host RAM. The latter are needed after the backward
-                # pass has produced per-token weights for X'WX accumulation.
-                active_layer_set = set(group_layers)
+                # Gradient scores were collected in a separate pass. During this
+                # replay, consume the stored token weights directly in each
+                # Linear hook so activation tensors never need host staging.
                 for layer_index in group_layers:
-                    def capture_gradient_layer_input(
-                        _module, inputs, *, layer_index=layer_index
-                    ):
-                        if not inputs or not torch.is_tensor(inputs[0]):
-                            raise RuntimeError(
-                                f"Could not capture block input for gradient weighting at layer {layer_index + 1}"
-                            )
-                        grad_state["layer_activations"][layer_index] = inputs[0]
-
-                    collect_handles.append(
-                        blocks[layer_index].register_forward_pre_hook(capture_gradient_layer_input)
-                    )
                     for name, linear in linears_by_layer[layer_index].items():
                         key = f"{layer_index}:{name}"
 
-                        def capture_gradient_linear_input(
-                            _module, inputs, _output, *, key=key
+                        def accumulate_gradient_hessian(
+                            _module, inputs, _output, *, key=key, layer_index=layer_index,
+                            width=linear.in_features,
                         ):
                             if not inputs or not torch.is_tensor(inputs[0]):
                                 raise RuntimeError(f"Could not capture Linear activation for gradient Hessian {key}")
-                            # Preserve the model's compact activation dtype on
-                            # CPU; accumulate_weighted_hessian promotes to f32.
-                            transfer_started = time.monotonic()
-                            grad_state["linear_activations"][key] = inputs[0].detach().to("cpu")
-                            record_timing(
-                                "gradient Hessian activation GPU-to-CPU staging",
-                                time.monotonic() - transfer_started,
+                            token_weights = grad_state["layer_weights"].get(layer_index)
+                            valid_mask = grad_state["current_valid"]
+                            if token_weights is None or valid_mask is None:
+                                raise RuntimeError(f"Stored gradient weights are unavailable for Hessian {key}")
+                            accumulate_weighted_hessian(
+                                active_hessians,
+                                counts,
+                                key,
+                                width,
+                                inputs[0],
+                                valid_mask,
+                                token_weights,
                             )
 
-                        collect_handles.append(linear.register_forward_hook(capture_gradient_linear_input))
+                        collect_handles.append(linear.register_forward_hook(accumulate_gradient_hessian))
 
             group_started = time.monotonic()
             try:
@@ -1242,9 +1329,14 @@ def main() -> int:
                         iga_state["pending_activations"].clear()
                         iga_cuda_events.clear()
                     if args.hessian_weighting == "grad":
-                        grad_state["layer_activations"].clear()
-                        grad_state["linear_activations"].clear()
-                        grad_state["layer_weights"].clear()
+                        valid_for_weights = attention_mask[0].clone()
+                        if args.hessian_token_scope == "text":
+                            valid_for_weights &= ~vision_mask[0]
+                        grad_state["current_valid"] = valid_for_weights
+                        grad_state["layer_weights"] = {
+                            layer_index: grad_weight_store[(sample_index, layer_index)].to(device="cuda")
+                            for layer_index in group_layers
+                        }
                     token_selection["mask"] = (
                         attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
                     )
@@ -1262,82 +1354,14 @@ def main() -> int:
                     )
                     forward_started = time.monotonic()
                     try:
-                        if args.hessian_weighting == "grad":
-                            labels = kwargs.get("labels")
-                            if labels is None:
-                                raise RuntimeError("Gradient Hessian weighting requires adapter-provided labels")
-                            gradient_inputs_embeds = inputs["inputs_embeds"].detach().requires_grad_(True)
-                            with torch.enable_grad():
-                                gradient_forward_started = time.monotonic()
-                                outputs = model(
-                                    inputs_embeds=gradient_inputs_embeds,
-                                    attention_mask=kwargs.get("attention_mask"),
-                                    use_cache=False,
-                                    output_attentions=False,
-                                    return_dict=True,
-                                )
-                                if SHOW_TIMING:
-                                    torch.cuda.synchronize()
-                                record_timing(
-                                    "gradient-weighted model forward",
-                                    time.monotonic() - gradient_forward_started,
-                                )
-                                valid_for_weights = attention_mask[0].clone()
-                                if args.hessian_token_scope == "text":
-                                    valid_for_weights &= ~vision_mask[0]
-                                gradient_score_started = time.monotonic()
-                                layer_weights = make_gradient_token_weights(
-                                    outputs.logits,
-                                    labels[0],
-                                    grad_state["layer_activations"],
-                                    valid_for_weights,
-                                )
-                                grad_state["layer_weights"].update(layer_weights)
-                                if SHOW_TIMING:
-                                    torch.cuda.synchronize()
-                                record_timing(
-                                    "assistant-token gradient score calculation",
-                                    time.monotonic() - gradient_score_started,
-                                )
-                            log(
-                                f"Gradient weighting computed sqrt(sum of squared block-input "
-                                f"gradients) for {int(labels[0, 1:].ne(-100).sum())} assistant CE targets "
-                                f"across {len(layer_weights)} decoder layers",
-                                level="extensive",
+                        with torch.inference_mode():
+                            model(
+                                inputs_embeds=inputs["inputs_embeds"],
+                                attention_mask=kwargs.get("attention_mask"),
+                                use_cache=False,
+                                output_attentions=args.hessian_weighting == "iga",
+                                return_dict=True,
                             )
-                            hessian_accumulation_started = time.monotonic()
-                            for layer_index in group_layers:
-                                token_weights = grad_state["layer_weights"][layer_index]
-                                for name, linear in linears_by_layer[layer_index].items():
-                                    key = f"{layer_index}:{name}"
-                                    activations = grad_state["linear_activations"].pop(key, None)
-                                    if activations is None:
-                                        raise RuntimeError(f"No saved Linear activations for gradient Hessian {key}")
-                                    accumulate_weighted_hessian(
-                                        active_hessians,
-                                        counts,
-                                        key,
-                                        linear.in_features,
-                                        activations,
-                                        valid_for_weights,
-                                        token_weights,
-                                    )
-                            if SHOW_TIMING:
-                                torch.cuda.synchronize()
-                            record_timing(
-                                "gradient-weighted Hessian activation transfer and accumulation",
-                                time.monotonic() - hessian_accumulation_started,
-                            )
-                            del outputs, gradient_inputs_embeds
-                        else:
-                            with torch.inference_mode():
-                                model(
-                                    inputs_embeds=inputs["inputs_embeds"],
-                                    attention_mask=kwargs.get("attention_mask"),
-                                    use_cache=False,
-                                    output_attentions=args.hessian_weighting == "iga",
-                                    return_dict=True,
-                                )
                         torch.cuda.synchronize()
                     finally:
                         token_selection["mask"] = None
@@ -1347,10 +1371,6 @@ def main() -> int:
                         missing = ", ".join(iga_state["pending_activations"])
                         iga_state["pending_activations"].clear()
                         raise RuntimeError(f"IGA attention hooks did not consume captured activations: {missing}")
-                    if args.hessian_weighting == "grad" and grad_state["linear_activations"]:
-                        missing = ", ".join(grad_state["linear_activations"])
-                        grad_state["linear_activations"].clear()
-                        raise RuntimeError(f"Gradient Hessian hooks did not consume captured activations: {missing}")
                     forward_elapsed = time.monotonic() - forward_started
                     completed_forwards += 1
                     record_timing("calibration model forward with active Hessian group", forward_elapsed)
@@ -1370,8 +1390,8 @@ def main() -> int:
                 iga_state["layer_weights"].clear()
                 iga_state["pending_activations"].clear()
                 grad_state["layer_activations"].clear()
-                grad_state["linear_activations"].clear()
                 grad_state["layer_weights"].clear()
+                grad_state["current_valid"] = None
                 for handle in collect_handles:
                     handle.remove()
 

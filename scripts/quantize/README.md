@@ -83,14 +83,15 @@ takes the square root to obtain the token score. Scores are normalized to mean
 1 over the selected token scope before weighting that layer's `X'WX` Hessians.
 This follows the investigation's `block_input` gradient capture convention and
 works with either `--hessian-token-scope all` or `text`. It does not request or
-retain attention matrices. Gradient weighting runs autograd through the full
-model and calculates one gradient per assistant answer token, so it can use
-substantially more memory and compute than uniform or IGA weighting. The
-selected Linear inputs are staged to CPU RAM until scores are available, then
-transferred to the active Hessian group for accumulation. Extensive logs time
-this staging, gradient-enabled forward and token-gradient calculation, and the
-weighted Hessian update separately. The weighting mode is recorded in
-`gptq_metadata.json`.
+retain attention matrices. Gradient weighting runs in two phases: grouped
+gradient-enabled forwards compute and store only per-token weights, then a
+second set of grouped inference forwards recomputes Linear activations and
+accumulates the weighted Hessians on GPU. This avoids staging every selected
+Linear activation in CPU RAM, at the cost of replaying the calibration
+forwards. Gradient scoring computes one gradient per assistant answer token,
+so it can use substantially more memory and compute than uniform or IGA
+weighting. Logs report the gradient-weight collection and Hessian accumulation
+phases separately. The weighting mode is recorded in `gptq_metadata.json`.
 
 Example using gradient weights:
 
