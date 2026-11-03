@@ -68,6 +68,38 @@ temporary attention memory. The selected weighting is recorded in
 `gptq_metadata.json`. To enable IGA, pass
 `--hessian-token-scope all --hessian-weighting iga`.
 
+Set `--hessian-weighting grad` to weight each included token by its gradient
+importance. For each calibration example, the script takes assistant-answer
+cross-entropy gradients with respect to each selected decoder block's input,
+sums squared gradients across hidden features and answer-token targets, then
+takes the square root to obtain the token score. Scores are normalized to mean
+1 over the selected token scope before weighting that layer's `X'WX` Hessians.
+This follows the investigation's `block_input` gradient capture convention and
+works with either `--hessian-token-scope all` or `text`. It does not request or
+retain attention matrices. Gradient weighting runs autograd through the full
+model and calculates one gradient per assistant answer token, so it can use
+substantially more memory and compute than uniform or IGA weighting. The
+selected Linear inputs are staged to CPU RAM until scores are available, then
+transferred to the active Hessian group for accumulation. Extensive logs time
+this staging, gradient-enabled forward and token-gradient calculation, and the
+weighted Hessian update separately. The weighting mode is recorded in
+`gptq_metadata.json`.
+
+Example using gradient weights:
+
+```bash
+.venv/bin/python scripts/quantize/quantize_gptq.py \
+  --output-dir outputs/quantized/llava-gptq-w4g128-grad \
+  --samples 128 \
+  --seed 42 \
+  --bits 4 \
+  --group-size 128 \
+  --hessian-token-scope text \
+  --hessian-weighting grad \
+  --hessian-group-layers 4 \
+  --log-level extensive
+```
+
 Disk-backed Hessians share one contiguous `hessians.f32` file. When an active
 layer group is entirely disk-backed, the script reads and writes that group's
 Hessians as one contiguous chunk rather than issuing separate transfers for
@@ -127,15 +159,14 @@ present in that extracted subset. Local paths and file-existence checks are
 refreshed against the current `raw_dir`, rather than reused from a previous
 machine's dataset cache.
 
-### Standalone checkpoint format convention
+### Quantized output format convention
 
-Quantization scripts must save a standalone checkpoint in the serialization
-format expected by the configured base model and existing inference loader.
-For the configured LLaVA 1.5 checkpoint, that means `config.json`, PyTorch
-`.bin` weight shards (`pytorch_model*.bin`), tokenizer files, and the image
-processor. Validate the config and at least one expected weight shard after
-export, before reporting success. Do not silently switch to another weight
-serialization format.
+The default `--output-format standalone` saves a complete checkpoint in the
+serialization format expected by the configured base model and inference
+loader. For LLaVA 1.5, that means `config.json`, PyTorch `.bin` weight shards
+(`pytorch_model*.bin`), tokenizer files, and the image processor. Validate the
+config and at least one expected weight shard after export, before reporting
+success. Do not silently switch serialization formats.
 
 The output is a **standalone LLaVA checkpoint**. `--output-dir` contains the
 model config, sharded FP16 weights, tokenizer, image processor, and
@@ -147,3 +178,24 @@ interface, but it is not a compact 4-bit checkpoint or a low-bit inference
 kernel. Packed layer files are temporary and removed after export. Loading the
 base model again and serializing the complete checkpoint adds time and needs
 disk space close to the original FP16 checkpoint size.
+
+Pass `--output-format packed-overlay` to keep a compact GPTQ artifact instead
+of writing a complete FP16 model. It stores packed 2/3/4/8-bit codes and their
+scales/zero-points under `layers/`, with `gptq_metadata.json`; it does not
+reload and reserialize the base checkpoint. For evaluation, pair it with the
+same base checkpoint:
+
+```bash
+.venv/bin/python scripts/evaluate_model.py \
+  --pretrained models/llava-v1.5-7b \
+  --overlay-dir outputs/quantized/llava-gptq-w4g128-packed \
+  --tasks pope
+```
+
+This packed format reduces the quantized artifact's disk size and preserves
+the requested low-bit codes. The current LMMS-Eval LLaVA adapter expands those
+codes to the model's regular dtype when applying the overlay, so it does not
+provide low-bit inference or reduced runtime weight memory. A backend with
+GPTQ low-bit kernels and a compatible LLaVA loader is still needed for that.
+`standalone` remains the default because it is directly loadable by the
+existing LLaVA checkpoint loader.

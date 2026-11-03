@@ -1,8 +1,8 @@
-"""Disk-backed, layerwise GPTQ that writes a standalone LLaVA 1.5 checkpoint.
+"""Disk-backed, layerwise GPTQ for LLaVA 1.5.
 
-The requested output directory contains a complete dense FP16 model. GPTQ
-weights are stored in a temporary packed form during quantization, then applied
-to the selected decoder Linear layers before the complete checkpoint is saved.
+By default, write a standalone dense FP16 checkpoint. ``--output-format
+packed-overlay`` instead preserves packed low-bit GPTQ layers on disk for use
+with ``scripts/evaluate_model.py --overlay-dir`` and the original base model.
 """
 
 from __future__ import annotations
@@ -148,6 +148,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet-warnings", action="store_true", help="Suppress noisy Python and dependency warnings.")
     parser.add_argument("--timing", action="store_true", help="Show timing details at normal verbosity.")
     parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4, help="Weight precision in bits.")
+    parser.add_argument(
+        "--output-format", choices=("standalone", "packed-overlay"), default="standalone",
+        help=(
+            "standalone writes a complete dense FP16 LLaVA checkpoint; packed-overlay keeps GPTQ codes "
+            "packed at the requested bit width and requires the base model when evaluating."
+        ),
+    )
     parser.add_argument("--group-size", type=int, default=128, help="Input columns per quantization group.")
     parser.add_argument(
         "--layers", default=None,
@@ -162,10 +169,10 @@ def parse_args() -> argparse.Namespace:
         help="Accumulate Hessians from all valid tokens or only non-image text tokens.",
     )
     parser.add_argument(
-        "--hessian-weighting", choices=("uniform", "iga"), default="uniform",
+        "--hessian-weighting", choices=("uniform", "iga", "grad"), default="uniform",
         help=(
-            "Use uniform token weights (default), or weight image-token activation rows by per-layer IGA; "
-            "IGA requires --hessian-token-scope all."
+            "Use uniform token weights (default), IGA image-token weights, or gradient-importance "
+            "weights from assistant-answer CE gradients."
         ),
     )
     parser.add_argument("--damp", type=float, default=0.01, help="Relative diagonal damping for Hessian factorization.")
@@ -347,13 +354,16 @@ def accumulate_weighted_hessian(
     valid_mask: torch.Tensor,
     token_weights: torch.Tensor,
 ) -> None:
-    """Add X'WX to a GPU Hessian for valid sequence rows."""
-    x = activations.detach().reshape(-1, width).float()
+    """Add X'WX to a GPU Hessian for valid sequence rows and token weights."""
+    # Gradient-weighted collection keeps detached Linear inputs on host RAM
+    # until the answer-token gradients are known; move each activation block
+    # back to the active Hessian device only for its matrix update.
+    x = activations.detach().reshape(-1, width).to(device="cuda", dtype=torch.float32)
     valid = valid_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
     weights = token_weights.reshape(-1).to(device=x.device, dtype=torch.float32)
     if valid.numel() != x.shape[0] or weights.numel() != x.shape[0]:
         raise RuntimeError(
-            f"IGA masks/weights for {key} do not match its activation rows: "
+            f"Token masks/weights for {key} do not match its activation rows: "
             f"rows={x.shape[0]}, valid={valid.numel()}, weights={weights.numel()}"
         )
     x = x[valid]
@@ -400,6 +410,73 @@ def make_iga_token_weights(
     token_weights = torch.ones(valid.numel(), device=device, dtype=torch.float32)
     token_weights[image_positions] = iga / mean_iga
     return token_weights
+
+
+def make_gradient_token_weights(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    layer_activations: dict[int, torch.Tensor],
+    selected_mask: torch.Tensor,
+) -> dict[int, torch.Tensor]:
+    """Compute mean-one token weights from root-sum-square answer CE gradients.
+
+    Scores match the investigation's block-input capture point: for each token
+    position, sum squared gradients over hidden dimensions and assistant answer
+    CE targets, then take the square root. Normalize over the included token
+    scope so the average Hessian contribution remains unchanged.
+    """
+    if logits.ndim != 3 or logits.shape[0] != 1:
+        raise RuntimeError(f"Gradient weighting expects logits [1, sequence, vocab], got {tuple(logits.shape)}")
+    labels = labels.reshape(-1).to(device="cpu", dtype=torch.long)
+    if labels.numel() != logits.shape[1]:
+        raise RuntimeError("Gradient labels do not align with model logits")
+    answer_positions = labels[1:].ne(-100).nonzero(as_tuple=True)[0] + 1
+    if answer_positions.numel() == 0:
+        raise RuntimeError("Gradient Hessian weighting needs at least one assistant answer token")
+    if not layer_activations:
+        raise RuntimeError("Gradient weighting captured no selected decoder block inputs")
+
+    layer_indices = sorted(layer_activations)
+    activations = [layer_activations[index] for index in layer_indices]
+    scores = {
+        index: torch.zeros(logits.shape[1], device=logits.device, dtype=torch.float32)
+        for index in layer_indices
+    }
+    target_count = int(answer_positions.numel())
+    for target_number, position_tensor in enumerate(answer_positions):
+        position = int(position_tensor)
+        target = labels[position].to(device=logits.device, dtype=torch.long).reshape(1)
+        token_loss = torch.nn.functional.cross_entropy(
+            logits[0, position - 1].float().unsqueeze(0), target
+        )
+        gradients = torch.autograd.grad(
+            token_loss,
+            tuple(activations),
+            retain_graph=target_number + 1 < target_count,
+            allow_unused=False,
+        )
+        for layer_index, gradient in zip(layer_indices, gradients):
+            scores[layer_index].add_(gradient[0].float().square().sum(dim=-1))
+
+    selected = selected_mask.reshape(-1).to(device=logits.device, dtype=torch.bool)
+    if selected.numel() != logits.shape[1] or not selected.any():
+        raise RuntimeError("Gradient weighting token scope is empty or does not align with logits")
+    result: dict[int, torch.Tensor] = {}
+    for layer_index, squared_score in scores.items():
+        # The square root is intentional: it converts accumulated squared
+        # gradient energy into the per-token gradient norm used as the weight.
+        score = squared_score.clamp_min(0).sqrt()
+        mean_score = score[selected].mean()
+        tiny = torch.finfo(torch.float32).tiny
+        normalized_score = torch.where(
+            mean_score > tiny,
+            score / mean_score.clamp_min(tiny),
+            torch.ones_like(score),
+        )
+        weights = torch.ones_like(score)
+        weights[selected] = normalized_score[selected]
+        result[layer_index] = weights
+    return result
 
 
 def allocate_hessians(
@@ -839,6 +916,11 @@ def main() -> int:
         "layer_weights": {},
         "pending_activations": {},
     }
+    grad_state: dict[str, Any] = {
+        "layer_activations": {},
+        "linear_activations": {},
+        "layer_weights": {},
+    }
     iga_cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
     original_output_attentions = getattr(model.config, "output_attentions", False)
     if args.hessian_weighting == "iga":
@@ -915,6 +997,12 @@ def main() -> int:
         f"at most {len(group_specs)} group saves, up to "
         f"{args.hessian_group_layers} selected decoder layers resident on GPU"
     )
+    if args.hessian_weighting == "grad":
+        log(
+            "Gradient weighting uses sqrt(sum of squared gradients over assistant-answer CE targets "
+            "and hidden features) at each decoder block input, normalized to mean 1; "
+            "one gradient is computed per answer token and per sample/group forward"
+        )
     completed_forwards = 0
     active_hessians: dict[str, torch.Tensor] = {}
     active_chunk: torch.Tensor | None = None
@@ -965,7 +1053,7 @@ def main() -> int:
                         collect_handles.append(linear.register_forward_hook(
                             gpu_hessian_hook(active_hessians, linear.in_features, counts, key, token_selection)
                         ))
-            else:
+            elif args.hessian_weighting == "iga":
                 active_layer_set = set(group_layers)
                 for layer_index in group_layers:
                     for name, linear in linears_by_layer[layer_index].items():
@@ -1073,6 +1161,42 @@ def main() -> int:
                             return (output[0], None, *output[2:])
 
                     collect_handles.append(attention_module.register_forward_hook(capture_layer_iga))
+            else:
+                # Capture block inputs for gradient scoring and detached Linear
+                # inputs on host RAM. The latter are needed after the backward
+                # pass has produced per-token weights for X'WX accumulation.
+                active_layer_set = set(group_layers)
+                for layer_index in group_layers:
+                    def capture_gradient_layer_input(
+                        _module, inputs, *, layer_index=layer_index
+                    ):
+                        if not inputs or not torch.is_tensor(inputs[0]):
+                            raise RuntimeError(
+                                f"Could not capture block input for gradient weighting at layer {layer_index + 1}"
+                            )
+                        grad_state["layer_activations"][layer_index] = inputs[0]
+
+                    collect_handles.append(
+                        blocks[layer_index].register_forward_pre_hook(capture_gradient_layer_input)
+                    )
+                    for name, linear in linears_by_layer[layer_index].items():
+                        key = f"{layer_index}:{name}"
+
+                        def capture_gradient_linear_input(
+                            _module, inputs, _output, *, key=key
+                        ):
+                            if not inputs or not torch.is_tensor(inputs[0]):
+                                raise RuntimeError(f"Could not capture Linear activation for gradient Hessian {key}")
+                            # Preserve the model's compact activation dtype on
+                            # CPU; accumulate_weighted_hessian promotes to f32.
+                            transfer_started = time.monotonic()
+                            grad_state["linear_activations"][key] = inputs[0].detach().to("cpu")
+                            record_timing(
+                                "gradient Hessian activation GPU-to-CPU staging",
+                                time.monotonic() - transfer_started,
+                            )
+
+                        collect_handles.append(linear.register_forward_hook(capture_gradient_linear_input))
 
             group_started = time.monotonic()
             try:
@@ -1113,6 +1237,10 @@ def main() -> int:
                         iga_state["layer_weights"].clear()
                         iga_state["pending_activations"].clear()
                         iga_cuda_events.clear()
+                    if args.hessian_weighting == "grad":
+                        grad_state["layer_activations"].clear()
+                        grad_state["linear_activations"].clear()
+                        grad_state["layer_weights"].clear()
                     token_selection["mask"] = (
                         attention_mask & ~vision_mask if args.hessian_token_scope == "text" else None
                     )
@@ -1130,14 +1258,82 @@ def main() -> int:
                     )
                     forward_started = time.monotonic()
                     try:
-                        with torch.inference_mode():
-                            model(
-                                inputs_embeds=inputs["inputs_embeds"],
-                                attention_mask=kwargs.get("attention_mask"),
-                                use_cache=False,
-                                output_attentions=args.hessian_weighting == "iga",
-                                return_dict=True,
+                        if args.hessian_weighting == "grad":
+                            labels = kwargs.get("labels")
+                            if labels is None:
+                                raise RuntimeError("Gradient Hessian weighting requires adapter-provided labels")
+                            gradient_inputs_embeds = inputs["inputs_embeds"].detach().requires_grad_(True)
+                            with torch.enable_grad():
+                                gradient_forward_started = time.monotonic()
+                                outputs = model(
+                                    inputs_embeds=gradient_inputs_embeds,
+                                    attention_mask=kwargs.get("attention_mask"),
+                                    use_cache=False,
+                                    output_attentions=False,
+                                    return_dict=True,
+                                )
+                                if SHOW_TIMING:
+                                    torch.cuda.synchronize()
+                                record_timing(
+                                    "gradient-weighted model forward",
+                                    time.monotonic() - gradient_forward_started,
+                                )
+                                valid_for_weights = attention_mask[0].clone()
+                                if args.hessian_token_scope == "text":
+                                    valid_for_weights &= ~vision_mask[0]
+                                gradient_score_started = time.monotonic()
+                                layer_weights = make_gradient_token_weights(
+                                    outputs.logits,
+                                    labels[0],
+                                    grad_state["layer_activations"],
+                                    valid_for_weights,
+                                )
+                                grad_state["layer_weights"].update(layer_weights)
+                                if SHOW_TIMING:
+                                    torch.cuda.synchronize()
+                                record_timing(
+                                    "assistant-token gradient score calculation",
+                                    time.monotonic() - gradient_score_started,
+                                )
+                            log(
+                                f"Gradient weighting computed sqrt(sum of squared block-input "
+                                f"gradients) for {int(labels[0, 1:].ne(-100).sum())} assistant CE targets "
+                                f"across {len(layer_weights)} decoder layers",
+                                level="extensive",
                             )
+                            hessian_accumulation_started = time.monotonic()
+                            for layer_index in group_layers:
+                                token_weights = grad_state["layer_weights"][layer_index]
+                                for name, linear in linears_by_layer[layer_index].items():
+                                    key = f"{layer_index}:{name}"
+                                    activations = grad_state["linear_activations"].pop(key, None)
+                                    if activations is None:
+                                        raise RuntimeError(f"No saved Linear activations for gradient Hessian {key}")
+                                    accumulate_weighted_hessian(
+                                        active_hessians,
+                                        counts,
+                                        key,
+                                        linear.in_features,
+                                        activations,
+                                        valid_for_weights,
+                                        token_weights,
+                                    )
+                            if SHOW_TIMING:
+                                torch.cuda.synchronize()
+                            record_timing(
+                                "gradient-weighted Hessian activation transfer and accumulation",
+                                time.monotonic() - hessian_accumulation_started,
+                            )
+                            del outputs, gradient_inputs_embeds
+                        else:
+                            with torch.inference_mode():
+                                model(
+                                    inputs_embeds=inputs["inputs_embeds"],
+                                    attention_mask=kwargs.get("attention_mask"),
+                                    use_cache=False,
+                                    output_attentions=args.hessian_weighting == "iga",
+                                    return_dict=True,
+                                )
                         torch.cuda.synchronize()
                     finally:
                         token_selection["mask"] = None
@@ -1147,6 +1343,10 @@ def main() -> int:
                         missing = ", ".join(iga_state["pending_activations"])
                         iga_state["pending_activations"].clear()
                         raise RuntimeError(f"IGA attention hooks did not consume captured activations: {missing}")
+                    if args.hessian_weighting == "grad" and grad_state["linear_activations"]:
+                        missing = ", ".join(grad_state["linear_activations"])
+                        grad_state["linear_activations"].clear()
+                        raise RuntimeError(f"Gradient Hessian hooks did not consume captured activations: {missing}")
                     forward_elapsed = time.monotonic() - forward_started
                     completed_forwards += 1
                     record_timing("calibration model forward with active Hessian group", forward_elapsed)
@@ -1165,6 +1365,9 @@ def main() -> int:
                 token_selection["mask"] = None
                 iga_state["layer_weights"].clear()
                 iga_state["pending_activations"].clear()
+                grad_state["layer_activations"].clear()
+                grad_state["linear_activations"].clear()
+                grad_state["layer_weights"].clear()
                 for handle in collect_handles:
                     handle.remove()
 
@@ -1327,9 +1530,8 @@ def main() -> int:
             f"Quantized {len(quantized_layers)} of {len(selected_layers)} selected decoder layers during finalization"
         )
 
-    # Release the offloaded calibration model before loading a complete CPU
-    # copy for serialization. The standalone checkpoint keeps the base model's
-    # unselected layers and replaces selected Linear weights with GPTQ values.
+    # Release the offloaded calibration model before either retaining the
+    # packed GPTQ layers or loading a complete CPU copy for dense export.
     quantize_handles.clear()
     execution_probe_handles.clear()
     # The loop's final callback and loop variables retain its decoder block.
@@ -1342,6 +1544,85 @@ def main() -> int:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    metadata = {
+        "format": (
+            "attention-quantization-gptq-packed-overlay-v1"
+            if args.output_format == "packed-overlay"
+            else "attention-quantization-gptq-standalone-pytorch-bin-dense-v1"
+        ),
+        "base_model": str(checkpoint),
+        "model_family": "llava-v1.5",
+        "bits": args.bits,
+        "group_size": args.group_size,
+        "selected_layers_1based": sorted(index + 1 for index in selected_layers),
+        "hessian_token_scope": args.hessian_token_scope,
+        "hessian_weighting": args.hessian_weighting,
+        "hessian_gradient_score": (
+            "sqrt(sum_answer_targets,hidden(grad CE / grad block_input)^2), normalized to mean 1 "
+            "over the selected token scope"
+            if args.hessian_weighting == "grad" else None
+        ),
+        "hessian_memory_limits_bytes": {
+            "gpu_bytes": args.max_hessian_memory_gpu,
+            "cpu_bytes": args.max_hessian_memory_cpu,
+            "disk_bytes": args.max_hessian_memory_disk,
+        },
+        "hessian_cpu_used_gib": ram_bytes / (1024**3),
+        "hessian_disk_used_gib": disk_bytes / (1024**3),
+        "hessian_disk_files": (
+            sorted({str(path.relative_to(offload_dir)) for path in hessian_paths.values()})
+            if args.keep_hessians else []
+        ),
+        "hessian_placement": hessian_placement,
+        "damp": args.damp,
+        "calibration_samples": len(dataset),
+        "seed": args.seed,
+    }
+
+    if args.output_format == "packed-overlay":
+        # Keep the packed uint8 bitstreams and per-group affine parameters as
+        # the final artifact. They are not expanded back to FP16 here.
+        layers_dir = output_dir / "layers"
+        layers_dir.mkdir(parents=True, exist_ok=True)
+        overlay_started = time.monotonic()
+        packed_files = sorted(packed_dir.glob("decoder-*.pt"))
+        if len(packed_files) != len(selected_layers):
+            raise RuntimeError(
+                f"Packed overlay has {len(packed_files)} layer files; expected {len(selected_layers)}"
+            )
+        for packed_path in packed_files:
+            os.replace(packed_path, layers_dir / packed_path.name)
+        metadata.update({
+            "storage": f"packed GPTQ codes at {args.bits} bits with FP32 scales and zero-points",
+            "load_note": (
+                "Pass this directory as --overlay-dir and the original checkpoint as --pretrained "
+                "to scripts/evaluate_model.py. The current LLaVA adapter expands selected weights "
+                "to the model dtype at load time; it does not run low-bit kernels."
+            ),
+        })
+        (output_dir / "gptq_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        if not (output_dir / "gptq_metadata.json").is_file() or not any(layers_dir.glob("decoder-*.pt")):
+            raise RuntimeError(f"Packed GPTQ overlay export is incomplete: {output_dir}")
+        saved_bytes = sum(path.stat().st_size for path in layers_dir.glob("decoder-*.pt"))
+        record_timing("packed GPTQ overlay export", time.monotonic() - overlay_started)
+        log(
+            f"Saved packed GPTQ overlay: layers={len(packed_files)}, bits={args.bits}, "
+            f"size={saved_bytes / 10**9:.2f} GB, directory={output_dir}"
+        )
+        cleanup_started = time.monotonic()
+        shutil.rmtree(packed_dir, ignore_errors=True)
+        if not args.keep_hessians and hessian_dir.exists():
+            shutil.rmtree(hessian_dir)
+        shutil.rmtree(offload_dir / "model", ignore_errors=True)
+        if args.offload_dir is None and not args.keep_hessians:
+            shutil.rmtree(offload_dir, ignore_errors=True)
+        record_timing("temporary Hessian/model scratch cleanup", time.monotonic() - cleanup_started)
+        if SHOW_TIMING and LOG_LEVEL != "extensive":
+            log(f"Run completed in {time.monotonic() - run_started:.1f}s")
+        return 0
 
     export_started = time.monotonic()
     log(f"Loading base checkpoint on CPU to write standalone model: {checkpoint}")
@@ -1417,33 +1698,10 @@ def main() -> int:
     gc.collect()
     record_timing("standalone model export", time.monotonic() - export_started)
 
-    metadata = {
-        "format": "attention-quantization-gptq-standalone-pytorch-bin-dense-v1",
-        "base_model": str(checkpoint),
-        "model_family": "llava-v1.5",
-        "bits": args.bits,
-        "group_size": args.group_size,
-        "selected_layers_1based": sorted(index + 1 for index in selected_layers),
-        "hessian_token_scope": args.hessian_token_scope,
-        "hessian_weighting": args.hessian_weighting,
-        "hessian_memory_limits_bytes": {
-            "gpu_bytes": args.max_hessian_memory_gpu,
-            "cpu_bytes": args.max_hessian_memory_cpu,
-            "disk_bytes": args.max_hessian_memory_disk,
-        },
-        "hessian_cpu_used_gib": ram_bytes / (1024**3),
-        "hessian_disk_used_gib": disk_bytes / (1024**3),
-        "hessian_disk_files": (
-            sorted({str(path.relative_to(offload_dir)) for path in hessian_paths.values()})
-            if args.keep_hessians else []
-        ),
-        "hessian_placement": hessian_placement,
-        "damp": args.damp,
-        "calibration_samples": len(dataset),
-        "seed": args.seed,
+    metadata.update({
         "storage": "dense float16 standalone checkpoint in PyTorch .bin format",
         "load_note": "Standalone LLaVA checkpoint; load directly from this output directory.",
-    }
+    })
     (output_dir / "gptq_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     cleanup_started = time.monotonic()
     shutil.rmtree(packed_dir, ignore_errors=True)
