@@ -78,14 +78,14 @@ temporary attention memory. The selected weighting is recorded in
 Set `--hessian-weighting grad` to weight each included token by its gradient
 importance. For each calibration example and selected layer group, the script
 sums the assistant-answer cross-entropy losses, differentiates that summed
-loss once with respect to each selected decoder block's input, and takes the
+loss once with respect to each selected decoder block's output, and takes the
 L2 norm over hidden features to obtain the token score. Scores are normalized
 to mean 1 over the selected token scope before weighting that layer's `X'WX`
 Hessians. This uses one gradient calculation per group and sample. It differs
 from summing the squared gradients of each answer-token loss separately.
-This follows the investigation's `block_input` gradient capture convention and
-works with either `--hessian-token-scope all` or `text`. It does not request or
-retain attention matrices. Gradient weighting runs in two phases: grouped
+The score is captured at decoder block outputs and works with either
+`--hessian-token-scope all` or `text`. It does not request or retain attention
+matrices. Gradient weighting runs in two phases: grouped
 gradient-enabled forwards compute and store only per-token weights, then a
 second set of grouped inference forwards recomputes Linear activations and
 accumulates the weighted Hessians on GPU. This avoids staging every selected

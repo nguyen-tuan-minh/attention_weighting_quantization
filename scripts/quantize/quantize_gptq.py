@@ -415,14 +415,14 @@ def make_iga_token_weights(
 def make_gradient_token_weights(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    layer_activations: dict[int, torch.Tensor],
+    layer_outputs: dict[int, torch.Tensor],
     selected_mask: torch.Tensor,
 ) -> dict[int, torch.Tensor]:
     """Compute mean-one token weights from the summed assistant-answer CE gradient.
 
     Differentiate the sum of all assistant answer-token losses once with
-    respect to each captured decoder block input. For each input token, take
-    the L2 norm over hidden features, then normalize over the selected scope.
+    respect to each captured decoder block output. For each output token,
+    take the L2 norm over hidden features, then normalize over the selected scope.
     """
     if logits.ndim != 3 or logits.shape[0] != 1:
         raise RuntimeError(f"Gradient weighting expects logits [1, sequence, vocab], got {tuple(logits.shape)}")
@@ -432,11 +432,11 @@ def make_gradient_token_weights(
     answer_positions = labels[1:].ne(-100).nonzero(as_tuple=True)[0] + 1
     if answer_positions.numel() == 0:
         raise RuntimeError("Gradient Hessian weighting needs at least one assistant answer token")
-    if not layer_activations:
-        raise RuntimeError("Gradient weighting captured no selected decoder block inputs")
+    if not layer_outputs:
+        raise RuntimeError("Gradient weighting captured no selected decoder block outputs")
 
-    layer_indices = sorted(layer_activations)
-    activations = [layer_activations[index] for index in layer_indices]
+    layer_indices = sorted(layer_outputs)
+    outputs_by_layer = [layer_outputs[index] for index in layer_indices]
     answer_positions = answer_positions.to(device=logits.device)
     targets = labels.to(device=logits.device, dtype=torch.long)[answer_positions]
     answer_logits = logits[0, answer_positions - 1].float()
@@ -445,7 +445,7 @@ def make_gradient_token_weights(
     )
     gradients = torch.autograd.grad(
         summed_answer_ce,
-        tuple(activations),
+        tuple(outputs_by_layer),
         allow_unused=False,
     )
     scores = {
@@ -915,7 +915,7 @@ def main() -> int:
         "pending_activations": {},
     }
     grad_state: dict[str, Any] = {
-        "layer_activations": {},
+        "layer_outputs": {},
         "layer_weights": {},
         "current_valid": None,
     }
@@ -1014,15 +1014,16 @@ def main() -> int:
         for group_pass, (group_layers, _group_keys, _group_bytes, _disk_chunk) in enumerate(group_specs, 1):
             gradient_handles = []
             for layer_index in group_layers:
-                def capture_gradient_layer_input(_module, inputs, *, layer_index=layer_index):
-                    if not inputs or not torch.is_tensor(inputs[0]):
+                def capture_gradient_layer_output(_module, _inputs, output, *, layer_index=layer_index):
+                    hidden_states = output[0] if isinstance(output, (tuple, list)) else output
+                    if not torch.is_tensor(hidden_states):
                         raise RuntimeError(
-                            f"Could not capture block input for gradient weighting at layer {layer_index + 1}"
+                            f"Could not capture block output for gradient weighting at layer {layer_index + 1}"
                         )
-                    grad_state["layer_activations"][layer_index] = inputs[0]
+                    grad_state["layer_outputs"][layer_index] = hidden_states
 
                 gradient_handles.append(
-                    blocks[layer_index].register_forward_pre_hook(capture_gradient_layer_input)
+                    blocks[layer_index].register_forward_hook(capture_gradient_layer_output)
                 )
             try:
                 for sample_index, sample in enumerate(dataset):
@@ -1050,7 +1051,7 @@ def main() -> int:
                     if labels is None:
                         raise RuntimeError("Gradient Hessian weighting requires adapter-provided labels")
                     answer_target_count = int(labels[0, 1:].ne(-100).sum())
-                    grad_state["layer_activations"].clear()
+                    grad_state["layer_outputs"].clear()
                     gradient_inputs_embeds = inputs["inputs_embeds"].detach().requires_grad_(True)
                     forward_started = time.monotonic()
                     with torch.enable_grad():
@@ -1066,7 +1067,7 @@ def main() -> int:
                         layer_weights = make_gradient_token_weights(
                             outputs.logits,
                             labels[0],
-                            grad_state["layer_activations"],
+                            grad_state["layer_outputs"],
                             valid_for_weights,
                         )
                         record_timing(
@@ -1078,8 +1079,9 @@ def main() -> int:
                             device="cpu", dtype=torch.float32
                         )
                     completed_gradient_forwards += 1
-                    del outputs, gradient_inputs_embeds, inputs, kwargs, batch, prepared, image_value
-                    grad_state["layer_activations"].clear()
+                    del outputs, gradient_inputs_embeds, layer_weights
+                    del inputs, kwargs, batch, prepared, image_value
+                    grad_state["layer_outputs"].clear()
                     log(
                         f"Gradient-weight pass {group_pass}/{len(group_specs)}, sample "
                         f"{sample_index + 1}/{len(dataset)} complete; "
@@ -1087,7 +1089,7 @@ def main() -> int:
                         f"completed forwards={completed_gradient_forwards}/{gradient_forwards}"
                     )
             finally:
-                grad_state["layer_activations"].clear()
+                grad_state["layer_outputs"].clear()
                 for handle in gradient_handles:
                     handle.remove()
         record_timing("gradient-weight collection phase", time.monotonic() - gradient_pass_started)
@@ -1385,7 +1387,7 @@ def main() -> int:
                 token_selection["mask"] = None
                 iga_state["layer_weights"].clear()
                 iga_state["pending_activations"].clear()
-                grad_state["layer_activations"].clear()
+                grad_state["layer_outputs"].clear()
                 grad_state["layer_weights"].clear()
                 grad_state["current_valid"] = None
                 for handle in collect_handles:
@@ -1579,7 +1581,7 @@ def main() -> int:
         "hessian_token_scope": args.hessian_token_scope,
         "hessian_weighting": args.hessian_weighting,
         "hessian_gradient_score": (
-            "sqrt(sum_hidden(grad sum_answer_CE / grad block_input)^2), normalized to mean 1 "
+            "sqrt(sum_hidden(grad sum_answer_CE / grad block_output)^2), normalized to mean 1 "
             "over the selected token scope"
             if args.hessian_weighting == "grad" else None
         ),
