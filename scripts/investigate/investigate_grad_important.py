@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import sys
 import time
@@ -313,6 +314,27 @@ def _generate_assistant_once(
             ),
             "",
         )
+        inspection_kwargs = {
+            "heatmap_only": heatmap_only,
+            "scale": scale,
+            "score_normalization": score_normalization,
+            "top_token_percent": top_token_percent,
+            "score_candidate_token_gradients_fn": score_candidate_token_gradients,
+            "generate_candidate_continuation_fn": generate_candidate_continuation,
+            "show_gradient_heatmaps_fn": show_gradient_heatmaps,
+            "show_large_source_image_fn": show_large_source_image,
+            "log_fn": log,
+            "interactive_timeout_seconds": interactive_timeout_seconds,
+        }
+        inspection_parameters = inspect.signature(inspect_generated_token_positions).parameters
+        if "top_token_cumulative_percent" in inspection_parameters:
+            inspection_kwargs["top_token_cumulative_percent"] = top_token_cumulative_percent
+        elif top_token_cumulative_percent is not None:
+            log(
+                "Cumulative score-mass masks are unavailable in the loaded interactive "
+                "session module; update the project's src/ module to enable them there.",
+                level="normal",
+            )
         inspection_action = inspect_generated_token_positions(
             input_adapter,
             active_sample,
@@ -326,17 +348,7 @@ def _generate_assistant_once(
             initial_question,
             image,
             sample_number,
-            heatmap_only=heatmap_only,
-            scale=scale,
-            score_normalization=score_normalization,
-            top_token_percent=top_token_percent,
-            top_token_cumulative_percent=top_token_cumulative_percent,
-            score_candidate_token_gradients_fn=score_candidate_token_gradients,
-            generate_candidate_continuation_fn=generate_candidate_continuation,
-            show_gradient_heatmaps_fn=show_gradient_heatmaps,
-            show_large_source_image_fn=show_large_source_image,
-            log_fn=log,
-            interactive_timeout_seconds=interactive_timeout_seconds,
+            **inspection_kwargs,
         )
     del generated_ids, generated_token_ids, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
     return assistant_text, inspection_action
