@@ -213,6 +213,12 @@ optional reference override when the base path normally comes from
   image-patch maps and text-token scores with decoded labels. Each modality has
   its own colorbar and scale, so image and text colors show relative levels
   within that modality and their raw colors must not be compared across the two.
+  `--capture-point value` scores gradients at each layer's self-attention
+  `v_proj` output; `block_input` and `after_layer_norm` are the other capture
+  choices. Use `--top-token-percent 0.1` to replace each image-gradient map
+  with a binary mask of that layer's top 10% image tokens, ranked separately
+  per layer. This option affects image maps only; text-token strips stay
+  continuous.
   Use `--heatmap-only` to show the source image in a separate reference panel
   beside the plain patch-grid heatmaps. The default color scale is logarithmic;
   use `--scale linear` for a normal linear scale. Use

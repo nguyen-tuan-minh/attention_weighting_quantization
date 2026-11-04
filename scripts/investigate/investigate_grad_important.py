@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, Normalize
+from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm, Normalize
 import numpy as np
 from PIL import Image
 import torch
@@ -736,6 +736,7 @@ def show_gradient_heatmaps(
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
+    top_token_percent: float | None = None,
     title_suffix: str | None = None,
     display: bool = True,
     save_dir: Path | None = None,
@@ -754,6 +755,8 @@ def show_gradient_heatmaps(
         scale: Color normalization, either logarithmic or linear.
         score_normalization: ``raw`` preserves score magnitudes; ``percent``
             makes each image-token score a percentage of that layer's total.
+        top_token_percent: Optional fraction in (0, 1] to retain by image-token
+            gradient score separately per layer and display as a binary map.
         title_suffix: Optional context appended to the figure title.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
@@ -771,6 +774,8 @@ def show_gradient_heatmaps(
         raise ValueError(f"Unknown score modality: {modality}")
     if modality in {"text", "both"} and (not text_scores or text_labels is None):
         raise ValueError("Text plotting requires text scores and aligned token labels")
+    if top_token_percent is not None and not 0 < top_token_percent <= 1:
+        raise ValueError("top_token_percent must be in (0, 1]")
     if text_scores is not None and text_labels is not None:
         if set(layer_scores) != set(text_scores):
             raise ValueError("Image and text score dictionaries must contain the same layers")
@@ -806,6 +811,15 @@ def show_gradient_heatmaps(
     # image_scores_display/text_scores_display: per-layer CPU float vectors with independent modality color scales.
     image_scores_display = normalize_scores(layer_scores) if show_image else None
     text_scores_display = normalize_scores(text_scores) if show_text and text_scores else None
+    binary_image_scores = None
+    if show_image and top_token_percent is not None:
+        binary_image_scores = {}
+        for layer_index, scores in image_scores_display.items():
+            keep_count = max(1, math.ceil(scores.numel() * top_token_percent))
+            selected = torch.topk(scores.flatten(), k=keep_count).indices
+            mask = torch.zeros_like(scores).flatten()
+            mask[selected] = 1.0
+            binary_image_scores[layer_index] = mask.reshape_as(scores)
     if show_image:
         image_token_count = next(iter(image_scores_display.values())).numel()
         grid_size = math.isqrt(image_token_count)
@@ -829,7 +843,13 @@ def show_gradient_heatmaps(
     text_rows = math.ceil(len(layer_indices) / columns) if show_text else 0
     figure = plt.figure(figsize=(columns * 3.5, image_rows * 3.2 + text_rows * 2.5), constrained_layout=True)
     outer = figure.add_gridspec(max(1, image_rows + text_rows), columns)
-    image_norm = make_norm(image_scores_display) if show_image else None
+    binary_mode = binary_image_scores is not None
+    image_norm = (
+        BoundaryNorm([-0.5, 0.5, 1.5], 2)
+        if binary_mode
+        else make_norm(image_scores_display) if show_image else None
+    )
+    image_cmap = ListedColormap(["#202020", "#FFD400"]) if binary_mode else "inferno"
     text_norm = make_norm(text_scores_display) if text_scores_display else None
     image_mappable = text_mappable = None
     image_offset = int(heatmap_only) if show_image else 0
@@ -844,13 +864,28 @@ def show_gradient_heatmaps(
         slot = layer_number + image_offset
         axis = figure.add_subplot(outer[slot // columns, slot % columns])
         image_axes.append(axis)
-        grid_scores = image_scores_display[layer_index].reshape(1, 1, grid_size, grid_size)
+        source_scores = (
+            binary_image_scores[layer_index]
+            if binary_mode else image_scores_display[layer_index]
+        )
+        grid_scores = source_scores.reshape(1, 1, grid_size, grid_size)
         if not heatmap_only:
             axis.imshow(image)
-            display_heatmap = F.interpolate(grid_scores, size=(square_side, square_side), mode="bilinear", align_corners=False)[0, 0].numpy()
+            interpolation = "nearest" if binary_mode else "bilinear"
+            display_heatmap = F.interpolate(
+                grid_scores,
+                size=(square_side, square_side),
+                mode=interpolation,
+                **({} if binary_mode else {"align_corners": False}),
+            )[0, 0].numpy()
         else:
             display_heatmap = grid_scores[0, 0].numpy()
-        image_mappable = axis.imshow(display_heatmap, cmap="inferno", norm=image_norm, alpha=0.58 if not heatmap_only else 1.0)
+        image_mappable = axis.imshow(
+            display_heatmap,
+            cmap=image_cmap,
+            norm=image_norm,
+            alpha=0.58 if not heatmap_only else 1.0,
+        )
         axis.set_title(f"Layer {layer_index}")
         axis.axis("off")
     image_slots = image_panel_count
@@ -858,8 +893,20 @@ def show_gradient_heatmaps(
         axis = figure.add_subplot(outer[slot // columns, slot % columns])
         axis.axis("off")
     if image_mappable is not None:
-        figure.colorbar(image_mappable, ax=image_axes, fraction=0.015, pad=0.01,
-                        label=f"Image-token score ({'percent within image tokens' if score_normalization == 'percent' else 'raw'})")
+        image_colorbar = figure.colorbar(
+            image_mappable,
+            ax=image_axes,
+            fraction=0.015,
+            pad=0.01,
+            label=(
+                "Top gradient image-token mask (binary)"
+                if binary_mode
+                else f"Image-token score ({'percent within image tokens' if score_normalization == 'percent' else 'raw'})"
+            ),
+        )
+        if binary_mode:
+            image_colorbar.set_ticks([0, 1])
+            image_colorbar.set_ticklabels(["Other tokens", "Retained top tokens"])
 
     if show_text and text_scores_display:
         for layer_number, layer_index in enumerate(layer_indices):
@@ -885,6 +932,8 @@ def show_gradient_heatmaps(
                             label=f"Text-token score ({'percent within text tokens' if score_normalization == 'percent' else 'raw'})")
 
     figure_title = f"Sample {sample_number}: selected decoder-activation gradient importance"
+    if binary_mode:
+        figure_title += f"; top {top_token_percent:.1%} image tokens per layer"
     if title_suffix:
         figure_title += f" ({title_suffix})"
     figure.suptitle(figure_title, fontsize=14)
@@ -998,6 +1047,15 @@ def parse_args() -> argparse.Namespace:
         help="Show raw scores or each image token's percentage of its layer's total score.",
     )
     parser.add_argument(
+        "--top-token-percent",
+        type=float,
+        default=None,
+        help=(
+            "Show a binary mask of each layer's highest-scoring image tokens; "
+            "pass a fraction in (0, 1], for example 0.1 for the top 10%%."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("none", "normal", "extensive"),
         default="normal",
@@ -1014,6 +1072,8 @@ def main() -> int:
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
     try:
+        if args.top_token_percent is not None and not 0 < args.top_token_percent <= 1:
+            raise ValueError("--top-token-percent must be in (0, 1], for example 0.1 for 10%")
         # Read options and validate settings before loading large resources.
         dataset_config = read_yaml(args.dataset_config)
         model_config = read_yaml(args.model_config)
@@ -1301,6 +1361,7 @@ def main() -> int:
                     heatmap_only=args.heatmap_only,
                     scale=args.scale,
                     score_normalization=args.score_normalization,
+                    top_token_percent=args.top_token_percent,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )
