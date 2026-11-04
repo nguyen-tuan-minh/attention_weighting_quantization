@@ -162,6 +162,7 @@ def _generate_assistant_once(
     scale: str = "log",
     score_normalization: str = "raw",
     top_token_percent: float | None = None,
+    top_token_cumulative_percent: float | None = None,
     sampling_mode: str = "greedy",
     temperature: float = 0.8,
     top_p: float = 0.9,
@@ -182,7 +183,10 @@ def _generate_assistant_once(
         heatmap_only: Use the separate-reference-image heatmap layout.
         scale: Heatmap color normalization, logarithmic or linear.
         score_normalization: Raw scores or per-layer image-token percentages.
-        top_token_percent: Optional per-layer fraction of image tokens to retain.
+        top_token_percent: Optional fraction of image tokens to retain by count
+            in each layer's binary image mask.
+        top_token_cumulative_percent: Optional fraction of each layer's total
+            image-token score mass to retain in the binary image mask.
         sampling_mode: ``greedy`` or stochastic nucleus ``sample`` generation.
         temperature: Positive softmax temperature for stochastic generation.
         top_p: Cumulative probability threshold for nucleus sampling.
@@ -326,6 +330,7 @@ def _generate_assistant_once(
             scale=scale,
             score_normalization=score_normalization,
             top_token_percent=top_token_percent,
+            top_token_cumulative_percent=top_token_cumulative_percent,
             score_candidate_token_gradients_fn=score_candidate_token_gradients,
             generate_candidate_continuation_fn=generate_candidate_continuation,
             show_gradient_heatmaps_fn=show_gradient_heatmaps,
@@ -350,6 +355,7 @@ def generate_assistant_reply(
     scale: str = "log",
     score_normalization: str = "raw",
     top_token_percent: float | None = None,
+    top_token_cumulative_percent: float | None = None,
     temperature: float = 0.8,
     top_p: float = 0.9,
     interactive_timeout_seconds: float = 600.0,
@@ -367,7 +373,10 @@ def generate_assistant_reply(
         heatmap_only: Display plain patch maps beside a reference image.
         scale: Gradient-plot color scale.
         score_normalization: Raw scores or within-modality percentages.
-        top_token_percent: Optional per-layer fraction of image tokens to retain.
+        top_token_percent: Optional fraction of image tokens to retain by count
+            in each layer's binary image mask.
+        top_token_cumulative_percent: Optional fraction of each layer's total
+            image-token score mass to retain in the binary image mask.
         temperature: Sampling temperature for interactive stochastic regeneration.
         top_p: Nucleus mass threshold for stochastic generation.
 
@@ -396,6 +405,7 @@ def generate_assistant_reply(
             scale=scale,
             score_normalization=score_normalization,
             top_token_percent=top_token_percent,
+            top_token_cumulative_percent=top_token_cumulative_percent,
             sampling_mode=sampling_mode,
             temperature=temperature,
             top_p=top_p,
@@ -743,6 +753,7 @@ def show_gradient_heatmaps(
     scale: str = "log",
     score_normalization: str = "raw",
     top_token_percent: float | None = None,
+    top_token_cumulative_percent: float | None = None,
     title_suffix: str | None = None,
     display: bool = True,
     save_dir: Path | None = None,
@@ -761,8 +772,11 @@ def show_gradient_heatmaps(
         scale: Color normalization, either logarithmic or linear.
         score_normalization: ``raw`` preserves score magnitudes; ``percent``
             makes each image-token score a percentage of that layer's total.
-        top_token_percent: Optional fraction in (0, 1] to retain by image-token
-            gradient score separately per layer and display as a binary map.
+        top_token_percent: Optional fraction in (0, 1] of image tokens to keep
+            by count, independently for each layer.
+        top_token_cumulative_percent: Optional fraction in (0, 1] of each
+            layer's total image-token score mass to keep. Tokens are ranked by
+            score and accumulated from highest to lowest.
         title_suffix: Optional context appended to the figure title.
         display: Whether to display the Matplotlib figure; true by default.
         save_dir: Optional directory enabling PNG output. ``None`` writes no file.
@@ -782,6 +796,10 @@ def show_gradient_heatmaps(
         raise ValueError("Text plotting requires text scores and aligned token labels")
     if top_token_percent is not None and not 0 < top_token_percent <= 1:
         raise ValueError("top_token_percent must be in (0, 1]")
+    if top_token_cumulative_percent is not None and not 0 < top_token_cumulative_percent <= 1:
+        raise ValueError("top_token_cumulative_percent must be in (0, 1]")
+    if top_token_percent is not None and top_token_cumulative_percent is not None:
+        raise ValueError("Use only one of top_token_percent or top_token_cumulative_percent")
     if text_scores is not None and text_labels is not None:
         if set(layer_scores) != set(text_scores):
             raise ValueError("Image and text score dictionaries must contain the same layers")
@@ -818,13 +836,23 @@ def show_gradient_heatmaps(
     image_scores_display = normalize_scores(layer_scores) if show_image else None
     text_scores_display = normalize_scores(text_scores) if show_text and text_scores else None
     binary_image_scores = None
-    if show_image and top_token_percent is not None:
+    if show_image and (top_token_percent is not None or top_token_cumulative_percent is not None):
         binary_image_scores = {}
         for layer_index, scores in image_scores_display.items():
-            keep_count = max(1, math.ceil(scores.numel() * top_token_percent))
-            selected = torch.topk(scores.flatten(), k=keep_count).indices
             mask = torch.zeros_like(scores).flatten()
-            mask[selected] = 1.0
+            flat_scores = scores.flatten()
+            if top_token_percent is not None:
+                keep_count = max(1, math.ceil(flat_scores.numel() * top_token_percent))
+                selected = torch.topk(flat_scores, k=keep_count).indices
+                mask[selected] = 1.0
+            else:
+                total_score = flat_scores.sum()
+                if total_score > 0:
+                    sorted_scores, sorted_indices = torch.sort(flat_scores, descending=True)
+                    cumulative_scores = torch.cumsum(sorted_scores, dim=0)
+                    threshold = total_score * top_token_cumulative_percent
+                    keep_count = int(torch.searchsorted(cumulative_scores, threshold).item()) + 1
+                    mask[sorted_indices[:keep_count]] = 1.0
             binary_image_scores[layer_index] = mask.reshape_as(scores)
     if show_image:
         image_token_count = next(iter(image_scores_display.values())).numel()
@@ -939,7 +967,10 @@ def show_gradient_heatmaps(
 
     figure_title = f"Sample {sample_number}: selected decoder-activation gradient importance"
     if binary_mode:
-        figure_title += f"; top {top_token_percent:.1%} image tokens per layer"
+        if top_token_percent is not None:
+            figure_title += f"; top {top_token_percent:.1%} tokens by count per layer"
+        else:
+            figure_title += f"; tokens reach {top_token_cumulative_percent:.1%} score mass per layer"
     if title_suffix:
         figure_title += f" ({title_suffix})"
     figure.suptitle(figure_title, fontsize=14)
@@ -1057,8 +1088,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Show a binary mask of each layer's highest-scoring image tokens; "
-            "pass a fraction in (0, 1], for example 0.1 for the top 10%%."
+            "Show a binary mask of this fraction of highest-scoring image "
+            "tokens by count in each layer; pass a fraction in (0, 1], "
+            "for example 0.1 for the top 10%% of tokens."
+        ),
+    )
+    parser.add_argument(
+        "--top-token-cumulative-percent",
+        type=float,
+        default=None,
+        help=(
+            "Show a binary mask of the highest-scoring image tokens whose "
+            "cumulative scores reach this fraction of each layer's total; "
+            "for example 0.9 for 90%% of score mass. Mutually exclusive with "
+            "--top-token-percent."
         ),
     )
     parser.add_argument(
@@ -1079,7 +1122,11 @@ def main() -> int:
     args.timing = args.timing or args.log_level == "extensive"
     try:
         if args.top_token_percent is not None and not 0 < args.top_token_percent <= 1:
-            raise ValueError("--top-token-percent must be in (0, 1], for example 0.1 for 10%")
+            raise ValueError("--top-token-percent must be in (0, 1], for example 0.1 for the top 10% by count")
+        if args.top_token_cumulative_percent is not None and not 0 < args.top_token_cumulative_percent <= 1:
+            raise ValueError("--top-token-cumulative-percent must be in (0, 1], for example 0.9 for 90% score mass")
+        if args.top_token_percent is not None and args.top_token_cumulative_percent is not None:
+            raise ValueError("Choose either --top-token-percent or --top-token-cumulative-percent")
         # Read options and validate settings before loading large resources.
         dataset_config = read_yaml(args.dataset_config)
         model_config = read_yaml(args.model_config)
@@ -1256,6 +1303,7 @@ def main() -> int:
                             scale=args.scale,
                             score_normalization=args.score_normalization,
                             top_token_percent=args.top_token_percent,
+                            top_token_cumulative_percent=args.top_token_cumulative_percent,
                             temperature=args.temperature,
                             top_p=args.top_p,
                             interactive_timeout_seconds=interactive_timeout_seconds,
@@ -1369,6 +1417,7 @@ def main() -> int:
                     scale=args.scale,
                     score_normalization=args.score_normalization,
                     top_token_percent=args.top_token_percent,
+                    top_token_cumulative_percent=args.top_token_cumulative_percent,
                     display=not args.no_display,
                     save_dir=save_dir,
                 )

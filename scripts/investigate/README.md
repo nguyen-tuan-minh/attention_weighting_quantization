@@ -332,6 +332,23 @@ python scripts/investigate/investigate_grad_important.py \
   --score-normalization percent
 ```
 
+`--top-token-percent 0.1` keeps the highest-scoring 10% of image tokens by
+count, independently in each layer. For cumulative score mass instead, use
+`--top-token-cumulative-percent 0.9`: each layer keeps the highest-scoring
+tokens until their scores add up to 90% of that layer's total. The two options
+are mutually exclusive. They only change image-token heatmaps; text-token
+strips remain continuous. Both also apply to image heatmaps opened from
+interactive candidate inspection.
+
+Example, keep the image tokens accounting for 90% of each layer's score:
+
+```bash
+python scripts/investigate/investigate_grad_important.py \
+  --samples 2 \
+  --answer-mode generate \
+  --top-token-cumulative-percent 0.9
+```
+
 Differentiate with respect to each layer's post-normalization activation instead
 of its pre-normalization block input:
 
