@@ -50,8 +50,9 @@ def register_decoder_activation_hooks(
             decoder-layer index to a live tensor [batch, sequence, hidden].
             The mapping is cleared before each sample; captured tensors remain
             attached to the current forward graph.
-        capture_point: ``block_input`` for pre-normalization block inputs or
-            ``after_layer_norm`` for the output of each block's input norm.
+        capture_point: ``block_input`` for pre-normalization block inputs,
+            ``after_layer_norm`` for the output of each block's input norm, or
+            ``value`` for the output of the self-attention value projection.
 
     Returns:
         Hook handles. The caller must remove every handle in a ``finally`` block.
@@ -59,11 +60,12 @@ def register_decoder_activation_hooks(
     Hook contract:
         For ``block_input``, read the first positional input to each decoder
         block with a forward-pre-hook. For ``after_layer_norm``, read the
-        output of that block's ``input_layernorm`` with a forward hook. Store
+        output of that block's ``input_layernorm``; for ``value``, read the
+        output of ``self_attn.v_proj``. Both use forward hooks. Store
         the [batch, sequence, hidden] tensor by layer index; neither hook
         changes model values.
     """
-    if capture_point not in {"block_input", "after_layer_norm"}:
+    if capture_point not in {"block_input", "after_layer_norm", "value"}:
         raise ValueError(f"Unsupported activation capture point: {capture_point}")
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
@@ -101,7 +103,7 @@ def register_decoder_activation_hooks(
                 store_activation(inputs[0], index=index)
 
             handles.append(layer.register_forward_pre_hook(capture_block_input))
-        else:
+        elif capture_point == "after_layer_norm":
             layer_norm = getattr(layer, "input_layernorm", None)
             if layer_norm is None:
                 raise RuntimeError(f"Decoder layer {layer_index} has no input_layernorm module")
@@ -118,6 +120,26 @@ def register_decoder_activation_hooks(
                 store_activation(output, index=index)
 
             handles.append(layer_norm.register_forward_hook(capture_after_layer_norm))
+        else:
+            attention = getattr(layer, "self_attn", None)
+            value_projection = getattr(attention, "v_proj", None)
+            if value_projection is None:
+                raise RuntimeError(
+                    f"Decoder layer {layer_index} has no self_attn.v_proj for value capture"
+                )
+
+            def capture_value_projection(
+                _module: Any,
+                _inputs: tuple[Any, ...],
+                output: Any,
+                *,
+                index: int = layer_index,
+            ) -> None:
+                if not active_sample.get("capture_enabled", True):
+                    return
+                store_activation(output, index=index)
+
+            handles.append(value_projection.register_forward_hook(capture_value_projection))
 
     if not handles:
         raise RuntimeError("No decoder blocks were found in the loaded model")
@@ -916,9 +938,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Override configured sample seed.")
     parser.add_argument(
         "--capture-point",
-        choices=("block_input", "after_layer_norm"),
+        choices=("block_input", "after_layer_norm", "value"),
         default="block_input",
-        help="Activation to differentiate: pre-norm block input (default) or input-layer-norm output.",
+        help=(
+            "Activation to differentiate: pre-norm block input (default), input-layer-norm output, "
+            "or self-attention value-projection output."
+        ),
     )
     parser.add_argument(
         "--answer-mode",

@@ -334,6 +334,15 @@ python scripts/investigate/investigate_grad_important.py \
   --capture-point after_layer_norm
 ```
 
+To score the attention value representation, differentiate with respect to the
+output of each layer's `self_attn.v_proj`:
+
+```bash
+python scripts/investigate/investigate_grad_important.py \
+  --samples 2 \
+  --capture-point value
+```
+
 Generate the assistant answer instead of scoring the dataset example:
 
 ```bash
