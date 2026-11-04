@@ -361,6 +361,17 @@ python scripts/investigate/investigate_grad_important.py \
   --answer-mode interactive
 ```
 
+In Colab, run it in a notebook cell with `%run` so prompts use the notebook's
+input frontend (the timeout applies only in a terminal):
+
+```python
+%run scripts/investigate/investigate_grad_important.py \
+  --samples 1 \
+  --answer-mode interactive \
+  --max-new-tokens 256 \
+  --log-level normal
+```
+
 Save the same per-sample figures without opening windows:
 
 ```bash
