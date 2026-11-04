@@ -161,6 +161,7 @@ def _generate_assistant_once(
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
+    top_token_percent: float | None = None,
     sampling_mode: str = "greedy",
     temperature: float = 0.8,
     top_p: float = 0.9,
@@ -181,6 +182,7 @@ def _generate_assistant_once(
         heatmap_only: Use the separate-reference-image heatmap layout.
         scale: Heatmap color normalization, logarithmic or linear.
         score_normalization: Raw scores or per-layer image-token percentages.
+        top_token_percent: Optional per-layer fraction of image tokens to retain.
         sampling_mode: ``greedy`` or stochastic nucleus ``sample`` generation.
         temperature: Positive softmax temperature for stochastic generation.
         top_p: Cumulative probability threshold for nucleus sampling.
@@ -323,6 +325,7 @@ def _generate_assistant_once(
             heatmap_only=heatmap_only,
             scale=scale,
             score_normalization=score_normalization,
+            top_token_percent=top_token_percent,
             score_candidate_token_gradients_fn=score_candidate_token_gradients,
             generate_candidate_continuation_fn=generate_candidate_continuation,
             show_gradient_heatmaps_fn=show_gradient_heatmaps,
@@ -346,6 +349,7 @@ def generate_assistant_reply(
     heatmap_only: bool = False,
     scale: str = "log",
     score_normalization: str = "raw",
+    top_token_percent: float | None = None,
     temperature: float = 0.8,
     top_p: float = 0.9,
     interactive_timeout_seconds: float = 600.0,
@@ -363,6 +367,7 @@ def generate_assistant_reply(
         heatmap_only: Display plain patch maps beside a reference image.
         scale: Gradient-plot color scale.
         score_normalization: Raw scores or within-modality percentages.
+        top_token_percent: Optional per-layer fraction of image tokens to retain.
         temperature: Sampling temperature for interactive stochastic regeneration.
         top_p: Nucleus mass threshold for stochastic generation.
 
@@ -390,6 +395,7 @@ def generate_assistant_reply(
             heatmap_only=heatmap_only,
             scale=scale,
             score_normalization=score_normalization,
+            top_token_percent=top_token_percent,
             sampling_mode=sampling_mode,
             temperature=temperature,
             top_p=top_p,
@@ -1249,6 +1255,7 @@ def main() -> int:
                             heatmap_only=args.heatmap_only,
                             scale=args.scale,
                             score_normalization=args.score_normalization,
+                            top_token_percent=args.top_token_percent,
                             temperature=args.temperature,
                             top_p=args.top_p,
                             interactive_timeout_seconds=interactive_timeout_seconds,

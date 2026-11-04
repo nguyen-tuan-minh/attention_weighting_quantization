@@ -218,7 +218,8 @@ optional reference override when the base path normally comes from
   choices. Use `--top-token-percent 0.1` to replace each image-gradient map
   with a binary mask of that layer's top 10% image tokens, ranked separately
   per layer. This option affects image maps only; text-token strips stay
-  continuous.
+  continuous. It also applies to candidate image-gradient maps shown by the
+  interactive token browser.
   Use `--heatmap-only` to show the source image in a separate reference panel
   beside the plain patch-grid heatmaps. The default color scale is logarithmic;
   use `--scale linear` for a normal linear scale. Use
