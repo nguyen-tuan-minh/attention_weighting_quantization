@@ -356,9 +356,8 @@ def accumulate_weighted_hessian(
     token_weights: torch.Tensor,
 ) -> None:
     """Add X'WX to a GPU Hessian for valid sequence rows and token weights."""
-    # Gradient-weighted collection keeps detached Linear inputs on host RAM
-    # until the answer-token gradients are known; move each activation block
-    # back to the active Hessian device only for its matrix update.
+    # Hooks pass the layer's current activation block directly; promote it and
+    # its weights to float32 on the active Hessian device for the X'WX update.
     x = activations.detach().reshape(-1, width).to(device="cuda", dtype=torch.float32)
     valid = valid_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
     weights = token_weights.reshape(-1).to(device=x.device, dtype=torch.float32)
@@ -419,12 +418,11 @@ def make_gradient_token_weights(
     layer_activations: dict[int, torch.Tensor],
     selected_mask: torch.Tensor,
 ) -> dict[int, torch.Tensor]:
-    """Compute mean-one token weights from root-sum-square answer CE gradients.
+    """Compute mean-one token weights from the summed assistant-answer CE gradient.
 
-    Scores match the investigation's block-input capture point: for each token
-    position, sum squared gradients over hidden dimensions and assistant answer
-    CE targets, then take the square root. Normalize over the included token
-    scope so the average Hessian contribution remains unchanged.
+    Differentiate the sum of all assistant answer-token losses once with
+    respect to each captured decoder block input. For each input token, take
+    the L2 norm over hidden features, then normalize over the selected scope.
     """
     if logits.ndim != 3 or logits.shape[0] != 1:
         raise RuntimeError(f"Gradient weighting expects logits [1, sequence, vocab], got {tuple(logits.shape)}")
@@ -439,33 +437,29 @@ def make_gradient_token_weights(
 
     layer_indices = sorted(layer_activations)
     activations = [layer_activations[index] for index in layer_indices]
+    answer_positions = answer_positions.to(device=logits.device)
+    targets = labels.to(device=logits.device, dtype=torch.long)[answer_positions]
+    answer_logits = logits[0, answer_positions - 1].float()
+    summed_answer_ce = torch.nn.functional.cross_entropy(
+        answer_logits, targets, reduction="sum"
+    )
+    gradients = torch.autograd.grad(
+        summed_answer_ce,
+        tuple(activations),
+        allow_unused=False,
+    )
     scores = {
-        index: torch.zeros(logits.shape[1], device=logits.device, dtype=torch.float32)
-        for index in layer_indices
+        layer_index: gradient[0].float().square().sum(dim=-1)
+        for layer_index, gradient in zip(layer_indices, gradients)
     }
-    target_count = int(answer_positions.numel())
-    for target_number, position_tensor in enumerate(answer_positions):
-        position = int(position_tensor)
-        target = labels[position].to(device=logits.device, dtype=torch.long).reshape(1)
-        token_loss = torch.nn.functional.cross_entropy(
-            logits[0, position - 1].float().unsqueeze(0), target
-        )
-        gradients = torch.autograd.grad(
-            token_loss,
-            tuple(activations),
-            retain_graph=target_number + 1 < target_count,
-            allow_unused=False,
-        )
-        for layer_index, gradient in zip(layer_indices, gradients):
-            scores[layer_index].add_(gradient[0].float().square().sum(dim=-1))
 
     selected = selected_mask.reshape(-1).to(device=logits.device, dtype=torch.bool)
     if selected.numel() != logits.shape[1] or not selected.any():
         raise RuntimeError("Gradient weighting token scope is empty or does not align with logits")
     result: dict[int, torch.Tensor] = {}
     for layer_index, squared_score in scores.items():
-        # The square root is intentional: it converts accumulated squared
-        # gradient energy into the per-token gradient norm used as the weight.
+        # The square root converts the squared L2 norm over hidden features
+        # into the per-token gradient norm used as the weight.
         score = squared_score.clamp_min(0).sqrt()
         mean_score = score[selected].mean()
         tiny = torch.finfo(torch.float32).tiny
@@ -1004,7 +998,7 @@ def main() -> int:
     if args.hessian_weighting == "grad":
         log(
             "Gradient weighting runs in two phases: first compute and store mean-one "
-            "sqrt(sum of squared assistant-answer CE gradients) token weights; then "
+            "token weights from the L2 norm of gradients of summed assistant-answer CE; then "
             "replay calibration forwards to accumulate weighted Hessians"
         )
     grad_weight_store: dict[tuple[int, int], torch.Tensor] = {}
@@ -1055,6 +1049,7 @@ def main() -> int:
                     labels = kwargs.get("labels")
                     if labels is None:
                         raise RuntimeError("Gradient Hessian weighting requires adapter-provided labels")
+                    answer_target_count = int(labels[0, 1:].ne(-100).sum())
                     grad_state["layer_activations"].clear()
                     gradient_inputs_embeds = inputs["inputs_embeds"].detach().requires_grad_(True)
                     forward_started = time.monotonic()
@@ -1088,6 +1083,7 @@ def main() -> int:
                     log(
                         f"Gradient-weight pass {group_pass}/{len(group_specs)}, sample "
                         f"{sample_index + 1}/{len(dataset)} complete; "
+                        f"assistant CE targets={answer_target_count}, autograd.grad calls=1; "
                         f"completed forwards={completed_gradient_forwards}/{gradient_forwards}"
                     )
             finally:
@@ -1583,7 +1579,7 @@ def main() -> int:
         "hessian_token_scope": args.hessian_token_scope,
         "hessian_weighting": args.hessian_weighting,
         "hessian_gradient_score": (
-            "sqrt(sum_answer_targets,hidden(grad CE / grad block_input)^2), normalized to mean 1 "
+            "sqrt(sum_hidden(grad sum_answer_CE / grad block_input)^2), normalized to mean 1 "
             "over the selected token scope"
             if args.hessian_weighting == "grad" else None
         ),

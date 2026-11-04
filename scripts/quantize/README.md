@@ -76,11 +76,13 @@ temporary attention memory. The selected weighting is recorded in
 `--hessian-token-scope all --hessian-weighting iga`.
 
 Set `--hessian-weighting grad` to weight each included token by its gradient
-importance. For each calibration example, the script takes assistant-answer
-cross-entropy gradients with respect to each selected decoder block's input,
-sums squared gradients across hidden features and answer-token targets, then
-takes the square root to obtain the token score. Scores are normalized to mean
-1 over the selected token scope before weighting that layer's `X'WX` Hessians.
+importance. For each calibration example and selected layer group, the script
+sums the assistant-answer cross-entropy losses, differentiates that summed
+loss once with respect to each selected decoder block's input, and takes the
+L2 norm over hidden features to obtain the token score. Scores are normalized
+to mean 1 over the selected token scope before weighting that layer's `X'WX`
+Hessians. This uses one gradient calculation per group and sample. It differs
+from summing the squared gradients of each answer-token loss separately.
 This follows the investigation's `block_input` gradient capture convention and
 works with either `--hessian-token-scope all` or `text`. It does not request or
 retain attention matrices. Gradient weighting runs in two phases: grouped
@@ -88,10 +90,10 @@ gradient-enabled forwards compute and store only per-token weights, then a
 second set of grouped inference forwards recomputes Linear activations and
 accumulates the weighted Hessians on GPU. This avoids staging every selected
 Linear activation in CPU RAM, at the cost of replaying the calibration
-forwards. Gradient scoring computes one gradient per assistant answer token,
-so it can use substantially more memory and compute than uniform or IGA
-weighting. Logs report the gradient-weight collection and Hessian accumulation
-phases separately. The weighting mode is recorded in `gptq_metadata.json`.
+forwards. Gradient scoring can still use substantially more memory and compute
+than uniform or IGA weighting. Logs report the gradient-weight collection and
+Hessian accumulation phases separately. The weighting mode is recorded in
+`gptq_metadata.json`.
 
 Example using gradient weights:
 
