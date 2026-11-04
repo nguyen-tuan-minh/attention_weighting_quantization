@@ -330,11 +330,14 @@ def _generate_assistant_once(
         if "top_token_cumulative_percent" in inspection_parameters:
             inspection_kwargs["top_token_cumulative_percent"] = top_token_cumulative_percent
         elif top_token_cumulative_percent is not None:
-            log(
-                "Cumulative score-mass masks are unavailable in the loaded interactive "
-                "session module; update the project's src/ module to enable them there.",
-                level="normal",
-            )
+            # Older session modules only forward top_token_percent. Adapt their
+            # callback so the new cumulative option still controls candidate plots.
+            def show_interactive_gradient_heatmaps(*heatmap_args: Any, **heatmap_kwargs: Any):
+                heatmap_kwargs["top_token_percent"] = None
+                heatmap_kwargs["top_token_cumulative_percent"] = top_token_cumulative_percent
+                return show_gradient_heatmaps(*heatmap_args, **heatmap_kwargs)
+
+            inspection_kwargs["show_gradient_heatmaps_fn"] = show_interactive_gradient_heatmaps
         inspection_action = inspect_generated_token_positions(
             input_adapter,
             active_sample,
@@ -932,7 +935,13 @@ def show_gradient_heatmaps(
             norm=image_norm,
             alpha=0.58 if not heatmap_only else 1.0,
         )
-        axis.set_title(f"Layer {layer_index}")
+        if binary_mode:
+            retained_count = int(binary_image_scores[layer_index].sum().item())
+            axis.set_title(
+                f"Layer {layer_index} ({retained_count}/{image_token_count} tokens)"
+            )
+        else:
+            axis.set_title(f"Layer {layer_index}")
         axis.axis("off")
     image_slots = image_panel_count
     for slot in range(image_slots, image_rows * columns):
