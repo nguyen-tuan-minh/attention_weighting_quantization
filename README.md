@@ -143,6 +143,24 @@ Evaluate a QIG checkpoint using the same benchmark tasks:
 
 The default output directory is a timestamped folder under `outputs/evaluations/`. Use `--tasks` to select another comma-separated set of registered LMMS-Eval tasks, `--batch-size` to adjust memory use, and `--log-samples` to save per-example outputs. `--limit 8` is useful for checking that the environment and model adapter work; limited runs are not benchmark results. For reproducible comparisons, use the same task IDs, model prompt settings, seed, and LMMS-Eval checkout for each model. The QIG paper's five benchmarks are evaluated on the task splits selected in its LMMS-Eval protocol; dataset versions and metric details are controlled by the installed task configs.
 
+To evaluate contrastive decoding, pass the expert in `--pretrained`, the amateur in `--contrastive-amateur`, and one or more `--contrastive-weights`. The project runner patches the LLaVA adapter in memory and runs one LMMS-Eval evaluation per weight; it does not edit the vendored LMMS-Eval checkout. Each weight gets a separate result directory. Contrastive evaluation currently requires `--batch-size 1`:
+
+```bash
+.venv/bin/python scripts/evaluate_model.py \
+  --pretrained models/llava-v1.5-7b \
+  --contrastive-amateur models/llava-v1.5-7b-gptq-w4g128 \
+  --contrastive-weights 0.1 0.5 1.0 \
+  --tasks vizwiz_vqa_val,mmmu_val,chartqa,ai2d,scienceqa_img,pope \
+  --batch-size 1 \
+  --limit 64 \
+  --max-expert-model-memory-gpu 10GB \
+  --max-amateur-model-memory-gpu 8GB \
+  --log-samples \
+  --output-dir outputs/evaluations/contrastive-smoke
+```
+
+Remove `--limit` for full benchmark runs. Adjust expert and amateur GPU/CPU limits for the available memory; the two models are resident together during decoding. Scores are saved under `outputs/evaluations/contrastive-smoke/weight-0.1/`, `weight-0.5/`, and `weight-1/`.
+
 Pass `--remove-new-task-data` to evaluate tasks one at a time and remove newly created files from the Hugging Face Hub and datasets caches after each task. Cache files and directories already present before a task are preserved, as is the Hub cache for the selected model. The option can make a full run slower because LMMS-Eval starts the model once per task. It honors `HF_HOME`, `HF_HUB_CACHE`, and `HF_DATASETS_CACHE` when set.
 
 Compare a saved QIG checkpoint with its base model on the exact calibration records used for quantization:

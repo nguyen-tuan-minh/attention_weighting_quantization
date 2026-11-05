@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits",
-        help="Scores to contrast; logits is raw-logit subtraction, log-probabilities preserves the previous method.",
+        help="Score type for (1 + weight) * expert - weight * amateur.",
     )
     parser.add_argument(
         "--generation-modes", nargs="+", choices=("greedy", "probabilistic"),
@@ -369,7 +369,9 @@ def decode_one(
                     amateur_scores = torch.log_softmax(amateur_logits, dim=-1)
                 else:
                     raise ValueError(f"Unsupported contrastive score type: {contrastive_score_type}")
-                scores = (expert_scores - contrastive_weight * amateur_scores).masked_fill(~allowed, -torch.inf)
+                scores = (
+                    (1 + contrastive_weight) * expert_scores - contrastive_weight * amateur_scores
+                ).masked_fill(~allowed, -torch.inf)
 
             if generation_mode == "greedy":
                 next_id = int(scores.argmax().item())
