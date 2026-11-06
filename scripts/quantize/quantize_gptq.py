@@ -143,6 +143,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=None, help="Override dataset.yaml calibration_samples.")
     parser.add_argument("--seed", type=int, default=None, help="Override dataset.yaml calibration_seed.")
     parser.add_argument(
+        "--calibration-modality", choices=("multimodal", "text-only"), default="multimodal",
+        help=(
+            "Use image and text inputs (default), or omit images and calibrate on conversation text only. "
+            "This is separate from --hessian-token-scope, which selects token rows within each input."
+        ),
+    )
+    parser.add_argument(
         "--log-level", choices=("none", "normal", "extensive"), default="normal",
         help="none suppresses progress; extensive adds resolved settings and execution diagnostics.",
     )
@@ -227,23 +234,75 @@ def resolve_checkpoint(args: argparse.Namespace, model_config: dict[str, Any]) -
 
 
 def sample_records(args: argparse.Namespace, data_config: dict[str, Any], dataset_config_path: Path):
-    """Load local-image calibration records and return the configured random subset."""
+    """Load calibration records and select a reproducible subset."""
     source = data_config.get("calibration_source", "coco")
     data = load_sharegpt4v_dataset(
         source=source,
         config_path=dataset_config_path,
-        download_images=True,
-        existing_images_only=True,
+        download_images=args.calibration_modality == "multimodal",
+        existing_images_only=args.calibration_modality == "multimodal",
     )
     if not len(data):
         raw_dir = get_data_paths(dataset_config_path)["raw_dir"]
         raise ValueError(
-            f"No ShareGPT4V {source!r} records match local images under {raw_dir}. "
-            "Check the extracted image paths and raw_dir in the dataset config."
+            f"No ShareGPT4V {source!r} calibration records are available"
+            + (
+                f" with local images under {raw_dir}. Check image extraction and raw_dir in the dataset config."
+                if args.calibration_modality == "multimodal" else "."
+            )
         )
     if args.samples < 1 or args.samples > len(data):
         raise ValueError(f"--samples must be in [1, {len(data)}]")
-    return data.shuffle(seed=args.seed).select(range(args.samples))
+    selected = data.shuffle(seed=args.seed).select(range(args.samples))
+    if args.calibration_modality == "text-only":
+        text_columns = [column for column in ("conversations", "id") if column in selected.column_names]
+        selected = selected.select_columns(text_columns)
+    return selected
+
+
+def prepare_calibration_sample(adapter, sample: dict[str, Any], sample_index: int, *, text_only: bool):
+    """Prepare multimodal calibration input or a text-only LLaVA input batch.
+
+    The upstream adapter's ``generate_input`` expands image placeholders and
+    assumes at least one image token. Text-only calibration therefore embeds
+    its ordinary token IDs directly and supplies an all-false vision mask.
+    """
+    row = {
+        "conversations": sample["conversations"],
+        "id": str(sample.get("id", sample_index)),
+    }
+    image_value = None
+    if text_only:
+        prepared = adapter.preprocess_data(None, row)
+        # The QIG LLaVA adapter creates a zero image for text-only rows. Drop it
+        # before collation so no image tensor is sent to the model.
+        prepared.pop("image", None)
+        batch = adapter.data_collator([prepared])
+        embedding = adapter.model.get_input_embeddings()
+        embedding_device = embedding.weight.device
+        if embedding_device.type == "meta":
+            raise RuntimeError("Text-only calibration requires input embeddings to be resident, not on meta")
+        input_ids = batch["input_ids"].to(device=embedding_device)
+        attention_mask = batch["attention_mask"].to(device=embedding_device)
+        labels = batch["labels"].to(device=embedding_device)
+        inputs = {"inputs_embeds": embedding(input_ids)}
+        kwargs = {
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "vision_mask": torch.zeros_like(attention_mask, dtype=torch.bool),
+            "caption_mask": labels.ne(-100),
+        }
+    else:
+        image_value = sample["image"]
+        if isinstance(image_value, dict):
+            image_value = Image.open(image_value["path"]).convert("RGB")
+        elif hasattr(image_value, "convert"):
+            image_value = image_value.convert("RGB")
+        row["image"] = "local"
+        prepared = adapter.preprocess_data([image_value], row)
+        batch = adapter.data_collator([prepared])
+        inputs, kwargs = adapter.generate_input(batch)
+    return inputs, kwargs, batch, prepared, image_value
 
 
 def linear_layers(block: nn.Module) -> dict[str, nn.Linear]:
@@ -720,6 +779,8 @@ def main() -> int:
         raise ValueError("--hessian-group-layers must be positive")
     if args.hessian_weighting == "iga" and args.hessian_token_scope != "all":
         raise ValueError("--hessian-weighting iga requires --hessian-token-scope all")
+    if args.hessian_weighting == "iga" and args.calibration_modality == "text-only":
+        raise ValueError("--hessian-weighting iga requires image inputs; use --calibration-modality multimodal")
     if args.damp < 0:
         raise ValueError("--damp must be nonnegative")
     if not torch.cuda.is_available():
@@ -737,7 +798,8 @@ def main() -> int:
         raise ValueError("--samples must be positive")
     log(
         f"Configuration: bits={args.bits}, group_size={args.group_size}, samples={args.samples}, "
-        f"seed={args.seed}, Hessian tokens={args.hessian_token_scope}, "
+        f"seed={args.seed}, calibration modality={args.calibration_modality}, "
+        f"Hessian tokens={args.hessian_token_scope}, "
         f"Hessian weighting={args.hessian_weighting}, damp={args.damp}, "
         f"Hessian memory limits GPU/CPU/disk="
         f"{format_memory_gb(args.max_hessian_memory_gpu)}/"
@@ -1028,19 +1090,10 @@ def main() -> int:
             try:
                 for sample_index, sample in enumerate(dataset):
                     preparation_started = time.monotonic()
-                    image_value = sample["image"]
-                    if isinstance(image_value, dict):
-                        image_value = Image.open(image_value["path"]).convert("RGB")
-                    elif hasattr(image_value, "convert"):
-                        image_value = image_value.convert("RGB")
-                    row = {
-                        "conversations": sample["conversations"],
-                        "id": str(sample.get("id", sample_index)),
-                        "image": "local",
-                    }
-                    prepared = adapter.preprocess_data([image_value], row)
-                    batch = adapter.data_collator([prepared])
-                    inputs, kwargs = adapter.generate_input(batch)
+                    inputs, kwargs, batch, prepared, image_value = prepare_calibration_sample(
+                        adapter, sample, sample_index,
+                        text_only=args.calibration_modality == "text-only",
+                    )
                     record_timing("gradient-pass sample preprocessing", time.monotonic() - preparation_started)
                     attention_mask = kwargs["attention_mask"].detach().to(device="cpu", dtype=torch.bool)
                     vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
@@ -1292,19 +1345,10 @@ def main() -> int:
                 for sample_index, sample in enumerate(dataset):
                     sample_started = time.monotonic()
                     preparation_started = time.monotonic()
-                    image_value = sample["image"]
-                    if isinstance(image_value, dict):
-                        image_value = Image.open(image_value["path"]).convert("RGB")
-                    elif hasattr(image_value, "convert"):
-                        image_value = image_value.convert("RGB")
-                    row = {
-                        "conversations": sample["conversations"],
-                        "id": str(sample.get("id", sample_index)),
-                        "image": "local",
-                    }
-                    prepared = adapter.preprocess_data([image_value], row)
-                    batch = adapter.data_collator([prepared])
-                    inputs, kwargs = adapter.generate_input(batch)
+                    inputs, kwargs, batch, prepared, image_value = prepare_calibration_sample(
+                        adapter, sample, sample_index,
+                        text_only=args.calibration_modality == "text-only",
+                    )
                     preparation_elapsed = time.monotonic() - preparation_started
                     record_timing("calibration sample preprocessing", preparation_elapsed)
                     vision_mask = kwargs["vision_mask"].detach().to(device="cpu", dtype=torch.bool)
@@ -1519,19 +1563,10 @@ def main() -> int:
     # The Hessians above all came from base-model forwards.
     first_sample = dataset[0]
     finalization_preparation_started = time.monotonic()
-    image_value = first_sample["image"]
-    if isinstance(image_value, dict):
-        image_value = Image.open(image_value["path"]).convert("RGB")
-    elif hasattr(image_value, "convert"):
-        image_value = image_value.convert("RGB")
-    row = {
-        "conversations": first_sample["conversations"],
-        "id": str(first_sample.get("id", 0)),
-        "image": "local",
-    }
-    prepared = adapter.preprocess_data([image_value], row)
-    batch = adapter.data_collator([prepared])
-    inputs, kwargs = adapter.generate_input(batch)
+    inputs, kwargs, batch, prepared, image_value = prepare_calibration_sample(
+        adapter, first_sample, 0,
+        text_only=args.calibration_modality == "text-only",
+    )
     record_timing("finalization sample preprocessing", time.monotonic() - finalization_preparation_started)
     finalization_started = time.monotonic()
     try:
@@ -1579,6 +1614,7 @@ def main() -> int:
         "group_size": args.group_size,
         "selected_layers_1based": sorted(index + 1 for index in selected_layers),
         "hessian_token_scope": args.hessian_token_scope,
+        "calibration_modality": args.calibration_modality,
         "hessian_weighting": args.hessian_weighting,
         "hessian_gradient_score": (
             "sqrt(sum_hidden(grad sum_answer_CE / grad block_output)^2), normalized to mean 1 "

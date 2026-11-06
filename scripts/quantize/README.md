@@ -61,6 +61,28 @@ outputs are not used to collect Hessians.
 position. Set it to `text` to exclude image positions; this uses the adapter's
 vision mask and attention mask, so padding is excluded as well.
 
+`--calibration-modality multimodal` (the default) preprocesses and forwards each
+sample's image together with its conversation. Set
+`--calibration-modality text-only` to omit the image from the model input and
+calibrate from the conversation text alone. Text-only mode does not download or
+require local image files. This is distinct from `--hessian-token-scope text`:
+that scope only selects non-image activation rows while the default multimodal
+input still passes the image through the model. In text-only mode there are no
+image-token rows, so `all` and `text` select the same non-padding text positions.
+IGA weighting requires image inputs and cannot be combined with text-only mode.
+
+Example, run a text-only calibration while retaining the usual text Hessian rows:
+
+```bash
+.venv/bin/python scripts/quantize/quantize_gptq.py \
+  --output-dir outputs/quantized/llava-gptq-w4g128-text-only \
+  --samples 128 \
+  --seed 42 \
+  --hessian-token-scope text \
+  --calibration-modality text-only \
+  --log-level extensive
+```
+
 `--hessian-weighting uniform` (the default) gives every included token equal
 weight. Set `--hessian-weighting iga` to use the repository's IGA definition:
 for each layer, average post-softmax attention over heads and valid text queries
