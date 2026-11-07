@@ -190,7 +190,10 @@ optional reference override when the base path normally comes from
 
 - `investigate_pope.py`: downloads POPE directly with `datasets`, then runs an
   interactive question browser without LMMS-Eval. `--question-id ID` selects
-  the starting question; without it, a seeded random row is used. On the main
+  the starting question; without it, a seeded random row is used. If that
+  question ID appears more than once, it starts at the first matching row and
+  lists the alternatives. Use `--row-id ID` to start at one unique dataset row,
+  or `s row:ID` to select one during the session. On the main
   screen, `m expert`, `m amateur`, `m contrastive [weight]`, and `m all` switch
   modes. `m all` opens a separate side-by-side answer screen. `s ID`, `s random`,
   and `s all` select a question, choose a random question, or answer every POPE

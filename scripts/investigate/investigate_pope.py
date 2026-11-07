@@ -43,7 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amateur-model", default=None,
                         help="Optional amateur checkpoint for amateur or contrastive mode.")
     parser.add_argument("--question-id", default=None,
-                        help="Initial POPE question_id. If omitted, start on a seeded random question.")
+                        help="Initial POPE question_id. Duplicate IDs start at their first dataset row; use --row-id to disambiguate.")
+    parser.add_argument("--row-id", default=None,
+                        help="Initial unique POPE row id; mutually exclusive with --question-id.")
     parser.add_argument("--dataset", default="lmms-lab/POPE")
     parser.add_argument("--split", default="test")
     parser.add_argument("--seed", type=int, default=42)
@@ -81,10 +83,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--plausibility-threshold must be in (0, 1]")
     if not math.isfinite(args.interactive_timeout_minutes) or args.interactive_timeout_minutes <= 0:
         raise ValueError("--interactive-timeout-minutes must be finite and positive")
+    if args.question_id is not None and args.row_id is not None:
+        raise ValueError("Use only one of --question-id or --row-id")
     if args.question_id is not None:
         args.question_id = str(args.question_id).strip()
         if not args.question_id:
             raise ValueError("--question-id cannot be empty")
+    if args.row_id is not None:
+        args.row_id = str(args.row_id).strip()
+        if not args.row_id:
+            raise ValueError("--row-id cannot be empty")
 
 
 def read_session_input(prompt: str, timeout: float) -> str:
@@ -98,7 +106,9 @@ def read_session_input(prompt: str, timeout: float) -> str:
         raise InteractiveSessionExit from error
 
 
-def load_pope_dataset(dataset_name: str, split: str) -> tuple[Any, dict[str, int], dict[str, list[int]]]:
+def load_pope_dataset(
+    dataset_name: str, split: str
+) -> tuple[Any, dict[str, list[int]], dict[str, int], dict[str, list[int]]]:
     """Load POPE metadata and build question/image indexes without decoding all images."""
     from datasets import load_dataset
 
@@ -106,7 +116,7 @@ def load_pope_dataset(dataset_name: str, split: str) -> tuple[Any, dict[str, int
     started = time.monotonic()
     dataset = load_dataset(dataset_name, split=split, token=True)
     columns = set(dataset.column_names)
-    required = {"question_id", "question", "answer", "image"}
+    required = {"id", "question_id", "question", "answer", "image"}
     missing = required - columns
     if missing:
         raise ValueError(f"POPE dataset is missing required columns: {sorted(missing)}")
@@ -115,17 +125,24 @@ def load_pope_dataset(dataset_name: str, split: str) -> tuple[Any, dict[str, int
     if "image_source" not in columns and "image_id" not in columns:
         raise ValueError("POPE needs an image_source or image_id column to find all questions for an image")
 
+    row_ids = [str(value) for value in dataset["id"]]
+    if len(row_ids) != len(set(row_ids)):
+        raise ValueError("POPE id values must be unique within the selected split")
+    row_index = {row_id: index for index, row_id in enumerate(row_ids)}
     qid_values = [str(value) for value in dataset["question_id"]]
-    if len(qid_values) != len(set(qid_values)):
-        raise ValueError("POPE question_id values must be unique within the selected split")
-    question_index = {qid: index for index, qid in enumerate(qid_values)}
+    question_index: dict[str, list[int]] = {}
+    for index, qid in enumerate(qid_values):
+        question_index.setdefault(qid, []).append(index)
     image_column = "image_source" if "image_source" in columns else "image_id"
     image_values = [str(value) for value in dataset[image_column]]
     image_index: dict[str, list[int]] = {}
     for index, image_key in enumerate(image_values):
         image_index.setdefault(image_key, []).append(index)
     log(f"Loaded {len(dataset)} POPE records and indexed {len(image_index)} images in {time.monotonic() - started:.1f}s")
-    return dataset, question_index, image_index
+    duplicate_qids = sum(len(positions) > 1 for positions in question_index.values())
+    if duplicate_qids:
+        log(f"Found {duplicate_qids} question_id values repeated across rows; use row IDs to disambiguate")
+    return dataset, question_index, row_index, image_index
 
 
 def make_prompt_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -196,7 +213,7 @@ def show_comparison_screen(row: dict[str, Any], outputs: list[dict[str, Any]], t
     columns = [("EXPERT", outputs[0]["answer"]), ("AMATEUR", outputs[1]["answer"]),
                (f"CONTRASTIVE w={outputs[2]['weight']:g}", outputs[2]["answer"])]
     print("\n" + "=" * (width * 3 + 8))
-    print(f"POPE comparison | question_id={row['question_id']} | target={row['answer']} | image={row.get('image_source', '')}")
+    print(f"POPE comparison | row_id={row['id']} | question_id={row['question_id']} | target={row['answer']} | image={row.get('image_source', '')}")
     print(str(row["question"]))
     print("=" * (width * 3 + 8))
     print(" | ".join(label[:width].ljust(width) for label, _ in columns))
@@ -222,7 +239,7 @@ def show_comparison_screen(row: dict[str, Any], outputs: list[dict[str, Any]], t
 def render_main_screen(row: dict[str, Any], selected_mode: str, weight: float,
                        output: dict[str, Any] | None, index: int, total: int) -> None:
     print("\n" + "=" * 78)
-    print(f"POPE question {index}/{total} | question_id={row['question_id']} | image={row.get('image_source', '')}")
+    print(f"POPE question {index}/{total} | row_id={row['id']} | question_id={row['question_id']} | image={row.get('image_source', '')}")
     print(f"Category: {row.get('category', 'unknown')} | Target: {row['answer']}")
     print(f"Question: {row['question']}")
     print(f"Selected model mode: {selected_mode}" + (f" (weight={weight:g})" if selected_mode == "contrastive" else ""))
@@ -232,7 +249,7 @@ def render_main_screen(row: dict[str, Any], selected_mode: str, weight: float,
         print("Answers: shown on the comparison screen")
     else:
         print(f"Answer: {output['answer']!r} | exact POPE match: {output['prediction'] == output['target']}")
-    print("Commands: m [expert|amateur|contrastive [weight]|all], s [question_id|random|all], i image, h help, q quit")
+    print("Commands: m [expert|amateur|contrastive [weight]|all], s [question_id|row:ID|random|all], i image, h help, q quit")
 
 
 def main() -> int:
@@ -242,12 +259,22 @@ def main() -> int:
     # ========================================================================
     # 1. PREPARE POPE DATASET AND QUESTION INDEXES
     # ========================================================================
-    dataset, question_index, image_index = load_pope_dataset(args.dataset, args.split)
+    dataset, question_index, row_index, image_index = load_pope_dataset(args.dataset, args.split)
     rng = random.Random(args.seed)
-    if args.question_id is not None:
+    if args.row_id is not None:
+        if args.row_id not in row_index:
+            raise ValueError(f"POPE row id {args.row_id!r} was not found in {args.dataset}/{args.split}")
+        current_index = row_index[args.row_id]
+    elif args.question_id is not None:
         if args.question_id not in question_index:
             raise ValueError(f"POPE question_id {args.question_id!r} was not found in {args.dataset}/{args.split}")
-        current_index = question_index[args.question_id]
+        matches = question_index[args.question_id]
+        current_index = matches[0]
+        if len(matches) > 1:
+            matching_rows = [dict(dataset[position]) for position in matches]
+            print(f"question_id={args.question_id} matches {len(matches)} rows; starting with the first:")
+            for row in matching_rows:
+                print(f"  row_id={row['id']} category={row.get('category', 'unknown')} image={row.get('image_source', '')}")
     else:
         current_index = rng.randrange(len(dataset))
 
@@ -318,7 +345,8 @@ def main() -> int:
             ]
             for output in outputs:
                 result_file.write(json.dumps({
-                    "timestamp": datetime.now().isoformat(), "question_id": str(row["question_id"]),
+                    "timestamp": datetime.now().isoformat(), "id": str(row["id"]),
+                    "question_id": str(row["question_id"]),
                     "image_source": row.get("image_source"), "question": row["question"],
                     "target": str(row["answer"]).strip().lower(), **output,
                 }, ensure_ascii=False) + "\n")
@@ -331,7 +359,8 @@ def main() -> int:
         output = run_generation(mode, weight, row, expert, expert_adapter, expert_tokenizer,
                                 amateur, amateur_adapter, amateur_tokenizer, args)
         result_file.write(json.dumps({
-            "timestamp": datetime.now().isoformat(), "question_id": str(row["question_id"]),
+            "timestamp": datetime.now().isoformat(), "id": str(row["id"]),
+            "question_id": str(row["question_id"]),
             "image_source": row.get("image_source"), "question": row["question"],
             "target": str(row["answer"]).strip().lower(), **output,
         }, ensure_ascii=False) + "\n")
@@ -356,7 +385,7 @@ def main() -> int:
                 break
             if command in {"h", "help"}:
                 print("m expert | m amateur | m contrastive [weight] | m all")
-                print("s ID | s random | s all (all questions sharing this image_source, in order)")
+                print("s ID | s row:ID | s random | s all (questions sharing this image, sequentially)")
                 print("i displays the current image; q exits. The comparison screen uses b to return.")
                 continue
             if command == "i" and len(parts) == 1:
@@ -421,10 +450,26 @@ def main() -> int:
                         if selected_mode != "all":
                             print(f"Answer: {current_output['answer']!r} | target={current_output['target']}")
                     continue
+                if selection.lower().startswith("row:"):
+                    selected_row_id = selection[4:]
+                    if selected_row_id not in row_index:
+                        print(f"Row ID {selected_row_id!r} was not found.")
+                        continue
+                    current_index = row_index[selected_row_id]
+                    current_row = row_at(current_index)
+                    current_output = generate_for_current(current_row, selected_mode, selected_weight)
+                    continue
                 if selection not in question_index:
                     print(f"Question ID {selection!r} was not found.")
                     continue
-                current_index = question_index[selection]
+                matches = question_index[selection]
+                if len(matches) > 1:
+                    print(f"question_id={selection} matches multiple rows; select one with s row:<id>:")
+                    for position in matches:
+                        matching_row = row_at(position)
+                        print(f"  row_id={matching_row['id']} category={matching_row.get('category', 'unknown')} image={matching_row.get('image_source', '')}")
+                    continue
+                current_index = matches[0]
                 current_row = row_at(current_index)
                 current_output = generate_for_current(current_row, selected_mode, selected_weight)
                 continue
@@ -442,10 +487,12 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        exit_code = main()
     except InteractiveSessionExit:
         print("Interactive POPE session ended.")
-        raise SystemExit(0)
+        exit_code = 0
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        exit_code = 1
+    if exit_code and "IPython" not in sys.modules:
+        raise SystemExit(exit_code)
