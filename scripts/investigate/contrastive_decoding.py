@@ -325,7 +325,8 @@ def decode_one(
     temperature: float = 0.8,
     top_p: float = 0.9,
     progress: Any = None,
-) -> tuple[list[int], str]:
+    collect_distributions: bool = False,
+) -> tuple[list[int], str] | tuple[list[int], str, list[torch.Tensor]]:
     """Decode greedily or probabilistically with one model or contrastive scores."""
     import torch
 
@@ -338,6 +339,7 @@ def decode_one(
     amateur_attention = amateur[2] if amateur is not None else None
     amateur_past = None
     generated: list[int] = []
+    distributions: list[torch.Tensor] = []
     eos_ids = eos_token_ids(model, tokenizer)
 
     with torch.inference_mode():
@@ -372,6 +374,9 @@ def decode_one(
                 scores = (
                     (1 + contrastive_weight) * expert_scores - contrastive_weight * amateur_scores
                 ).masked_fill(~allowed, -torch.inf)
+
+            if collect_distributions:
+                distributions.append(torch.softmax(scores, dim=-1).detach().cpu())
 
             if generation_mode == "greedy":
                 next_id = int(scores.argmax().item())
@@ -411,6 +416,8 @@ def decode_one(
                 )
 
     text = tokenizer.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+    if collect_distributions:
+        return generated, text, distributions
     return generated, text
 
 

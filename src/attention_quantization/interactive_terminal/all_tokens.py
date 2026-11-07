@@ -28,11 +28,14 @@ def render_all_tokens(
         print(f"[{position}] {token_text!r}  p={chosen_probability:.4f}")
 
 
-def read_all_tokens_command(token_count: int, timeout_seconds: float) -> list[str] | None:
+def read_all_tokens_command(
+    token_count: int, timeout_seconds: float, *, read_only: bool = False
+) -> list[str] | None:
     """Read one all-token screen command, returning None on terminal EOF."""
+    actions = "n [k count | p mass], i, b, h, q" if read_only else "n [k count | p mass], r [s], e, i, h, q"
     try:
         command = read_timed_input(
-            f"Position n [k count | p mass], r [s], e, i, h, q "
+            f"Position {actions} "
             f"(n=1-{token_count}): ",
             timeout_seconds,
         ).strip()
@@ -41,9 +44,9 @@ def read_all_tokens_command(token_count: int, timeout_seconds: float) -> list[st
     return command.split()
 
 
-def show_all_tokens_help() -> None:
+def show_all_tokens_help(*, read_only: bool = False) -> None:
     """Print the all-token screen command summary."""
-    print(
-        "Select n, n k count, or n p mass; r regenerates, r s samples, "
-        "e edits the question, i shows the image, q exits."
-    )
+    if read_only:
+        print("Select n, n k count, or n p mass; i shows the image, b returns, q exits.")
+    else:
+        print("Select n, n k count, or n p mass; r regenerates, r s samples, e edits the question, i shows the image, q exits.")

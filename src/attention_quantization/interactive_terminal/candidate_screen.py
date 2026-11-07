@@ -25,11 +25,14 @@ def render_candidates(
         print(f"[{rank}] {candidate_text!r}  p={probability:.4f}")
 
 
-def read_candidate_command(candidate_count: int, timeout_seconds: float) -> list[str] | None:
+def read_candidate_command(
+    candidate_count: int, timeout_seconds: float, *, read_only: bool = False
+) -> list[str] | None:
     """Read one candidate-screen command, returning None on terminal EOF."""
+    actions = "n [i|t|g], b, or q" if read_only else "n [i|t [c]|g], n + c, or n replace [c]"
     try:
         command = read_timed_input(
-            f"Candidate: n [i|t [c]|g], n + c, or n replace [c] (n=1-{candidate_count}), "
+            f"Candidate: {actions} (n=1-{candidate_count}), "
             "h for help, b to list positions, q to finish: ",
             timeout_seconds,
         ).strip().lower().split()
@@ -38,14 +41,12 @@ def read_candidate_command(candidate_count: int, timeout_seconds: float) -> list
     return command
 
 
-def show_candidate_help() -> None:
+def show_candidate_help(*, read_only: bool = False) -> None:
     """Print the candidate-screen command summary."""
-    print(
-        "Use n or n i for image scores, n t for all prior text scores, "
-        "n t c for the latest c, n g for image/text gradient percentages, "
-        "n + c to preview a continuation, "
-        "n replace [c] to replace and regenerate, b to return, q to exit."
-    )
+    if read_only:
+        print("Use n or n i for image scores, n t [c] for prior text scores, n g for image/text gradient percentages, b to return, q to exit.")
+    else:
+        print("Use n or n i for image scores, n t for all prior text scores, n t c for the latest c, n g for image/text gradient percentages, n + c to preview a continuation, n replace [c] to replace and regenerate, b to return, q to exit.")
 
 
 def show_gradient_norm_percentages(

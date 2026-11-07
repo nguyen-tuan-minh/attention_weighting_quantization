@@ -204,7 +204,13 @@ optional reference override when the base path normally comes from
   `--max-expert-model-memory-gpu/cpu` and
   `--max-amateur-model-memory-gpu/cpu`. Answers are written to
   `interactive_results.jsonl`; each displayed answer includes its POPE exact
-  match percentage (100% or 0%). Reruns require `--overwrite` to replace it.
+  match percentage (100% or 0%). Enter `p` to open the gradient investigator's
+  answer-token position and candidate screens. In `m all` mode, use `p expert`,
+  `p amateur`, or `p contrastive` to inspect one answer. Candidate ranking uses
+  that answer's generation scores; candidate gradient maps use the selected
+  model's cross-entropy. `--capture-point` chooses `block_input` (default),
+  `after_layer_norm`, or `value` for those maps. Reruns require `--overwrite`
+  to replace the output.
 
 Example for a starting question and expert/amateur contrastive decoding:
 

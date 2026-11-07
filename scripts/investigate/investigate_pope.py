@@ -24,7 +24,6 @@ from contrastive_decoding import (  # noqa: E402
     load_model,
     load_runtime,
     parse_memory_size,
-    prepare_prompt,
     validate_compatibility,
 )
 from investigation_logging import configure_logging, log  # noqa: E402
@@ -54,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits")
     parser.add_argument("--plausibility-threshold", type=float, default=0.001)
     parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument(
+        "--capture-point", choices=("block_input", "after_layer_norm", "value"),
+        default="block_input", help="Decoder activation used for candidate-token gradient maps.",
+    )
     parser.add_argument("--device", default=None)
     for role in ("expert", "amateur"):
         for tier in ("gpu", "cpu"):
@@ -157,6 +160,27 @@ def make_prompt_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def prepare_position_prompt(adapter: Any, image: Any, prompt_row: dict[str, Any]) -> dict[str, Any]:
+    """Prepare multimodal prompt tensors and token labels for position inspection."""
+    from investigate_grad_important import decode_non_image_token_labels
+
+    prepared = adapter.preprocess_data([image], prompt_row)
+    batch = adapter.data_collator([prepared])
+    prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
+    image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+    attention_mask = prompt_kwargs["attention_mask"]
+    text_labels = decode_non_image_token_labels(adapter, batch)
+    valid_text = attention_mask[0].bool().detach().cpu() & ~image_mask
+    if len(text_labels) != int(valid_text.sum()):
+        raise RuntimeError("Prompt text labels do not align with non-image decoder positions")
+    return {
+        "prompt_embeds": prompt_inputs["inputs_embeds"],
+        "attention_mask": attention_mask,
+        "image_mask": image_mask,
+        "text_labels": text_labels,
+    }
+
+
 def run_generation(
     mode: str,
     weight: float,
@@ -169,6 +193,8 @@ def run_generation(
     amateur_tokenizer: Any,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    import torch
+
     image = row["image"]
     if image is None or not hasattr(image, "convert"):
         raise ValueError(f"POPE question_id={row['question_id']} has no readable image")
@@ -176,23 +202,31 @@ def run_generation(
     prompt_row = make_prompt_row(row)
 
     if mode == "amateur":
-        prompt_embeds, prompt_mask, _ = prepare_prompt(amateur_adapter, image, prompt_row)
+        position_prompt = prepare_position_prompt(amateur_adapter, image, prompt_row)
+        prompt_embeds = position_prompt["prompt_embeds"]
+        prompt_mask = position_prompt["attention_mask"]
         model, tokenizer = amateur, amateur_tokenizer
         amateur_state = None
+        gradient_role = "amateur"
     else:
-        prompt_embeds, prompt_mask, _ = prepare_prompt(expert_adapter, image, prompt_row)
+        position_prompt = prepare_position_prompt(expert_adapter, image, prompt_row)
+        prompt_embeds = position_prompt["prompt_embeds"]
+        prompt_mask = position_prompt["attention_mask"]
         model, tokenizer = expert, expert_tokenizer
         amateur_state = None
+        gradient_role = "expert"
         if mode == "contrastive":
-            amateur_embeds, amateur_mask, _ = prepare_prompt(amateur_adapter, image, prompt_row)
+            amateur_prompt = prepare_position_prompt(amateur_adapter, image, prompt_row)
+            amateur_embeds, amateur_mask = amateur_prompt["prompt_embeds"], amateur_prompt["attention_mask"]
             amateur_state = (amateur, amateur_embeds, amateur_mask)
 
-    _, answer = decode_one(
+    token_ids, answer, distributions = decode_one(
         model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
         amateur=amateur_state,
         contrastive_weight=weight,
         contrastive_score_type=args.contrastive_score_type,
         plausibility_threshold=args.plausibility_threshold,
+        collect_distributions=True,
     )
     return {
         "mode": mode,
@@ -201,6 +235,16 @@ def run_generation(
         "prediction": answer.strip().lower(),
         "target": str(row["answer"]).strip().lower(),
         "exact_match_percent": 100 if answer.strip().lower() == str(row["answer"]).strip().lower() else 0,
+        "position_inspection": {
+            **position_prompt,
+            "mode": mode,
+            "token_ids": torch.tensor([token_ids], dtype=torch.long, device=prompt_embeds.device),
+            "distributions": distributions,
+            "adapter": expert_adapter if gradient_role == "expert" else amateur_adapter,
+            "gradient_role": gradient_role,
+            "question": str(row["question"]),
+            "image": image,
+        },
     }
 
 
@@ -240,6 +284,81 @@ def show_comparison_screen(row: dict[str, Any], outputs: list[dict[str, Any]], t
         print("Use b to return or q to exit.")
 
 
+def inspect_answer_positions(
+    output: dict[str, Any],
+    active_samples: dict[str, dict[str, Any]],
+    timeout: float,
+) -> str:
+    """Open the gradient investigator's token-position and candidate screens read-only."""
+    from investigate_grad_important import (
+        generate_candidate_continuation,
+        score_candidate_token_gradients,
+        show_gradient_heatmaps,
+        show_large_source_image,
+    )
+    from attention_quantization.interactive_terminal import inspect_generated_token_positions
+
+    inspection = output["position_inspection"]
+    role = inspection["gradient_role"]
+    print(
+        f"Inspecting {inspection['mode']} answer positions; token candidates use its generation scores, "
+        f"candidate gradient maps use the {role} model."
+    )
+    active_sample = active_samples[role]
+    active_sample["layer_activations"] = {}
+    active_sample["capture_enabled"] = False
+    try:
+        action = inspect_generated_token_positions(
+            inspection["adapter"],
+            active_sample,
+            inspection["prompt_embeds"],
+            inspection["attention_mask"],
+            inspection["image_mask"],
+            inspection["text_labels"],
+            inspection["token_ids"],
+            inspection["distributions"],
+            len(inspection["token_ids"][0]),
+            inspection["question"],
+            inspection["image"],
+            1,
+            heatmap_only=False,
+            scale="log",
+            score_normalization="raw",
+            top_token_percent=None,
+            top_token_cumulative_percent=None,
+            score_candidate_token_gradients_fn=score_candidate_token_gradients,
+            generate_candidate_continuation_fn=generate_candidate_continuation,
+            show_gradient_heatmaps_fn=show_gradient_heatmaps,
+            show_large_source_image_fn=show_large_source_image,
+            log_fn=log,
+            interactive_timeout_seconds=timeout,
+            read_only_inspection=True,
+        )
+    except InteractiveTimeoutError:
+        log("Position inspection timed out; returning to the POPE screen")
+        return "back"
+    if action and action["action"] == "quit":
+        return "quit"
+    return "back"
+
+
+def result_record(row: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+    """Strip live tensors and image objects before writing a result line."""
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "id": str(row["id"]),
+        "question_id": str(row["question_id"]),
+        "image_source": row.get("image_source"),
+        "question": row["question"],
+        "target": output["target"],
+        "mode": output["mode"],
+        "weight": output["weight"],
+        "answer": output["answer"],
+        "prediction": output["prediction"],
+        "exact_match_percent": output["exact_match_percent"],
+    }
+
+
 def render_main_screen(row: dict[str, Any], selected_mode: str, weight: float,
                        output: dict[str, Any] | None, index: int, total: int) -> None:
     print("\n" + "=" * 78)
@@ -253,7 +372,7 @@ def render_main_screen(row: dict[str, Any], selected_mode: str, weight: float,
         print("Answers: shown on the comparison screen")
     else:
         print(f"Answer: {output['answer']!r} | POPE exact match: {output['exact_match_percent']}%")
-    print("Commands: m [expert|amateur|contrastive [weight]|all], s [question_id|row:ID|random|all], i image, h help, q quit")
+    print("Commands: m [expert|amateur|contrastive [weight]|all], s [question_id|row:ID|random|all], p [model] positions, i image, h help, q quit")
 
 
 def main() -> int:
@@ -331,6 +450,21 @@ def main() -> int:
     selected_weight = args.contrastive_weight
     current_output: dict[str, Any] | None = None
     result_file = results_path.open("w", encoding="utf-8")
+    active_samples = {
+        "expert": {"layer_activations": {}, "capture_enabled": False},
+        "amateur": {"layer_activations": {}, "capture_enabled": False},
+    }
+    hook_handles: list[Any] = []
+
+    def ensure_position_hooks() -> None:
+        if hook_handles:
+            return
+        from investigate_grad_important import register_decoder_activation_hooks
+
+        hook_handles.extend(register_decoder_activation_hooks(expert, active_samples["expert"], args.capture_point))
+        if amateur is not None:
+            hook_handles.extend(register_decoder_activation_hooks(amateur, active_samples["amateur"], args.capture_point))
+        log(f"Registered candidate-gradient hooks on {len(hook_handles)} decoder layers", level="extensive")
 
     def row_at(position: int) -> dict[str, Any]:
         return dict(dataset[position])
@@ -348,26 +482,15 @@ def main() -> int:
                                amateur, amateur_adapter, amateur_tokenizer, args),
             ]
             for output in outputs:
-                result_file.write(json.dumps({
-                    "timestamp": datetime.now().isoformat(), "id": str(row["id"]),
-                    "question_id": str(row["question_id"]),
-                    "image_source": row.get("image_source"), "question": row["question"],
-                    "target": str(row["answer"]).strip().lower(), **output,
-                }, ensure_ascii=False) + "\n")
+                result_file.write(json.dumps(result_record(row, output), ensure_ascii=False) + "\n")
             result_file.flush()
             screen_action = show_comparison_screen(row, outputs, timeout)
             if screen_action == "quit":
                 raise InteractiveSessionExit
-            return {"mode": "all", "answer": " | ".join(output["answer"] for output in outputs),
-                    "prediction": "", "target": str(row["answer"]).strip().lower()}
+            return {"mode": "all", "outputs": outputs, "target": str(row["answer"]).strip().lower()}
         output = run_generation(mode, weight, row, expert, expert_adapter, expert_tokenizer,
                                 amateur, amateur_adapter, amateur_tokenizer, args)
-        result_file.write(json.dumps({
-            "timestamp": datetime.now().isoformat(), "id": str(row["id"]),
-            "question_id": str(row["question_id"]),
-            "image_source": row.get("image_source"), "question": row["question"],
-            "target": str(row["answer"]).strip().lower(), **output,
-        }, ensure_ascii=False) + "\n")
+        result_file.write(json.dumps(result_record(row, output), ensure_ascii=False) + "\n")
         result_file.flush()
         return output
 
@@ -390,6 +513,7 @@ def main() -> int:
             if command in {"h", "help"}:
                 print("m expert | m amateur | m contrastive [weight] | m all")
                 print("s ID | s row:ID | s random | s all (questions sharing this image, sequentially)")
+                print("p [expert|amateur|contrastive] opens token-position and candidate-gradient screens")
                 print("i displays the current image; q exits. The comparison screen uses b to return.")
                 continue
             if command == "i" and len(parts) == 1:
@@ -399,6 +523,35 @@ def main() -> int:
                 plt.axis("off")
                 plt.title(f"POPE question_id={current_row['question_id']}")
                 plt.show()
+                continue
+            if command == "p":
+                if selected_mode == "all":
+                    if current_output is None or current_output.get("mode") != "all":
+                        print("Run m all first to create the three answers for this question.")
+                        continue
+                    if len(parts) < 2:
+                        choice = read_session_input(
+                            "Inspect positions for [expert/amateur/contrastive]: ", timeout
+                        ).strip().lower()
+                    else:
+                        choice = parts[1].lower()
+                    outputs_by_mode = {item["mode"]: item for item in current_output["outputs"]}
+                    if choice not in outputs_by_mode or len(parts) > 2:
+                        print("Use p expert, p amateur, or p contrastive.")
+                        continue
+                    selected_output = outputs_by_mode[choice]
+                else:
+                    if len(parts) > 1:
+                        print("Use p to inspect the current answer's token positions.")
+                        continue
+                    if current_output is None:
+                        print("Generate an answer first.")
+                        continue
+                    selected_output = current_output
+                ensure_position_hooks()
+                position_action = inspect_answer_positions(selected_output, active_samples, timeout)
+                if position_action == "quit":
+                    raise InteractiveSessionExit
                 continue
             if command == "m":
                 if len(parts) < 2:
@@ -484,6 +637,8 @@ def main() -> int:
     except InteractiveSessionExit:
         pass
     finally:
+        for handle in hook_handles:
+            handle.remove()
         result_file.close()
     # ========================================================================
     # 5. CLOSE AND REPORT SAVED RESPONSES

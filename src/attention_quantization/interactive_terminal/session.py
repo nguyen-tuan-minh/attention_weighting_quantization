@@ -41,6 +41,7 @@ def inspect_generated_token_positions(
     show_large_source_image_fn: Any,
     log_fn: Any,
     interactive_timeout_seconds: float,
+    read_only_inspection: bool = False,
 ) -> dict[str, Any] | None:
     """Inspect stored top-token distributions and candidate gradients by generated position.
 
@@ -48,6 +49,9 @@ def inspect_generated_token_positions(
     distribution is conditioned on the prefix before its numbered token. The
     user may inspect several positions and optionally display one candidate's
     image and text gradient views for each candidate at a position.
+    ``read_only_inspection`` disables answer regeneration, question editing,
+    continuation previews, and candidate replacement for callers inspecting a
+    saved answer without changing its generation result.
     """
     # token_ids: list[int], generated assistant tokens, including EOS when emitted.
     token_ids = generated_ids[0].tolist()
@@ -57,7 +61,9 @@ def inspect_generated_token_positions(
     ).strip()
     while True:
         render_all_tokens(input_adapter, initial_question, token_ids, position_distributions)
-        command_parts = read_all_tokens_command(len(token_ids), interactive_timeout_seconds)
+        command_parts = read_all_tokens_command(
+            len(token_ids), interactive_timeout_seconds, read_only=read_only_inspection
+        )
         if command_parts is None:
             return {"action": "quit"}
         command_name = command_parts[0].lower() if command_parts else ""
@@ -66,13 +72,21 @@ def inspect_generated_token_positions(
             continue
         if command_name == "q" and len(command_parts) == 1:
             return {"action": "quit"}
+        if read_only_inspection and command_name == "b" and len(command_parts) == 1:
+            return {"action": "back"}
         if command_name == "r" and len(command_parts) <= 2:
+            if read_only_inspection:
+                print("Regeneration is unavailable in this answer inspection.")
+                continue
             sampling_mode = "sample" if len(command_parts) == 2 and command_parts[1].lower() in {"s", "sample"} else "greedy"
             if len(command_parts) == 2 and command_parts[1].lower() not in {"s", "sample", "g", "greedy"}:
                 print("Use r for greedy regeneration or r s for stochastic regeneration.")
                 continue
             return {"action": "regenerate", "sampling_mode": sampling_mode}
         if command_name == "e" and len(command_parts) == 1:
+            if read_only_inspection:
+                print("Question editing is unavailable in this answer inspection.")
+                continue
             try:
                 new_question = read_timed_input("New initial question: ", interactive_timeout_seconds).strip()
             except EOFError:
@@ -97,10 +111,13 @@ def inspect_generated_token_positions(
                 "sampling_mode": "sample" if sampling_choice in {"s", "sample", "stochastic"} else "greedy",
             }
         if command_name == "h" and len(command_parts) == 1:
-            show_all_tokens_help()
+            show_all_tokens_help(read_only=read_only_inspection)
             continue
         if not command_parts or not command_parts[0].isdigit():
-            print("Use n, n k count, n p mass, r [s], e, i, h, or q.")
+            if read_only_inspection:
+                print("Use n, n k count, n p mass, i, b, h, or q.")
+            else:
+                print("Use n, n k count, n p mass, r [s], e, i, h, or q.")
             continue
         # position: int, one-based generated assistant token position selected for inspection.
         position = int(command_parts[0])
@@ -153,7 +170,9 @@ def inspect_generated_token_positions(
         ]
         while True:
             render_candidates(input_adapter, position, position_options)
-            command = read_candidate_command(len(position_options), interactive_timeout_seconds)
+            command = read_candidate_command(
+                len(position_options), interactive_timeout_seconds, read_only=read_only_inspection
+            )
             if command is None:
                 return {"action": "quit"}
             if command == ["q"]:
@@ -161,15 +180,21 @@ def inspect_generated_token_positions(
             if command == ["b"]:
                 break
             if command == ["h"]:
-                show_candidate_help()
+                show_candidate_help(read_only=read_only_inspection)
                 continue
             if not command or not command[0].isdigit() or len(command) > 3:
-                print("Use n, n i, n t, n t c, n g, n + c, n replace [c], b, or q.")
+                if read_only_inspection:
+                    print("Use n, n i, n t [c], n g, b, or q.")
+                else:
+                    print("Use n, n i, n t, n t c, n g, n + c, n replace [c], b, or q.")
                 continue
             # candidate_rank: int, one-based rank in the top candidate list for the selected assistant position.
             candidate_rank = int(command[0])
             if not 1 <= candidate_rank <= len(position_options):
                 print(f"Choose a candidate rank from 1 to {len(position_options)}.")
+                continue
+            if read_only_inspection and len(command) >= 2 and command[1] in {"replace", "+"}:
+                print("Candidate replacement and continuation are unavailable in this answer inspection.")
                 continue
             if len(command) >= 2 and command[1] == "replace":
                 if len(command) == 3 and (not command[2].isdigit() or int(command[2]) < 1):
