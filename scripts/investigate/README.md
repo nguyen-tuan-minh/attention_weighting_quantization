@@ -188,6 +188,36 @@ optional reference override when the base path normally comes from
 
 ## Current scripts
 
+- `investigate_pope.py`: downloads POPE directly with `datasets`, then runs an
+  interactive question browser without LMMS-Eval. `--question-id ID` selects
+  the starting question; without it, a seeded random row is used. On the main
+  screen, `m expert`, `m amateur`, `m contrastive [weight]`, and `m all` switch
+  modes. `m all` opens a separate side-by-side answer screen. `s ID`, `s random`,
+  and `s all` select a question, choose a random question, or answer every POPE
+  question for the current image sequentially in dataset order. `s all` follows
+  the current model mode, including the three-answer comparison when `m all` is
+  selected.
+  The default contrastive weight is `1`. Optional placement caps are
+  `--max-expert-model-memory-gpu/cpu` and
+  `--max-amateur-model-memory-gpu/cpu`. Answers are written to
+  `interactive_results.jsonl`; reruns require `--overwrite` to replace it.
+
+Example for a starting question and expert/amateur contrastive decoding:
+
+```bash
+python scripts/investigate/investigate_pope.py \
+  --pretrained models/llava-v1.5-7b \
+  --amateur-model models/llava-v1.5-7b-gptq-w4g128 \
+  --question-id 1 \
+  --contrastive-weight 1 \
+  --max-expert-model-memory-gpu 14GB \
+  --max-expert-model-memory-cpu 40GB \
+  --max-amateur-model-memory-gpu 8GB \
+  --max-amateur-model-memory-cpu 40GB \
+  --output-dir outputs/investigations/pope-interactive \
+  --overwrite
+```
+
 - `investigate_attention.py`: captures attention/IGA information and can display
   or save attention maps. Use `--true-attention-percent` to label image-key
   softmax weights as percentages of attention over all valid keys. Use
