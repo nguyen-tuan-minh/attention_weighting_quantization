@@ -200,6 +200,7 @@ def run_generation(
         "answer": answer,
         "prediction": answer.strip().lower(),
         "target": str(row["answer"]).strip().lower(),
+        "exact_match_percent": 100 if answer.strip().lower() == str(row["answer"]).strip().lower() else 0,
     }
 
 
@@ -210,8 +211,11 @@ def wrap_column(text: str, width: int) -> list[str]:
 def show_comparison_screen(row: dict[str, Any], outputs: list[dict[str, Any]], timeout: float) -> str:
     """Display the three model answers side by side as a separate screen."""
     width = max(24, min(48, (shutil.get_terminal_size(fallback=(120, 24)).columns - 8) // 3))
-    columns = [("EXPERT", outputs[0]["answer"]), ("AMATEUR", outputs[1]["answer"]),
-               (f"CONTRASTIVE w={outputs[2]['weight']:g}", outputs[2]["answer"])]
+    columns = [
+        (f"EXPERT {outputs[0]['exact_match_percent']}%", outputs[0]["answer"]),
+        (f"AMATEUR {outputs[1]['exact_match_percent']}%", outputs[1]["answer"]),
+        (f"CONTRASTIVE w={outputs[2]['weight']:g} {outputs[2]['exact_match_percent']}%", outputs[2]["answer"]),
+    ]
     print("\n" + "=" * (width * 3 + 8))
     print(f"POPE comparison | row_id={row['id']} | question_id={row['question_id']} | target={row['answer']} | image={row.get('image_source', '')}")
     print(str(row["question"]))
@@ -248,7 +252,7 @@ def render_main_screen(row: dict[str, Any], selected_mode: str, weight: float,
     elif output.get("mode") == "all":
         print("Answers: shown on the comparison screen")
     else:
-        print(f"Answer: {output['answer']!r} | exact POPE match: {output['prediction'] == output['target']}")
+        print(f"Answer: {output['answer']!r} | POPE exact match: {output['exact_match_percent']}%")
     print("Commands: m [expert|amateur|contrastive [weight]|all], s [question_id|row:ID|random|all], i image, h help, q quit")
 
 
@@ -448,7 +452,10 @@ def main() -> int:
                                            current_index + 1, len(dataset))
                         current_output = generate_for_current(current_row, selected_mode, selected_weight)
                         if selected_mode != "all":
-                            print(f"Answer: {current_output['answer']!r} | target={current_output['target']}")
+                            print(
+                                f"Answer: {current_output['answer']!r} | target={current_output['target']} "
+                                f"| POPE exact match: {current_output['exact_match_percent']}%"
+                            )
                     continue
                 if selection.lower().startswith("row:"):
                     selected_row_id = selection[4:]

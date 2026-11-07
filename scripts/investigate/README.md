@@ -203,7 +203,8 @@ optional reference override when the base path normally comes from
   The default contrastive weight is `1`. Optional placement caps are
   `--max-expert-model-memory-gpu/cpu` and
   `--max-amateur-model-memory-gpu/cpu`. Answers are written to
-  `interactive_results.jsonl`; reruns require `--overwrite` to replace it.
+  `interactive_results.jsonl`; each displayed answer includes its POPE exact
+  match percentage (100% or 0%). Reruns require `--overwrite` to replace it.
 
 Example for a starting question and expert/amateur contrastive decoding:
 
