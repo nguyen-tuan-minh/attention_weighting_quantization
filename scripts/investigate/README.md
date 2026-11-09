@@ -197,7 +197,9 @@ optional reference override when the base path normally comes from
   screen, `m expert`, `m amateur`, `m contrastive [weight]`, and `m all` switch
   modes. `m all` opens a separate side-by-side answer screen. `s ID`, `s random`,
   and `s all` select a question, choose a random question, or answer every POPE
-  question for the current image sequentially in dataset order. `s all` follows
+  question for the current image in dataset order. `--batch-size` controls the
+  batch size for `s all` (default `2`); lower it if GPU memory is tight, or
+  raise it when memory allows. `s all` follows
   the current model mode, including the three-answer comparison when `m all` is
   selected.
   The default contrastive weight is `1`. Optional placement caps are

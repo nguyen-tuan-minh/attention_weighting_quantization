@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plausibility-threshold", type=float, default=0.001)
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
+        "--batch-size", type=int, default=2,
+        help="Batch size used by `s all` to answer questions about the same image.",
+    )
+    parser.add_argument(
         "--capture-point", choices=("block_input", "after_layer_norm", "value"),
         default="block_input", help="Decoder activation used for candidate-token gradient maps.",
     )
@@ -80,6 +84,8 @@ def resolve_path(value: str | Path) -> Path:
 def validate_args(args: argparse.Namespace) -> None:
     if args.max_new_tokens < 1:
         raise ValueError("--max-new-tokens must be positive")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive")
     if not math.isfinite(args.contrastive_weight) or args.contrastive_weight < 0:
         raise ValueError("--contrastive-weight must be finite and non-negative")
     if not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1:
@@ -246,6 +252,205 @@ def run_generation(
             "image": image,
         },
     }
+
+
+def run_generation_batch(
+    mode: str,
+    weight: float,
+    rows: list[dict[str, Any]],
+    expert: Any,
+    expert_adapter: Any,
+    expert_tokenizer: Any,
+    amateur: Any,
+    amateur_adapter: Any,
+    amateur_tokenizer: Any,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Generate a batch of questions about one image using cached autoregressive decoding."""
+    import torch
+
+    if not rows:
+        return []
+    if mode == "amateur":
+        adapter, model, tokenizer = amateur_adapter, amateur, amateur_tokenizer
+        amateur_inputs = None
+        gradient_role = "amateur"
+    else:
+        adapter, model, tokenizer = expert_adapter, expert, expert_tokenizer
+        amateur_inputs = None
+        gradient_role = "expert"
+
+    images = []
+    prepared = []
+    for row in rows:
+        image = row["image"]
+        if image is None or not hasattr(image, "convert"):
+            raise ValueError(f"POPE question_id={row['question_id']} has no readable image")
+        image = image.convert("RGB")
+        images.append(image)
+        prepared.append(adapter.preprocess_data([image], make_prompt_row(row)))
+    batch = adapter.data_collator(prepared)
+    prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
+    prompt_embeds = prompt_inputs["inputs_embeds"]
+    prompt_mask = prompt_kwargs["attention_mask"]
+
+    if mode == "contrastive":
+        amateur_prepared = [
+            amateur_adapter.preprocess_data([image], make_prompt_row(row))
+            for image, row in zip(images, rows)
+        ]
+        amateur_batch = amateur_adapter.data_collator(amateur_prepared)
+        amateur_prompt_inputs, amateur_prompt_kwargs = amateur_adapter.generate_input(amateur_batch)
+        amateur_inputs = (
+            amateur,
+            amateur_prompt_inputs["inputs_embeds"],
+            amateur_prompt_kwargs["attention_mask"],
+        )
+
+    generated, texts, distributions = decode_batch(
+        model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
+        amateur=amateur_inputs,
+        contrastive_weight=weight,
+        contrastive_score_type=args.contrastive_score_type,
+        plausibility_threshold=args.plausibility_threshold,
+    )
+
+    # Keep the existing position-inspection screen available for the resulting answers.
+    from investigate_grad_important import decode_non_image_token_labels
+
+    outputs = []
+    image_mask = prompt_kwargs["vision_mask"]
+    for index, (row, image, answer) in enumerate(zip(rows, images, texts)):
+        valid = prompt_mask[index].bool()
+        # Remove collator padding so the single-answer position inspector sees its usual input shape.
+        sample_embeds = prompt_embeds[index:index + 1, valid]
+        sample_image_mask = image_mask[index, valid].detach().cpu()
+        sample_labels = decode_non_image_token_labels(adapter, adapter.data_collator([prepared[index]]))
+        sample_distributions = [scores[index:index + 1] for scores in distributions[:len(generated[index])]]
+        output = {
+            "mode": mode,
+            "weight": weight if mode == "contrastive" else None,
+            "answer": answer,
+            "prediction": answer.strip().lower(),
+            "target": str(row["answer"]).strip().lower(),
+            "exact_match_percent": 100 if answer.strip().lower() == str(row["answer"]).strip().lower() else 0,
+            "position_inspection": {
+                "prompt_embeds": sample_embeds,
+                "attention_mask": torch.ones((1, sample_embeds.shape[1]), dtype=prompt_mask.dtype,
+                                              device=prompt_mask.device),
+                "image_mask": sample_image_mask,
+                "text_labels": sample_labels,
+                "mode": mode,
+                "token_ids": torch.tensor([generated[index]], dtype=torch.long, device=sample_embeds.device),
+                "distributions": sample_distributions,
+                "adapter": adapter,
+                "gradient_role": gradient_role,
+                "question": str(row["question"]),
+                "image": image,
+            },
+        }
+        outputs.append(output)
+    return outputs
+
+
+def decode_batch(
+    model: Any,
+    tokenizer: Any,
+    prompt_embeds: Any,
+    prompt_mask: Any,
+    max_new_tokens: int,
+    *,
+    amateur: tuple[Any, Any, Any] | None = None,
+    contrastive_weight: float = 1.0,
+    contrastive_score_type: str = "logits",
+    plausibility_threshold: float = 0.001,
+) -> tuple[list[list[int]], list[str], list[Any]]:
+    """Greedy autoregressive decoding for a batch, retaining per-row KV caches."""
+    import torch
+
+    batch_size = prompt_embeds.shape[0]
+    embedding = model.get_input_embeddings()
+    current_embeds = prompt_embeds
+    attention = prompt_mask
+    past = None
+    amateur_model, amateur_current, amateur_attention = amateur or (None, None, None)
+    amateur_past = None
+    generated: list[list[int]] = [[] for _ in range(batch_size)]
+    distributions: list[Any] = []
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=prompt_embeds.device)
+    eos_ids = eos_token_ids(model, tokenizer)
+    pad_id = tokenizer.pad_token_id or next(iter(eos_ids), 0)
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            expert_outputs = model(
+                inputs_embeds=current_embeds, attention_mask=attention, past_key_values=past,
+                use_cache=True, return_dict=True,
+            )
+            logits = expert_outputs.logits.float()
+            if past is None:
+                positions = torch.arange(attention.shape[1], device=attention.device).expand_as(attention)
+                last_positions = positions.masked_fill(~attention.bool(), -1).max(dim=1).values
+                scores = logits[torch.arange(batch_size, device=logits.device), last_positions]
+            else:
+                scores = logits[:, -1, :]
+
+            if amateur_model is not None:
+                amateur_outputs = amateur_model(
+                    inputs_embeds=amateur_current, attention_mask=amateur_attention,
+                    past_key_values=amateur_past, use_cache=True, return_dict=True,
+                )
+                amateur_logits_all = amateur_outputs.logits.float()
+                if amateur_past is None:
+                    amateur_positions = torch.arange(amateur_attention.shape[1], device=amateur_attention.device).expand_as(amateur_attention)
+                    amateur_last = amateur_positions.masked_fill(~amateur_attention.bool(), -1).max(dim=1).values
+                    amateur_logits = amateur_logits_all[
+                        torch.arange(batch_size, device=amateur_logits_all.device), amateur_last
+                    ].to(scores.device)
+                else:
+                    amateur_logits = amateur_logits_all[:, -1, :].to(scores.device)
+                if scores.shape[-1] != amateur_logits.shape[-1]:
+                    raise RuntimeError("Expert and amateur output vocabulary sizes differ")
+                expert_log_probs = torch.log_softmax(scores, dim=-1)
+                allowed = expert_log_probs.exp() >= expert_log_probs.exp().amax(dim=-1, keepdim=True) * plausibility_threshold
+                if contrastive_score_type == "logits":
+                    expert_scores, amateur_scores = scores, amateur_logits
+                elif contrastive_score_type == "log-probabilities":
+                    expert_scores, amateur_scores = expert_log_probs, torch.log_softmax(amateur_logits, dim=-1)
+                else:
+                    raise ValueError(f"Unsupported contrastive score type: {contrastive_score_type}")
+                scores = ((1 + contrastive_weight) * expert_scores - contrastive_weight * amateur_scores).masked_fill(~allowed, -torch.inf)
+
+            distributions.append(torch.softmax(scores, dim=-1).detach().cpu())
+            next_ids = scores.argmax(dim=-1)
+            if eos_ids:
+                was_finished = finished.clone()
+                for eos_id in eos_ids:
+                    finished |= next_ids.eq(eos_id)
+                next_ids = torch.where(was_finished, torch.full_like(next_ids, pad_id), next_ids)
+            else:
+                was_finished = finished.clone()
+            for idx, token_id in enumerate(next_ids.tolist()):
+                if not was_finished[idx]:
+                    generated[idx].append(int(token_id))
+            if bool(finished.all()):
+                break
+
+            active = ~finished
+            past = expert_outputs.past_key_values
+            token_embeds = embedding(next_ids[:, None].to(embedding.weight.device))
+            current_embeds = token_embeds
+            attention = torch.cat((attention, active[:, None].to(attention.dtype)), dim=1)
+            if amateur_model is not None:
+                amateur_past = amateur_outputs.past_key_values
+                amateur_embedding = amateur_model.get_input_embeddings()
+                amateur_current = amateur_embedding(next_ids[:, None].to(amateur_embedding.weight.device))
+                amateur_attention = torch.cat(
+                    (amateur_attention, active[:, None].to(amateur_attention.device, amateur_attention.dtype)), dim=1
+                )
+
+    texts = [tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip() for tokens in generated]
+    return generated, texts, distributions
 
 
 def wrap_column(text: str, width: int) -> list[str]:
@@ -494,6 +699,38 @@ def main() -> int:
         result_file.flush()
         return output
 
+    def generate_all_for_rows(rows: list[dict[str, Any]], mode: str, weight: float) -> list[dict[str, Any]]:
+        """Generate questions for the current image in batches and save every answer."""
+        if mode in {"amateur", "contrastive", "all"} and amateur is None:
+            raise ValueError("This mode requires --amateur-model")
+        modes = ("expert", "amateur", "contrastive") if mode == "all" else (mode,)
+        by_mode: dict[str, list[dict[str, Any]]] = {}
+        for one_mode in modes:
+            by_mode[one_mode] = run_generation_batch(
+                one_mode, weight, rows, expert, expert_adapter, expert_tokenizer,
+                amateur, amateur_adapter, amateur_tokenizer, args,
+            )
+        results = []
+        for row_idx, row in enumerate(rows):
+            row_outputs = [by_mode[one_mode][row_idx] for one_mode in modes]
+            if mode == "all":
+                for output in row_outputs:
+                    result_file.write(json.dumps(result_record(row, output), ensure_ascii=False) + "\n")
+                result = {"mode": "all", "outputs": row_outputs, "target": str(row["answer"]).strip().lower()}
+                if show_comparison_screen(row, row_outputs, timeout) == "quit":
+                    result_file.flush()
+                    raise InteractiveSessionExit
+            else:
+                result = row_outputs[0]
+                result_file.write(json.dumps(result_record(row, result), ensure_ascii=False) + "\n")
+                print(
+                    f"Answer: {result['answer']!r} | target={result['target']} "
+                    f"| POPE exact match: {result['exact_match_percent']}%"
+                )
+            results.append(result)
+        result_file.flush()
+        return results
+
     try:
         current_row = row_at(current_index)
         current_output = generate_for_current(current_row, selected_mode, selected_weight)
@@ -512,7 +749,7 @@ def main() -> int:
                 break
             if command in {"h", "help"}:
                 print("m expert | m amateur | m contrastive [weight] | m all")
-                print("s ID | s row:ID | s random | s all (questions sharing this image, sequentially)")
+                print(f"s ID | s row:ID | s random | s all (same-image questions, batches of {args.batch_size})")
                 print("p [expert|amateur|contrastive] opens token-position and candidate-gradient screens")
                 print("i displays the current image; q exits. The comparison screen uses b to return.")
                 continue
@@ -597,18 +834,21 @@ def main() -> int:
                     if not positions:
                         print("Could not find questions for this image.")
                         continue
-                    for number, position in enumerate(positions, start=1):
-                        current_index = position
+                    image_rows = [row_at(position) for position in positions]
+                    batch_count = math.ceil(len(image_rows) / args.batch_size)
+                    print(
+                        f"Generating {len(image_rows)} questions for image {source} "
+                        f"in {batch_count} batch(es) of up to {args.batch_size}"
+                    )
+                    all_results = []
+                    for offset in range(0, len(image_rows), args.batch_size):
+                        chunk = image_rows[offset:offset + args.batch_size]
+                        print(f"Batch {offset // args.batch_size + 1}/{batch_count}")
+                        all_results.extend(generate_all_for_rows(chunk, selected_mode, selected_weight))
+                    if all_results:
+                        current_index = positions[-1]
                         current_row = row_at(current_index)
-                        print(f"\n--- Image question {number}/{len(positions)} ---")
-                        render_main_screen(current_row, selected_mode, selected_weight, None,
-                                           current_index + 1, len(dataset))
-                        current_output = generate_for_current(current_row, selected_mode, selected_weight)
-                        if selected_mode != "all":
-                            print(
-                                f"Answer: {current_output['answer']!r} | target={current_output['target']} "
-                                f"| POPE exact match: {current_output['exact_match_percent']}%"
-                            )
+                        current_output = all_results[-1]
                     continue
                 if selection.lower().startswith("row:"):
                     selected_row_id = selection[4:]
