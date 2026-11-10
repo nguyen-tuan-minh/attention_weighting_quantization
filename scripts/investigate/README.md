@@ -202,6 +202,11 @@ optional reference override when the base path normally comes from
   raise it when memory allows. `s all` follows
   the current model mode, including the three-answer comparison when `m all` is
   selected.
+  For a non-interactive sweep over the entire split, pass `--all-questions`.
+  Set `--mode expert|amateur|contrastive|all` to select the model output(s),
+  and use `--batch-size` to tune memory and throughput. It writes one JSONL
+  record per model answer to `all_questions_results.jsonl`, with periodic batch
+  progress and no per-question screen pauses.
   The default contrastive weight is `1`. Optional placement caps are
   `--max-expert-model-memory-gpu/cpu` and
   `--max-amateur-model-memory-gpu/cpu`. Answers are written to

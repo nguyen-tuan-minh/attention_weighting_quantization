@@ -56,7 +56,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
         "--batch-size", type=int, default=2,
-        help="Batch size used by `s all` to answer questions about the same image.",
+        help="Batch size for `s all` or the --all-questions dataset sweep.",
+    )
+    parser.add_argument(
+        "--all-questions", action="store_true",
+        help="Run every row in the POPE split in batches, without interactive screens, and save JSONL results.",
+    )
+    parser.add_argument(
+        "--mode", choices=("expert", "amateur", "contrastive", "all"), default="expert",
+        help="Model mode for --all-questions and the initial interactive question.",
     )
     parser.add_argument(
         "--capture-point", choices=("block_input", "after_layer_norm", "value"),
@@ -625,6 +633,8 @@ def main() -> int:
     model_config = read_yaml(args.model_config)
     expert_checkpoint = resolve_path(args.expert_model or model_config.get("model_dir") or model_config.get("model_id"))
     amateur_checkpoint = resolve_path(args.amateur_model) if args.amateur_model else None
+    if args.mode in {"amateur", "contrastive", "all"} and amateur_checkpoint is None:
+        raise ValueError(f"--mode {args.mode} requires --amateur-model")
     device = args.device or model_config.get("device_map", "cuda:0")
     if device not in {"cpu", "cuda", "auto"} and not (device.startswith("cuda:") and device[5:].isdigit()):
         raise ValueError("--device must be cpu, auto, cuda, or cuda:N")
@@ -632,7 +642,7 @@ def main() -> int:
     args.timing = args.log_level == "extensive"
     output_dir = resolve_path(args.output_dir or Path("outputs/investigations") / "pope-interactive")
     output_dir.mkdir(parents=True, exist_ok=True)
-    results_path = output_dir / "interactive_results.jsonl"
+    results_path = output_dir / ("all_questions_results.jsonl" if args.all_questions else "interactive_results.jsonl")
     if results_path.exists() and not args.overwrite:
         raise FileExistsError(f"Results already exist: {results_path}; pass --overwrite to replace them")
     qig_root = resolve_path(model_config.get("implementation_source_dir", "third_party/QIG"))
@@ -664,7 +674,7 @@ def main() -> int:
     # 4. RUN THE INTERACTIVE QUESTION SESSION
     # ========================================================================
     timeout = args.interactive_timeout_minutes * 60
-    selected_mode = "expert"
+    selected_mode = args.mode
     selected_weight = args.contrastive_weight
     current_output: dict[str, Any] | None = None
     result_file = results_path.open("w", encoding="utf-8")
@@ -712,8 +722,10 @@ def main() -> int:
         result_file.flush()
         return output
 
-    def generate_all_for_rows(rows: list[dict[str, Any]], mode: str, weight: float) -> list[dict[str, Any]]:
-        """Generate questions for the current image in batches and save every answer."""
+    def generate_all_for_rows(
+        rows: list[dict[str, Any]], mode: str, weight: float, *, interactive: bool = True
+    ) -> list[dict[str, Any]]:
+        """Generate a batch of questions and save each answer."""
         if mode in {"amateur", "contrastive", "all"} and amateur is None:
             raise ValueError("This mode requires --amateur-model")
         modes = ("expert", "amateur", "contrastive") if mode == "all" else (mode,)
@@ -730,21 +742,39 @@ def main() -> int:
                 for output in row_outputs:
                     result_file.write(json.dumps(result_record(row, output), ensure_ascii=False) + "\n")
                 result = {"mode": "all", "outputs": row_outputs, "target": str(row["answer"]).strip().lower()}
-                if show_comparison_screen(row, row_outputs, timeout) == "quit":
+                if interactive and show_comparison_screen(row, row_outputs, timeout) == "quit":
                     result_file.flush()
                     raise InteractiveSessionExit
             else:
                 result = row_outputs[0]
                 result_file.write(json.dumps(result_record(row, result), ensure_ascii=False) + "\n")
-                print(
-                    f"Answer: {result['answer']!r} | target={result['target']} "
-                    f"| POPE exact match: {result['exact_match_percent']}%"
-                )
+                if interactive:
+                    print(
+                        f"Answer: {result['answer']!r} | target={result['target']} "
+                        f"| POPE exact match: {result['exact_match_percent']}%"
+                    )
             results.append(result)
         result_file.flush()
         return results
 
     try:
+        if args.all_questions:
+            batch_count = math.ceil(len(dataset) / args.batch_size)
+            log(
+                f"Running all {len(dataset)} POPE rows in {batch_count} batches "
+                f"(batch_size={args.batch_size}, mode={selected_mode}, weight={selected_weight:g}); "
+                f"writing {results_path}"
+            )
+            progress_interval = max(1, math.ceil(batch_count / 100))
+            for offset in range(0, len(dataset), args.batch_size):
+                rows = [row_at(index) for index in range(offset, min(offset + args.batch_size, len(dataset)))]
+                batch_number = offset // args.batch_size + 1
+                if batch_number == 1 or batch_number % progress_interval == 0 or batch_number == batch_count:
+                    log(f"POPE batch {batch_number}/{batch_count}: rows {offset}-{offset + len(rows) - 1}")
+                generate_all_for_rows(rows, selected_mode, selected_weight, interactive=False)
+            log(f"Finished all {len(dataset)} POPE rows; results saved to {results_path}")
+            return 0
+
         current_row = row_at(current_index)
         current_output = generate_for_current(current_row, selected_mode, selected_weight)
         while True:
