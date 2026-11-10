@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -53,10 +54,13 @@ def parse_args() -> argparse.Namespace:
                         help="Initial contrastive weight and default for the interactive model command.")
     parser.add_argument("--contrastive-score-type", choices=("logits", "log-probabilities"), default="logits")
     parser.add_argument("--plausibility-threshold", type=float, default=0.001)
-    parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
-        "--batch-size", type=int, default=2,
-        help="Batch size for `s all` or the --all-questions dataset sweep.",
+        "--max-new-tokens", type=int, default=128,
+        help="Generation limit; defaults to the LMMS-Eval POPE setting (128).",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=1,
+        help="Batch size for `s all` or the --all-questions sweep; defaults to LMMS-Eval's batch size.",
     )
     parser.add_argument(
         "--all-questions", action="store_true",
@@ -202,6 +206,104 @@ def prepare_position_prompt(adapter: Any, image: Any, prompt_row: dict[str, Any]
     }
 
 
+def generate_lmms_batch(
+    model: Any,
+    adapter: Any,
+    tokenizer: Any,
+    rows: list[dict[str, Any]],
+    images: list[Any],
+    max_new_tokens: int,
+) -> tuple[list[list[int]], list[str], list[Any]]:
+    """Run ordinary greedy generation with the same LLaVA path as LMMS-Eval."""
+    import torch
+    from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+    from llava.conversation import conv_templates
+    from llava.mm_utils import process_images, tokenizer_image_token
+
+    conv_template = "vicuna_v1"  # LMMS-Eval's Llava model default.
+    contexts = [
+        f"{str(row['question']).strip()}\nAnswer the question using a single word or phrase."
+        for row in rows
+    ]
+    prompt_texts = []
+    for context in contexts:
+        question = context
+        if DEFAULT_IMAGE_TOKEN not in question:
+            question = DEFAULT_IMAGE_TOKEN + "\n" + question
+        conv = (
+            copy.deepcopy(conv_templates[conv_template])
+            if "llama_3" in conv_template
+            else conv_templates[conv_template].copy()
+        )
+        conv.append_message(conv.roles[0], question)
+        conv.append_message(conv.roles[1], None)
+        prompt_texts.append(conv.get_prompt())
+
+    image_tensor = process_images(images, adapter.image_processor, model.config)
+    input_device = model.get_input_embeddings().weight.device
+    if isinstance(image_tensor, list):
+        image_tensor = [image.to(dtype=torch.float16, device=input_device) for image in image_tensor]
+    else:
+        image_tensor = image_tensor.to(dtype=torch.float16, device=input_device)
+
+    input_ids_list = [
+        tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+        for prompt in prompt_texts
+    ]
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if tokenizer.padding_side == "left":
+        input_ids_list = [torch.flip(ids, [0]) for ids in input_ids_list]
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids_list, batch_first=True, padding_value=pad_token_id
+    )
+    if tokenizer.padding_side == "left":
+        input_ids = torch.flip(input_ids, [1])
+    input_ids = input_ids.to(input_device)
+    attention_mask = input_ids.ne(pad_token_id).to(input_device)
+    image_sizes = [image.size for image in images]
+
+    with torch.inference_mode():
+        result = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=pad_token_id,
+            images=image_tensor,
+            image_sizes=image_sizes,
+            do_sample=False,
+            temperature=0,
+            top_p=1.0,
+            num_beams=1,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+
+    step_scores = list(result.scores or ())
+    if not step_scores:
+        return [[] for _ in rows], [""] * len(rows), []
+
+    # LLaVA's generate override supplies multimodal inputs_embeds to Transformers;
+    # the returned sequences contain the generated continuation after its start token.
+    generated_tensor = result.sequences[:, -len(step_scores):]
+    eos_ids = eos_token_ids(model, tokenizer)
+    generated: list[list[int]] = []
+    for row_index in range(len(rows)):
+        token_ids = []
+        for token_id in generated_tensor[row_index].tolist():
+            if token_id in eos_ids or token_id == pad_token_id:
+                break
+            token_ids.append(int(token_id))
+        generated.append(token_ids)
+
+    texts = [
+        tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+        for tokens in generated
+    ]
+    distributions = [torch.softmax(scores.float(), dim=-1).detach().cpu() for scores in step_scores]
+    return generated, texts, distributions
+
+
 def run_generation(
     mode: str,
     weight: float,
@@ -241,14 +343,21 @@ def run_generation(
             amateur_embeds, amateur_mask = amateur_prompt["prompt_embeds"], amateur_prompt["attention_mask"]
             amateur_state = (amateur, amateur_embeds, amateur_mask)
 
-    token_ids, answer, distributions = decode_one(
-        model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
-        amateur=amateur_state,
-        contrastive_weight=weight,
-        contrastive_score_type=args.contrastive_score_type,
-        plausibility_threshold=args.plausibility_threshold,
-        collect_distributions=True,
-    )
+    if mode == "contrastive":
+        token_ids, answer, distributions = decode_one(
+            model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
+            amateur=amateur_state,
+            contrastive_weight=weight,
+            contrastive_score_type=args.contrastive_score_type,
+            plausibility_threshold=args.plausibility_threshold,
+            collect_distributions=True,
+        )
+    else:
+        generated, texts, distributions = generate_lmms_batch(
+            model, amateur_adapter if mode == "amateur" else expert_adapter,
+            tokenizer, [row], [image], args.max_new_tokens,
+        )
+        token_ids, answer = generated[0], texts[0]
     return {
         "mode": mode,
         "weight": weight if mode == "contrastive" else None,
@@ -280,8 +389,10 @@ def run_generation_batch(
     amateur_adapter: Any,
     amateur_tokenizer: Any,
     args: argparse.Namespace,
+    *,
+    include_position_data: bool = True,
 ) -> list[dict[str, Any]]:
-    """Generate a batch of questions about one image using cached autoregressive decoding."""
+    """Generate a batch with LMMS-Eval's LLaVA path or custom contrastive decoding."""
     import torch
 
     if not rows:
@@ -296,14 +407,35 @@ def run_generation_batch(
         gradient_role = "expert"
 
     images = []
-    prepared = []
     for row in rows:
         image = row["image"]
         if image is None or not hasattr(image, "convert"):
             raise ValueError(f"POPE question_id={row['question_id']} has no readable image")
         image = image.convert("RGB")
         images.append(image)
-        prepared.append(adapter.preprocess_data([image], make_prompt_row(row)))
+
+    # Dataset sweeps only need answers. Avoid doing a second multimodal forward
+    # through the QIG adapter solely to build interactive token-position data.
+    if mode != "contrastive" and not include_position_data:
+        generated, texts, _ = generate_lmms_batch(
+            model, adapter, tokenizer, rows, images, args.max_new_tokens,
+        )
+        return [
+            {
+                "mode": mode,
+                "weight": None,
+                "answer": answer,
+                "prediction": answer.strip().lower(),
+                "target": str(row["answer"]).strip().lower(),
+                "exact_match_percent": 100 if answer.strip().lower() == str(row["answer"]).strip().lower() else 0,
+            }
+            for row, answer in zip(rows, texts)
+        ]
+
+    prepared = [
+        adapter.preprocess_data([image], make_prompt_row(row))
+        for image, row in zip(images, rows)
+    ]
     batch = adapter.data_collator(prepared)
     prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
     prompt_embeds = prompt_inputs["inputs_embeds"]
@@ -322,13 +454,31 @@ def run_generation_batch(
             amateur_prompt_kwargs["attention_mask"],
         )
 
-    generated, texts, distributions = decode_batch(
-        model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
-        amateur=amateur_inputs,
-        contrastive_weight=weight,
-        contrastive_score_type=args.contrastive_score_type,
-        plausibility_threshold=args.plausibility_threshold,
-    )
+    if mode == "contrastive":
+        generated, texts, distributions = decode_batch(
+            model, tokenizer, prompt_embeds, prompt_mask, args.max_new_tokens,
+            amateur=amateur_inputs,
+            contrastive_weight=weight,
+            contrastive_score_type=args.contrastive_score_type,
+            plausibility_threshold=args.plausibility_threshold,
+        )
+    else:
+        generated, texts, distributions = generate_lmms_batch(
+            model, adapter, tokenizer, rows, images, args.max_new_tokens,
+        )
+
+    if not include_position_data:
+        return [
+            {
+                "mode": mode,
+                "weight": weight if mode == "contrastive" else None,
+                "answer": answer,
+                "prediction": answer.strip().lower(),
+                "target": str(row["answer"]).strip().lower(),
+                "exact_match_percent": 100 if answer.strip().lower() == str(row["answer"]).strip().lower() else 0,
+            }
+            for row, answer in zip(rows, texts)
+        ]
 
     # Keep the existing position-inspection screen available for the resulting answers.
     from investigate_grad_important import decode_non_image_token_labels
@@ -668,6 +818,10 @@ def main() -> int:
     # ========================================================================
     # 3. PREPARE INFERENCE SESSION
     # ========================================================================
+    log(
+        "Expert/amateur generation uses LMMS-Eval LLaVA greedy generation; "
+        "contrastive mode uses the custom logits decoder",
+    )
     log("POPE generation uses inference mode without capture hooks", level="extensive")
 
     # ========================================================================
@@ -734,6 +888,7 @@ def main() -> int:
             by_mode[one_mode] = run_generation_batch(
                 one_mode, weight, rows, expert, expert_adapter, expert_tokenizer,
                 amateur, amateur_adapter, amateur_tokenizer, args,
+                include_position_data=interactive,
             )
         results = []
         for row_idx, row in enumerate(rows):
