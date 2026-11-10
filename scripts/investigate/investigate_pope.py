@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from contrastive_decoding import (  # noqa: E402
     decode_one,
+    eos_token_ids,
     load_model,
     load_runtime,
     parse_memory_size,
