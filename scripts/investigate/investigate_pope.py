@@ -163,6 +163,12 @@ def make_prompt_row(row: dict[str, Any]) -> dict[str, Any]:
         "conversations": [{
             "from": "human",
             "value": f"<image>\n{question}\nAnswer the question using a single word or phrase.",
+        }, {
+            # LLaVA's conversation template needs an empty assistant turn so
+            # generation starts after `### Assistant:` rather than after the
+            # human turn separator (which can make the model emit EOS at once).
+            "from": "gpt",
+            "value": "",
         }],
     }
 
@@ -324,8 +330,8 @@ def run_generation_batch(
     for index, (row, image, answer) in enumerate(zip(rows, images, texts)):
         valid = prompt_mask[index].bool()
         # Remove collator padding so the single-answer position inspector sees its usual input shape.
-        sample_embeds = prompt_embeds[index:index + 1, valid]
-        sample_image_mask = image_mask[index, valid].detach().cpu()
+        sample_embeds = prompt_embeds[index:index + 1, valid.to(prompt_embeds.device)]
+        sample_image_mask = image_mask[index, valid.to(image_mask.device)].detach().cpu()
         sample_labels = decode_non_image_token_labels(adapter, adapter.data_collator([prepared[index]]))
         sample_distributions = [scores[index:index + 1] for scores in distributions[:len(generated[index])]]
         output = {
@@ -378,7 +384,8 @@ def decode_batch(
     amateur_past = None
     generated: list[list[int]] = [[] for _ in range(batch_size)]
     distributions: list[Any] = []
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=prompt_embeds.device)
+    token_device = embedding.weight.device
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=token_device)
     eos_ids = eos_token_ids(model, tokenizer)
     pad_id = tokenizer.pad_token_id or next(iter(eos_ids), 0)
 
@@ -390,11 +397,13 @@ def decode_batch(
             )
             logits = expert_outputs.logits.float()
             if past is None:
-                positions = torch.arange(attention.shape[1], device=attention.device).expand_as(attention)
-                last_positions = positions.masked_fill(~attention.bool(), -1).max(dim=1).values
+                logits_mask = attention.to(logits.device).bool()
+                positions = torch.arange(logits_mask.shape[1], device=logits.device).expand_as(logits_mask)
+                last_positions = positions.masked_fill(~logits_mask, -1).max(dim=1).values
                 scores = logits[torch.arange(batch_size, device=logits.device), last_positions]
             else:
                 scores = logits[:, -1, :]
+            scores = scores.to(token_device)
 
             if amateur_model is not None:
                 amateur_outputs = amateur_model(
@@ -403,13 +412,14 @@ def decode_batch(
                 )
                 amateur_logits_all = amateur_outputs.logits.float()
                 if amateur_past is None:
-                    amateur_positions = torch.arange(amateur_attention.shape[1], device=amateur_attention.device).expand_as(amateur_attention)
-                    amateur_last = amateur_positions.masked_fill(~amateur_attention.bool(), -1).max(dim=1).values
+                    amateur_mask = amateur_attention.to(amateur_logits_all.device).bool()
+                    amateur_positions = torch.arange(amateur_mask.shape[1], device=amateur_logits_all.device).expand_as(amateur_mask)
+                    amateur_last = amateur_positions.masked_fill(~amateur_mask, -1).max(dim=1).values
                     amateur_logits = amateur_logits_all[
                         torch.arange(batch_size, device=amateur_logits_all.device), amateur_last
-                    ].to(scores.device)
+                    ].to(token_device)
                 else:
-                    amateur_logits = amateur_logits_all[:, -1, :].to(scores.device)
+                    amateur_logits = amateur_logits_all[:, -1, :].to(token_device)
                 if scores.shape[-1] != amateur_logits.shape[-1]:
                     raise RuntimeError("Expert and amateur output vocabulary sizes differ")
                 expert_log_probs = torch.log_softmax(scores, dim=-1)
@@ -441,7 +451,9 @@ def decode_batch(
             past = expert_outputs.past_key_values
             token_embeds = embedding(next_ids[:, None].to(embedding.weight.device))
             current_embeds = token_embeds
-            attention = torch.cat((attention, active[:, None].to(attention.dtype)), dim=1)
+            attention = torch.cat(
+                (attention, active[:, None].to(device=attention.device, dtype=attention.dtype)), dim=1
+            )
             if amateur_model is not None:
                 amateur_past = amateur_outputs.past_key_values
                 amateur_embedding = amateur_model.get_input_embeddings()
