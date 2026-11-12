@@ -183,6 +183,22 @@ def parse_args() -> argparse.Namespace:
             "weights from assistant-answer CE gradients."
         ),
     )
+    parser.add_argument(
+        "--top-token-cumulative-percent", type=float, default=None,
+        help=(
+            "With --hessian-weighting grad, omit the highest-gradient image tokens per sample and layer "
+            "until they account for this fraction of image-token gradient-score mass. Remaining image "
+            "weights are rescaled to preserve the pre-selection image-weight sum. Requires multimodal "
+            "calibration and token scope all."
+        ),
+    )
+    parser.add_argument(
+        "--hessian-grad-normal-layers", default=None,
+        help=(
+            "1-based decoder layers/ranges that use ordinary gradient weighting without cumulative image-token "
+            "selection (for example 1-4,31). Requires --top-token-cumulative-percent."
+        ),
+    )
     parser.add_argument("--damp", type=float, default=0.01, help="Relative diagonal damping for Hessian factorization.")
     parser.add_argument(
         "--max-hessian-memory-gpu", type=parse_memory_size, default=None,
@@ -427,6 +443,9 @@ def accumulate_weighted_hessian(
         )
     x = x[valid]
     weights = weights[valid]
+    positive = weights > 0
+    x = x[positive]
+    weights = weights[positive]
     if x.shape[0] == 0:
         return
     hessian = active_hessians.get(key)
@@ -476,12 +495,19 @@ def make_gradient_token_weights(
     labels: torch.Tensor,
     layer_outputs: dict[int, torch.Tensor],
     selected_mask: torch.Tensor,
+    vision_mask: torch.Tensor | None = None,
+    top_token_cumulative_percent: float | None = None,
+    normal_grad_layers: set[int] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Compute mean-one token weights from the summed assistant-answer CE gradient.
 
     Differentiate the sum of all assistant answer-token losses once with
     respect to each captured decoder block output. For each output token,
     take the L2 norm over hidden features, then normalize over the selected scope.
+    If a cumulative threshold is supplied, omit the top image tokens per layer
+    until they contain that fraction of image-gradient score mass. Remaining
+    image weights are rescaled to preserve the pre-selection sum of image-token
+    weights; text weights retain the ordinary gradient normalization.
     """
     if logits.ndim != 3 or logits.shape[0] != 1:
         raise RuntimeError(f"Gradient weighting expects logits [1, sequence, vocab], got {tuple(logits.shape)}")
@@ -515,6 +541,16 @@ def make_gradient_token_weights(
     selected = selected_mask.reshape(-1).to(device=logits.device, dtype=torch.bool)
     if selected.numel() != logits.shape[1] or not selected.any():
         raise RuntimeError("Gradient weighting token scope is empty or does not align with logits")
+    image = None
+    if top_token_cumulative_percent is not None:
+        if not 0 < top_token_cumulative_percent <= 1:
+            raise ValueError("top_token_cumulative_percent must be in (0, 1]")
+        if vision_mask is None:
+            raise ValueError("Cumulative image-token gradient weighting requires a vision mask")
+        image = vision_mask.reshape(-1).to(device=logits.device, dtype=torch.bool) & selected
+        if not image.any():
+            raise RuntimeError("Cumulative image-token gradient weighting found no valid image tokens")
+    normal_grad_layers = normal_grad_layers or set()
     result: dict[int, torch.Tensor] = {}
     for layer_index, squared_score in scores.items():
         # The square root converts the squared L2 norm over hidden features
@@ -529,6 +565,31 @@ def make_gradient_token_weights(
         )
         weights = torch.ones_like(score)
         weights[selected] = normalized_score[selected]
+        if image is not None and layer_index not in normal_grad_layers:
+            image_positions = image.nonzero(as_tuple=True)[0]
+            original_image_weight = weights[image_positions].sum()
+            image_scores = score[image_positions]
+            total_score = image_scores.sum()
+            omitted_mask = torch.zeros_like(image_positions, dtype=torch.bool)
+            if total_score > 0:
+                ordered_scores, order = torch.sort(image_scores, descending=True)
+                cumulative_scores = torch.cumsum(ordered_scores, dim=0)
+                threshold = total_score * top_token_cumulative_percent
+                omit_count = int(torch.searchsorted(cumulative_scores, threshold).item()) + 1
+                omitted_mask[order[:omit_count]] = True
+            # With no image-gradient mass there is no meaningful top token, so
+            # leave all image positions available.
+            omitted_image_positions = image_positions[omitted_mask]
+            retained_image_positions = image_positions[~omitted_mask]
+            weights[omitted_image_positions] = 0.0
+            if retained_image_positions.numel() > 0:
+                retained_total = weights[retained_image_positions].sum()
+                if retained_total > torch.finfo(torch.float32).tiny:
+                    weights[retained_image_positions] *= original_image_weight / retained_total
+                else:
+                    weights[retained_image_positions] = (
+                        original_image_weight / retained_image_positions.numel()
+                    )
         result[layer_index] = weights
     return result
 
@@ -777,6 +838,19 @@ def main() -> int:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
         raise ValueError("--hessian-group-layers must be positive")
+    if args.top_token_cumulative_percent is not None:
+        if not 0 < args.top_token_cumulative_percent <= 1:
+            raise ValueError("--top-token-cumulative-percent must be in (0, 1]")
+        if args.hessian_weighting != "grad":
+            raise ValueError("--top-token-cumulative-percent requires --hessian-weighting grad")
+        if args.hessian_token_scope != "all":
+            raise ValueError("Cumulative image-token weighting requires --hessian-token-scope all")
+        if args.calibration_modality != "multimodal":
+            raise ValueError("Cumulative image-token weighting requires --calibration-modality multimodal")
+    elif args.hessian_grad_normal_layers is not None:
+        raise ValueError("--hessian-grad-normal-layers requires --top-token-cumulative-percent")
+    if args.hessian_grad_normal_layers is not None and args.hessian_weighting != "grad":
+        raise ValueError("--hessian-grad-normal-layers requires --hessian-weighting grad")
     if args.hessian_weighting == "iga" and args.hessian_token_scope != "all":
         raise ValueError("--hessian-weighting iga requires --hessian-token-scope all")
     if args.hessian_weighting == "iga" and args.calibration_modality == "text-only":
@@ -927,10 +1001,27 @@ def main() -> int:
     record_timing("multimodal adapter initialization", time.monotonic() - adapter_started)
     blocks = model.model.layers
     selected_layers = parse_layer_selection(args.layers, len(blocks))
+    normal_grad_layers = (
+        parse_layer_selection(args.hessian_grad_normal_layers, len(blocks))
+        if args.hessian_grad_normal_layers is not None
+        else set()
+    )
+    unquantized_normal_layers = normal_grad_layers - selected_layers
+    if unquantized_normal_layers:
+        raise ValueError(
+            "--hessian-grad-normal-layers must be a subset of --layers; extra layers: "
+            + ",".join(str(index + 1) for index in sorted(unquantized_normal_layers))
+        )
     log(
         f"Quantizing {len(selected_layers)}/{len(blocks)} decoder layers: "
         f"{','.join(str(index + 1) for index in sorted(selected_layers))}"
     )
+    if args.top_token_cumulative_percent is not None:
+        log(
+            f"Gradient image-token exclusion: cumulative score mass={args.top_token_cumulative_percent:.1%}; "
+            "remaining image weights are rescaled to preserve the pre-exclusion image-weight sum; "
+            f"normal-gradient layers={','.join(str(index + 1) for index in sorted(normal_grad_layers)) or 'none'}"
+        )
     device_map = getattr(model, "hf_device_map", {})
     log(
         f"Model has {len(blocks)} decoder layers; Accelerate storage map: "
@@ -1122,6 +1213,9 @@ def main() -> int:
                             labels[0],
                             grad_state["layer_outputs"],
                             valid_for_weights,
+                            vision_mask[0],
+                            args.top_token_cumulative_percent,
+                            normal_grad_layers,
                         )
                         record_timing(
                             "assistant-token gradient score calculation",
@@ -1616,6 +1710,16 @@ def main() -> int:
         "hessian_token_scope": args.hessian_token_scope,
         "calibration_modality": args.calibration_modality,
         "hessian_weighting": args.hessian_weighting,
+        "top_token_cumulative_percent": args.top_token_cumulative_percent,
+        "hessian_grad_normal_layers_1based": (
+            sorted(index + 1 for index in normal_grad_layers)
+            if args.top_token_cumulative_percent is not None else []
+        ),
+        "hessian_grad_image_token_selection": (
+            "per-sample/per-layer top gradient-score mass omitted; remaining image weights rescaled "
+            "to preserve the pre-exclusion image-weight sum; text weights unchanged"
+            if args.top_token_cumulative_percent is not None else None
+        ),
         "hessian_gradient_score": (
             "sqrt(sum_hidden(grad sum_answer_CE / grad block_output)^2), normalized to mean 1 "
             "over the selected token scope"

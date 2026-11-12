@@ -89,6 +89,26 @@ Task-independent helpers live in `src/attention_quantization/`: `config.py` read
 
 The scripts keep calibration selection and forwarding local to the workflow. Attention hooks, IGA calculation, and plots also remain in `scripts/investigate/investigate_attention.py`; these are analysis-specific rather than shared infrastructure. This QIG workflow currently targets the original `liuhaotian/llava-v1.5-7b` checkpoint format. A different dataset can provide its own loader while reusing the common conversation helper when its records use the same turn format.
 
+### Gradient-selected image tokens for GPTQ
+
+`scripts/quantize/quantize_gptq.py` supports `--hessian-weighting grad`, which weights Hessian contributions by the per-token L2 norm of the gradient of summed assistant-answer cross-entropy. Pass `--top-token-cumulative-percent P` (a fraction from 0 to 1) to omit high-score image tokens. For each calibration sample and decoder layer, image tokens are ranked by gradient score `sqrt(sum_hidden(gradient ** 2))`, the L2 norm across the hidden dimension. Tokens are sorted from highest to lowest, and the smallest prefix whose cumulative score reaches `P` of the total image-token score is omitted from that layer's Hessian. The remaining image weights are rescaled to preserve their pre-exclusion sum; text-token gradient weights remain unchanged. A value of 1 omits all image tokens. This option requires multimodal calibration and `--hessian-token-scope all`.
+
+Use `--hessian-grad-normal-layers` with 1-based layer numbers/ranges to keep ordinary gradient weighting on specified layers while applying cumulative image-token exclusion on the other selected quantization layers. For example, `--hessian-grad-normal-layers 1-4,31` bypasses the exclusion in those layers. Example:
+
+```bash
+python scripts/quantize/quantize_gptq.py \
+  --output-dir models/llava-v1.5-7b-gptq-w4g128-grad-top90 \
+  --samples 128 \
+  --bits 4 \
+  --group-size 128 \
+  --calibration-modality multimodal \
+  --hessian-token-scope all \
+  --hessian-weighting grad \
+  --top-token-cumulative-percent 0.9 \
+  --hessian-grad-normal-layers 1-4,31 \
+  --overwrite
+```
+
 ### Run QIG quantization
 
 The QIG source is kept under `third_party/QIG` so its code can be maintained with this project. The LLaVA-NeXT and LMMS-Eval companion checkouts are ignored by Git and cloned there by the setup script. The script uses the shared Python 3.11 `.venv`, prepares ShareGPT4V COCO calibration records using this project's dataset module, and runs a selected method against the original `liuhaotian/llava-v1.5-7b` model. When `--base-model` is omitted, it downloads the model from `configs/model.yaml` into `models/llava-v1.5-7b` if that directory does not already contain a config and weight file. It filters calibration candidates to image files already present under the configured `raw_dir`; it does not download missing images or the full COCO ZIP during quantization:
