@@ -213,6 +213,8 @@ def generate_lmms_batch(
     rows: list[dict[str, Any]],
     images: list[Any],
     max_new_tokens: int,
+    *,
+    collect_distributions: bool = False,
 ) -> tuple[list[list[int]], list[str], list[Any]]:
     """Run ordinary greedy generation with the same LLaVA path as LMMS-Eval."""
     import torch
@@ -262,30 +264,69 @@ def generate_lmms_batch(
     attention_mask = input_ids.ne(pad_token_id).to(input_device)
     image_sizes = [image.size for image in images]
 
+    generation_kwargs = dict(
+        attention_mask=attention_mask,
+        pad_token_id=pad_token_id,
+        images=image_tensor,
+        image_sizes=image_sizes,
+        do_sample=False,
+        temperature=0,
+        top_p=1.0,
+        num_beams=1,
+        max_new_tokens=max_new_tokens,
+        use_cache=True,
+    )
     with torch.inference_mode():
-        result = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            pad_token_id=pad_token_id,
-            images=image_tensor,
-            image_sizes=image_sizes,
-            do_sample=False,
-            temperature=0,
-            top_p=1.0,
-            num_beams=1,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-            return_dict_in_generate=True,
-            output_scores=True,
+        if collect_distributions:
+            result = model.generate(
+                input_ids,
+                return_dict_in_generate=True,
+                output_scores=True,
+                **generation_kwargs,
+            )
+            generated_sequences = result.sequences
+            step_scores = list(result.scores or ())
+        else:
+            # Match LMMS-Eval's ordinary path: request the generated token tensor
+            # directly, without retaining every vocabulary score tensor.
+            generated_sequences = model.generate(input_ids, **generation_kwargs)
+            step_scores = []
+
+    if generated_sequences.ndim == 1:
+        generated_sequences = generated_sequences.unsqueeze(0)
+    if generated_sequences.shape[0] != len(rows):
+        if len(rows) > 1:
+            # Some LLaVA/Transformers combinations collapse the output batch
+            # when multimodal inputs are passed as a list. Retry row by row so
+            # a long POPE sweep completes and each answer stays aligned.
+            log(
+                "WARNING: LLaVA returned %d generations for a batch of %d; "
+                "retrying this batch one question at a time"
+                % (generated_sequences.shape[0], len(rows))
+            )
+            singles = [
+                generate_lmms_batch(
+                    model, adapter, tokenizer, [row], [image], max_new_tokens,
+                    collect_distributions=collect_distributions,
+                )
+                for row, image in zip(rows, images)
+            ]
+            return (
+                [item[0][0] for item in singles],
+                [item[1][0] for item in singles],
+                [item[2][0] if item[2] else None for item in singles],
+            )
+        raise RuntimeError(
+            "LLaVA returned %d sequences for one POPE question"
+            % generated_sequences.shape[0]
         )
 
-    step_scores = list(result.scores or ())
-    if not step_scores:
-        return [[] for _ in rows], [""] * len(rows), []
-
     # LLaVA's generate override supplies multimodal inputs_embeds to Transformers;
-    # the returned sequences contain the generated continuation after its start token.
-    generated_tensor = result.sequences[:, -len(step_scores):]
+    # returned sequences contain generated tokens (the same tensor LMMS decodes).
+    if step_scores:
+        generated_tensor = generated_sequences[:, -len(step_scores):]
+    else:
+        generated_tensor = generated_sequences
     eos_ids = eos_token_ids(model, tokenizer)
     generated: list[list[int]] = []
     for row_index in range(len(rows)):
@@ -356,6 +397,7 @@ def run_generation(
         generated, texts, distributions = generate_lmms_batch(
             model, amateur_adapter if mode == "amateur" else expert_adapter,
             tokenizer, [row], [image], args.max_new_tokens,
+            collect_distributions=True,
         )
         token_ids, answer = generated[0], texts[0]
     return {
@@ -662,11 +704,12 @@ def show_comparison_screen(row: dict[str, Any], outputs: list[dict[str, Any]], t
 
 def inspect_answer_positions(
     output: dict[str, Any],
-    active_samples: dict[str, dict[str, Any]],
+    capture_point: str,
     timeout: float,
 ) -> str:
     """Open the gradient investigator's token-position and candidate screens read-only."""
     from investigate_grad_important import (
+        activation_target,
         generate_candidate_continuation,
         score_candidate_token_gradients,
         show_gradient_heatmaps,
@@ -680,13 +723,11 @@ def inspect_answer_positions(
         f"Inspecting {inspection['mode']} answer positions; token candidates use its generation scores, "
         f"candidate gradient maps use the {role} model."
     )
-    active_sample = active_samples[role]
-    active_sample["layer_activations"] = {}
-    active_sample["capture_enabled"] = False
+    capture_target = activation_target(capture_point)
     try:
         action = inspect_generated_token_positions(
             inspection["adapter"],
-            active_sample,
+            capture_target,
             inspection["prompt_embeds"],
             inspection["attention_mask"],
             inspection["image_mask"],
@@ -816,7 +857,7 @@ def main() -> int:
         torch.cuda.manual_seed_all(args.seed)
 
     # ========================================================================
-    # 3. PREPARE INFERENCE SESSION
+    # 3. RUN GENERATION AND CAPTURE CANDIDATE GRADIENTS
     # ========================================================================
     log(
         "Expert/amateur generation uses LMMS-Eval LLaVA greedy generation; "
@@ -824,30 +865,11 @@ def main() -> int:
     )
     log("POPE generation uses inference mode without capture hooks", level="extensive")
 
-    # ========================================================================
-    # 4. RUN THE INTERACTIVE QUESTION SESSION
-    # ========================================================================
     timeout = args.interactive_timeout_minutes * 60
     selected_mode = args.mode
     selected_weight = args.contrastive_weight
     current_output: dict[str, Any] | None = None
     result_file = results_path.open("w", encoding="utf-8")
-    active_samples = {
-        "expert": {"layer_activations": {}, "capture_enabled": False},
-        "amateur": {"layer_activations": {}, "capture_enabled": False},
-    }
-    hook_handles: list[Any] = []
-
-    def ensure_position_hooks() -> None:
-        if hook_handles:
-            return
-        from investigate_grad_important import register_decoder_activation_hooks
-
-        hook_handles.extend(register_decoder_activation_hooks(expert, active_samples["expert"], args.capture_point))
-        if amateur is not None:
-            hook_handles.extend(register_decoder_activation_hooks(amateur, active_samples["amateur"], args.capture_point))
-        log(f"Registered candidate-gradient hooks on {len(hook_handles)} decoder layers", level="extensive")
-
     def row_at(position: int) -> dict[str, Any]:
         return dict(dataset[position])
 
@@ -983,8 +1005,7 @@ def main() -> int:
                         print("Generate an answer first.")
                         continue
                     selected_output = current_output
-                ensure_position_hooks()
-                position_action = inspect_answer_positions(selected_output, active_samples, timeout)
+                position_action = inspect_answer_positions(selected_output, args.capture_point, timeout)
                 if position_action == "quit":
                     raise InteractiveSessionExit
                 continue
@@ -1075,11 +1096,9 @@ def main() -> int:
     except InteractiveSessionExit:
         pass
     finally:
-        for handle in hook_handles:
-            handle.remove()
         result_file.close()
     # ========================================================================
-    # 5. CLOSE AND REPORT SAVED RESPONSES
+    # 4. CLOSE AND REPORT SAVED RESPONSES
     # ========================================================================
     print(f"Interactive POPE responses saved to {results_path}")
     return 0

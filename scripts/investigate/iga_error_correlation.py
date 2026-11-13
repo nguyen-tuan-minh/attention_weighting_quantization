@@ -25,6 +25,7 @@ from attention_quantization.models.qig_loader import (  # noqa: E402
     load_qig_llava_model,
     load_qig_quantized_model,
 )
+from attention_quantization.inspection import LlavaInspector, TensorCapture, IGACollector  # noqa: E402
 from attention_quantization.quantization.qig import load_qig_runtime  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
 
@@ -119,7 +120,7 @@ def make_process_model(runtime: Any, lm: Any) -> Any:
 
 
 # ============================================================================
-# PHASES 3–4. REGISTER HOOKS AND FORWARD CALIBRATION SAMPLES
+# PHASE 3. CAPTURE AND FORWARD CALIBRATION SAMPLES
 # ============================================================================
 def prepare_batch(adapter: Any, samples: list[dict[str, Any]]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Preprocess samples and return CPU embeddings plus tensor input kwargs.
@@ -207,121 +208,61 @@ def capture_layer_outputs_and_iga(
     *,
     capture_iga: bool,
 ) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]] | None, torch.Tensor]:
-    """Forward a batch and capture block outputs plus optional IGA scores.
+    """Forward one batch in a capture scope and return CPU outputs, IGA, and logits.
 
-    Args:
-        adapter: QIG process adapter whose ``model`` contains LLaVA layers.
-        inputs_embeds: CPU input embeddings with shape ``[batch, sequence, hidden]``.
-        kwargs: CPU masks/labels consumed by the adapter.
-        capture_iga: Whether to capture post-softmax attention and compute IGA.
-
-    Returns:
-        Per-sample, per-layer hidden outputs (each [sequence, hidden]); optional
-        per-sample, per-layer image-token IGA vectors (each [image_tokens]); and
-        logits with shape [batch, sequence, vocabulary]. Outputs are detached on CPU.
+    Inputs are CPU [batch, sequence, hidden] embeddings and adapter masks/labels.
+    Block outputs/logits are float16; optional IGA vectors remain float32. A sink
+    converts block captures as layers finish, avoiding retention of a full batch
+    of native-dtype hidden states alongside their float16 copies. Attention-output
+    settings are restored and hooks removed even when the forward fails.
     """
     model = adapter.model
-    layers = getattr(getattr(model, "model", None), "layers", None)
-    if layers is None:
-        raise RuntimeError("Could not find LLaVA decoder layers at model.model.layers")
+    inspector = LlavaInspector(model)
+    targets = [TensorCapture("block.output")]
+    iga_collector = None
+    if capture_iga:
+        image_mask, text_mask = image_and_text_masks(kwargs)
+        iga_collector = IGACollector(query_mask=text_mask, image_mask=image_mask)
+        targets.append(iga_collector)
+    # outputs_by_layer: per-forward layer -> CPU float16 [batch, sequence, hidden].
+    outputs_by_layer = {}
 
-    # active: dict[str, Any], hook captures reset for this model forward.
-    # active["outputs"]: dict[int, torch.Tensor], layer -> CPU float16 [batch, sequence, hidden].
-    # active["iga"]: dict[int, list[torch.Tensor]], layer -> per-sample CPU float32 [image_tokens].
-    active: dict[str, Any] = {"outputs": {}, "iga": {}}
-    # image_mask: torch.Tensor | None, CPU bool [batch, sequence], valid image tokens if IGA is enabled.
-    # text_mask: torch.Tensor | None, CPU bool [batch, sequence], post-image text queries if IGA is enabled.
-    image_mask, text_mask = image_and_text_masks(kwargs) if capture_iga else (None, None)
-    # handles: list[torch.utils.hooks.RemovableHandle], hooks removed after the forward in finally.
-    handles = []
-    for layer_index, layer in enumerate(layers):
-        def save_layer(_module: Any, _inputs: Any, output: Any, *, index: int = layer_index) -> None:
-            # hidden: torch.Tensor, [batch, sequence, hidden], decoder block output.
-            hidden = output[0] if isinstance(output, tuple) else output
-            if torch.is_tensor(hidden):
-                # active["outputs"][index]: torch.Tensor, CPU float16 [batch, sequence, hidden], captured block output.
-                active["outputs"][index] = hidden.detach().to(device="cpu", dtype=torch.float16)
+    def save_block(_forward, layer, target, _call, value):
+        """Retain each block's CPU float16 output; IGA stays in collector results."""
+        if target == "block.output":
+            outputs_by_layer[layer] = value.to(dtype=torch.float16)
 
-        handles.append(layer.register_forward_hook(save_layer))
-        if capture_iga:
-            attention_module = getattr(layer, "self_attn", None)
-            if attention_module is None:
-                raise RuntimeError(f"Decoder layer {layer_index} has no self_attn module")
-
-            def save_attention(_module: Any, _inputs: Any, output: Any, *, index: int = layer_index) -> None:
-                if not isinstance(output, tuple) or len(output) < 2 or not torch.is_tensor(output[1]):
-                    return
-                # weights: torch.Tensor, [batch, heads, query_sequence, key_sequence], post-softmax attention.
-                weights = output[1]
-                if weights.ndim != 4:
-                    return
-                # layer_scores: list[torch.Tensor], CPU float32 [image_tokens] IGA vector per batch item.
-                layer_scores = []
-                for sample_index in range(weights.shape[0]):
-                    # query_mask: torch.Tensor, bool [sequence] on attention device, text query positions.
-                    query_mask = text_mask[sample_index].to(weights.device)
-                    # key_mask: torch.Tensor, bool [sequence] on attention device, image key positions.
-                    key_mask = image_mask[sample_index].to(weights.device)
-                    # [heads, sequence, sequence] -> [heads, text_queries, image_keys].
-                    # text_to_image: torch.Tensor, [heads, text_queries, image_tokens], selected attention values.
-                    text_to_image = weights[sample_index][:, query_mask, :][:, :, key_mask]
-                    # Reduce head/query axes -> [image_keys] IGA vector.
-                    # layer_scores entry: torch.Tensor, CPU float32 [image_tokens], mean attention per image key.
-                    layer_scores.append(text_to_image.float().mean(dim=(0, 1)).cpu())
-                # active["iga"][index]: list[torch.Tensor], per-sample CPU [image_tokens] scores for this layer.
-                active["iga"][index] = layer_scores
-                # The model's output_attentions collection otherwise keeps a
-                # full [batch, heads, sequence, sequence] matrix for every
-                # decoder layer. IGA is already computed, so don't retain it.
-                return (output[0], None, *output[2:])
-
-            handles.append(attention_module.register_forward_hook(save_attention))
-
+    original_output_attentions = getattr(model.config, "output_attentions", False)
     try:
         if capture_iga:
             model.config.output_attentions = True
-        # device: torch.device, model parameter device used for adapter inputs.
         device = next(model.parameters()).device
-        with torch.inference_mode():
-            # result: ModelOutput, logits [batch, sequence, vocabulary] plus model metadata.
-            result = adapter(
-                inputs_embeds=inputs_embeds.to(device),
-                attention_mask=kwargs["attention_mask"].to(device),
-                labels=kwargs["labels"].to(device),
-                use_cache=False,
-                return_dict=True,
-            )
-        batch_count = inputs_embeds.shape[0]
-        # Split [batch, sequence, hidden] captured tensors into per-sample
-        # [sequence, hidden] entries, grouped by sample and layer.
-        # outputs: list[list[torch.Tensor]], CPU float16 [sequence, hidden] per sample and layer.
-        outputs = [
-            [active["outputs"][layer_index][sample_index] for layer_index in range(len(layers))]
-            for sample_index in range(batch_count)
-        ]
-        # iga: list[list[torch.Tensor]] | None, optional CPU [image_tokens] vectors per sample/layer.
-        iga = None
-        if capture_iga:
-            # missing: list[int], decoder layers for which hooks captured no attention weights.
-            missing = [index for index in range(len(layers)) if index not in active["iga"]]
-            if missing:
-                raise RuntimeError(
-                    f"No post-softmax attention weights captured for layers {missing}; use eager attention."
+        with torch.inference_mode(), inspector.capture(
+            targets=targets, storage="cpu", sink=save_block, retain_tensors=False,
+            release_attention=capture_iga, scoped=True,
+        ) as capture:
+            with capture.forward():
+                result = adapter(
+                    inputs_embeds=inputs_embeds.to(device),
+                    attention_mask=kwargs["attention_mask"].to(device),
+                    labels=kwargs["labels"].to(device), use_cache=False, return_dict=True,
                 )
-            iga = [
-                [active["iga"][layer_index][sample_index] for layer_index in range(len(layers))]
-                for sample_index in range(batch_count)
-            ]
-        # logits: torch.Tensor, CPU float16 [batch, sequence, vocabulary].
-        logits = result.logits.detach().to(device="cpu", dtype=torch.float16)
+            layer_indices = sorted(outputs_by_layer)
+            outputs = [[outputs_by_layer[layer][sample] for layer in layer_indices]
+                       for sample in range(inputs_embeds.shape[0])]
+            iga_scores = None
+            if iga_collector is not None:
+                measurements = capture.results[0].collections[iga_collector.name].measurements
+                iga_scores = [[measurements[iga_collector.measurement_key(layer)][0][sample]
+                               for layer in layer_indices] for sample in range(inputs_embeds.shape[0])]
+            logits = result.logits.detach().to(device="cpu", dtype=torch.float16)
     finally:
-        for handle in handles:
-            handle.remove()
-    return outputs, iga, logits
+        model.config.output_attentions = original_output_attentions
+    return outputs, iga_scores, logits
 
 
 # ============================================================================
-# PHASE 5. ANALYSE CAPTURED DATA
+# PHASE 4. ANALYSE CAPTURED DATA
 # ============================================================================
 def layer_mse(
     base_outputs: list[list[torch.Tensor]],
@@ -521,7 +462,7 @@ def main() -> int:
         # Inputs from phase 1:
         # dataset: datasets.Dataset, selected rows with local images.
         # batches: list[list[dict[str, Any]]], Python row dictionaries grouped for forwarding.
-        # per_sample: list[dict[str, Any]], initialized metric rows filled in phases 3–4.
+        # per_sample: list[dict[str, Any]], initialized metric rows filled in phase 3.
         # Alternate checkpoint loads per batch to cap retained host/GPU memory.
         for batch_index, samples in enumerate(batches, start=1):
             batch_started = time.perf_counter()
@@ -541,8 +482,8 @@ def main() -> int:
             )
             if args.timing:
                 log(f"[timing] Base model load: {time.perf_counter() - base_load_started:.2f} s", flush=True)
-            # 3–4. REGISTER BASE HOOKS AND FORWARD THE BATCH.
-            # Hook setup, capture, and cleanup are grouped in the helper.
+            # 3. CAPTURE AND FORWARD THE BASE BATCH.
+            # The helper opens a capture scope around the forward and removes hooks on exit.
             # Inputs from phase 2:
             # base_adapter: Any, QIG LLaVA adapter that preprocesses and forwards this batch.
             # samples: list[dict[str, Any]], this batch's calibration rows.
@@ -588,7 +529,7 @@ def main() -> int:
                 log(f"[timing] Quantized model load: {time.perf_counter() - quant_load_started:.2f} s", flush=True)
             quant_adapter = make_process_model(runtime, quant_lm)
             # =====================================================================
-            # 3–4. REGISTER QUANTIZED HOOKS AND FORWARD THE SAME BATCH
+            # 3. CAPTURE AND FORWARD THE QUANTIZED BATCH
             # =====================================================================
             # Inputs from the base pass:
             # inputs_embeds: torch.Tensor, CPU [batch, sequence, hidden], shared model input.
@@ -670,9 +611,9 @@ def main() -> int:
                 torch.cuda.empty_cache()
 
         # =====================================================================
-        # 5. ANALYSE CAPTURED DATA
+        # 4. ANALYSE CAPTURED DATA
         # =====================================================================
-        # Inputs from phases 3–4:
+        # Inputs from phase 3:
         # per_sample: list[dict[str, Any]], Python scalar metrics and per-layer float lists.
         # layer_count: int, decoder-layer count shared by base and quantized models.
         if layer_count is None:

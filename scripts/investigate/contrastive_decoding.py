@@ -577,13 +577,7 @@ def main() -> int:
                 torch.cuda.manual_seed_all(seed)
 
         # ====================================================================
-        # 3. REGISTER HOOKS
-        # ====================================================================
-        # This generation comparison needs no capture hooks; model-level forward hooks would add overhead.
-        log("No capture hooks required for token-level decoding comparison", level="extensive")
-
-        # ====================================================================
-        # 4. FORWARD CALIBRATION SAMPLES
+        # 3. GENERATE CALIBRATION RESPONSES
         # ====================================================================
         with results_path.open("w", encoding="utf-8") as result_file:
             for sample_index, sample in enumerate(dataset, start=1):
@@ -723,7 +717,7 @@ def main() -> int:
                 log(f"Sample {sample_index}/{len(dataset)} saved", level="extensive")
 
         # ====================================================================
-        # 5. ANALYSE DECODED OUTPUTS
+        # 4. ANALYSE DECODED OUTPUTS
         # ====================================================================
         metadata = {
             "expert_model": str(expert_checkpoint), "amateur_model": str(amateur_checkpoint),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import re
 import sys
 import time
 from pathlib import Path
@@ -21,62 +20,12 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
+from attention_quantization.inspection import LlavaInspector, TensorCapture  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 
 
 # ============================================================================
-# PHASE 3. REGISTER HOOKS
-# ============================================================================
-def register_layernorm_hooks(
-    model: torch.nn.Module,
-    active_sample: dict[str, Any],
-) -> list[torch.utils.hooks.RemovableHandle]:
-    """Register hooks that capture decoder inputs after input LayerNorm.
-
-    Args:
-        model: Loaded LLaVA model containing decoder ``input_layernorm`` modules.
-        active_sample: Mutable state with an ``activations`` mapping. Each
-            layer index maps to one CPU float16 activation tensor [sequence, hidden].
-
-    Returns:
-        Hook handles. The caller must remove every handle in a ``finally`` block.
-    """
-    # handles: list[torch.utils.hooks.RemovableHandle], registered hooks for caller cleanup.
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-    for name, module in model.named_modules():
-        match = re.search(r"(?:^|\.)layers\.(\d+)\.input_layernorm$", name)
-        if match is None or "vision_tower" in name:
-            continue
-        layer_index = int(match.group(1))
-
-        def capture_activation(
-            _module: Any,
-            _inputs: Any,
-            output: Any,
-            *,
-            index: int = layer_index,
-        ) -> None:
-            # activation: torch.Tensor, [batch, sequence, hidden], LayerNorm output.
-            activation = output[0] if isinstance(output, tuple) else output
-            if not torch.is_tensor(activation) or activation.ndim != 3:
-                return
-            # Keep only one sample on CPU; do not retain the forward graph or
-            # accumulate all layer activations on the GPU.
-            # Select batch item 0: [batch, sequence, hidden] -> [sequence, hidden].
-            # active_sample["activations"][index]: torch.Tensor, CPU float16 [sequence, hidden], detached sample capture.
-            active_sample["activations"][index] = activation[0].detach().to(
-                device="cpu", dtype=torch.float16
-            )
-
-        handles.append(module.register_forward_hook(capture_activation))
-
-    if not handles:
-        raise RuntimeError("No decoder input_layernorm modules were found in the loaded model")
-    return handles
-
-
-# ============================================================================
-# PHASE 5. ANALYSE CAPTURED DATA
+# PHASE 4. ANALYSE CAPTURED DATA
 # ============================================================================
 def layerwise_pca(
     activation_samples: list[dict[int, torch.Tensor]],
@@ -330,7 +279,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Run the five phases: data, model, hooks, forward capture, then PCA plots."""
+    """Run the four phases: data, model, forward capture, then PCA plots."""
     args = parse_args()
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
@@ -411,125 +360,106 @@ def main() -> int:
             log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
-        # 3. REGISTER HOOKS
+        # 3. CAPTURE AND FORWARD CALIBRATION SAMPLES
         # =====================================================================
-        # Inputs from phases 1–2:
-        # model: torch.nn.Module, loaded LLaVA model containing decoder LayerNorms.
-        # dataset: datasets.Dataset, rows forwarded one at a time in phase 4.
-        hooks_started = time.perf_counter() if args.timing else None
-        # active_sample: dict[str, Any], mutable hook state reset for each input sample.
-        # active_sample["activations"]: dict[int, torch.Tensor], layer index -> CPU float16 [sequence, hidden].
-        active_sample: dict[str, Any] = {"activations": {}}
-        hook_handles = register_layernorm_hooks(model, active_sample)
-        log(f"Registered hooks on {len(hook_handles)} decoder input LayerNorm modules")
-        if hooks_started is not None:
-            log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
-
-        # =====================================================================
-        # 4. FORWARD CALIBRATION SAMPLES
-        # =====================================================================
-        # Inputs from phase 3:
-        # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
-        # active_sample: dict[str, Any], layer index -> CPU float16 [sequence, hidden] activation.
+        inspector = LlavaInspector(model)
         log(f"Forwarding {len(dataset):,} samples one at a time...")
         # activation_samples: list[dict[int, torch.Tensor]], per-sample CPU float16 [sequence, hidden] activations.
         activation_samples: list[dict[int, torch.Tensor]] = []
         # token_masks: list[tuple[torch.Tensor, torch.Tensor]], per-sample CPU bool [sequence] image/text masks.
         token_masks: list[tuple[torch.Tensor, torch.Tensor]] = []
-        try:
-            for index, sample in enumerate(dataset, start=1):
-                sample_started = time.perf_counter() if args.timing else None
-                # active_sample["activations"]: dict[int, torch.Tensor], reset for this sample's hook captures.
-                active_sample["activations"] = {}
-                # row: dict[str, Any], QIG input with conversations, stable sample id, and local-image sentinel.
-                row = {
-                    "conversations": sample["conversations"],
-                    "id": sample.get("id", str(index)),
-                    "image": "local",
-                }
-                # prepared: Any, adapter-preprocessed single-sample row.
-                prepared = input_adapter.preprocess_data([sample["image"]], row)
-                # batch: dict[str, Any], collated multimodal sample consumed by generate_input.
-                batch = input_adapter.data_collator([prepared])
-                # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
-                # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
-                prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
+        for index, sample in enumerate(dataset, start=1):
+            sample_started = time.perf_counter() if args.timing else None
+            # row: dict[str, Any], QIG input with conversations, stable sample id, and local-image sentinel.
+            row = {
+                "conversations": sample["conversations"],
+                "id": sample.get("id", str(index)),
+                "image": "local",
+            }
+            # prepared: Any, adapter-preprocessed single-sample row.
+            prepared = input_adapter.preprocess_data([sample["image"]], row)
+            # batch: dict[str, Any], collated multimodal sample consumed by generate_input.
+            batch = input_adapter.data_collator([prepared])
+            # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
+            # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
+            prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
 
-                # Both token masks are CPU boolean vectors [sequence], so their
-                # combination and later PCA indexing use one consistent device.
-                # attention_mask: torch.Tensor, CPU bool [sequence], valid token positions.
-                attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
-                # image_mask: torch.Tensor, CPU bool [sequence], image-token positions.
-                image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
-                # text_mask: torch.Tensor, CPU bool [sequence], valid non-image token positions.
-                text_mask = attention_mask & ~image_mask
-                if not image_mask.any() or not text_mask.any():
-                    raise ValueError("Could not identify image and text token positions")
-                log(
-                    f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
-                    f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
-                    f"text_tokens={int(text_mask.sum())}",
-                    level="extensive",
-                )
+            # Both token masks are CPU boolean vectors [sequence], so their
+            # combination and later PCA indexing use one consistent device.
+            # attention_mask: torch.Tensor, CPU bool [sequence], valid token positions.
+            attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+            # image_mask: torch.Tensor, CPU bool [sequence], image-token positions.
+            image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+            # text_mask: torch.Tensor, CPU bool [sequence], valid non-image token positions.
+            text_mask = attention_mask & ~image_mask
+            if not image_mask.any() or not text_mask.any():
+                raise ValueError("Could not identify image and text token positions")
+            log(
+                f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
+                f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
+                f"text_tokens={int(text_mask.sum())}",
+                level="extensive",
+            )
 
-                forward_started = time.perf_counter() if args.timing else None
-                with torch.inference_mode():
-                # outputs: ModelOutput, logits [batch, sequence, vocabulary] plus model metadata.
-                outputs = input_adapter(
+            forward_started = time.perf_counter() if args.timing else None
+            # Capture CPU float16 [sequence, hidden] activations for batch item 0.
+            with torch.inference_mode(), inspector.capture(
+                targets=[TensorCapture("input_norm.output")], storage="cpu",
+                dtype=torch.float16, scoped=True,
+            ) as capture:
+                with capture.forward():
+                    outputs = input_adapter(
                         inputs_embeds=prompt_inputs["inputs_embeds"],
                         attention_mask=prompt_kwargs["attention_mask"],
-                        labels=prompt_kwargs["labels"],
-                        use_cache=False,
-                        return_dict=True,
+                        labels=prompt_kwargs["labels"], use_cache=False, return_dict=True,
                     )
-                # Model output logits have shape [batch, sequence, vocabulary].
-                if forward_started is not None:
-                    log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
-                if not active_sample["activations"]:
-                    raise RuntimeError("No layernorm hooks captured activations")
-                # first_activation: torch.Tensor, CPU float16 [sequence, hidden], example captured layer output.
-                first_activation = active_sample["activations"][min(active_sample["activations"])]
-                log(
-                    f"Sample {index}: logits={tuple(outputs.logits.shape)}, "
-                    f"captured_layers={len(active_sample['activations'])}, "
-                    f"activation_shape={tuple(first_activation.shape)}",
-                    level="extensive",
+                activations = {layer: calls[0][0] for (layer, _), calls in capture.results[0].tensors.items()}
+            capture.clear()
+            # Model output logits have shape [batch, sequence, vocabulary].
+            if forward_started is not None:
+                log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
+            if not activations:
+                raise RuntimeError("No layernorm hooks captured activations")
+            # first_activation: torch.Tensor, CPU float16 [sequence, hidden], example captured layer output.
+            first_activation = activations[min(activations)]
+            log(
+                f"Sample {index}: logits={tuple(outputs.logits.shape)}, "
+                f"captured_layers={len(activations)}, "
+                f"activation_shape={tuple(first_activation.shape)}",
+                level="extensive",
+            )
+
+            if args.plot_scope == "all":
+                # activation_samples entry: dict[int, torch.Tensor], CPU float16 [sequence, hidden] per layer.
+                activation_samples.append(activations)
+                # token_masks entry: tuple[torch.Tensor, torch.Tensor], CPU bool [sequence] image/text masks.
+                token_masks.append((image_mask, text_mask))
+            else:
+                analyse_started = time.perf_counter() if args.timing else None
+                # projected: dict[int, tuple[torch.Tensor, torch.Tensor]], layer -> coordinates [tokens, 2], labels [tokens].
+                projected = layerwise_pca(
+                    [activations],
+                    [(image_mask, text_mask)],
+                    balance_pca=args.balance_pca,
+                    seed=seed,
                 )
-
-                if args.plot_scope == "all":
-                    # activation_samples entry: dict[int, torch.Tensor], CPU float16 [sequence, hidden] per layer.
-                    activation_samples.append(active_sample["activations"])
-                    # token_masks entry: tuple[torch.Tensor, torch.Tensor], CPU bool [sequence] image/text masks.
-                    token_masks.append((image_mask, text_mask))
-                else:
-                    analyse_started = time.perf_counter() if args.timing else None
-                    # projected: dict[int, tuple[torch.Tensor, torch.Tensor]], layer -> coordinates [tokens, 2], labels [tokens].
-                    projected = layerwise_pca(
-                        [active_sample["activations"]],
-                        [(image_mask, text_mask)],
-                        balance_pca=args.balance_pca,
-                        seed=seed,
-                    )
-                    log(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers", level="extensive")
-                    show_activation_pca(
-                        projected,
-                        f"Sample {index}: post-input-LayerNorm activations",
-                        args.save_dir,
-                        output_name=f"sample_{index:04d}_activation_pca.png",
-                    )
-                    if analyse_started is not None:
-                        log(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
-                if sample_started is not None:
-                    log(f"[timing] Sample {index} total: {time.perf_counter() - sample_started:.2f} s")
-                del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
-        finally:
-            for handle in hook_handles:
-                handle.remove()
+                log(f"[{index}/{len(dataset)}] PCA calculated for {len(projected)} layers", level="extensive")
+                show_activation_pca(
+                    projected,
+                    f"Sample {index}: post-input-LayerNorm activations",
+                    args.save_dir,
+                    output_name=f"sample_{index:04d}_activation_pca.png",
+                )
+                if analyse_started is not None:
+                    log(f"[timing] Sample {index} PCA and plot: {time.perf_counter() - analyse_started:.2f} s")
+            if sample_started is not None:
+                log(f"[timing] Sample {index} total: {time.perf_counter() - sample_started:.2f} s")
+            del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
 
         # =====================================================================
-        # 5. ANALYSE ACTIVATIONS
+        # 4. ANALYSE ACTIVATIONS
         # =====================================================================
-        # Inputs from phase 4:
+        # Inputs from phase 3:
         # activation_samples: list[dict[int, torch.Tensor]], CPU float16 [sequence, hidden] by layer and sample.
         # token_masks: list[tuple[torch.Tensor, torch.Tensor]], CPU bool [sequence] image/text masks per sample.
         if args.plot_scope == "all":

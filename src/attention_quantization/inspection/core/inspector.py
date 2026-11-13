@@ -45,7 +45,7 @@ class ModelInspector(ABC):
         raise ValueError("This inspector does not support attention-output release")
 
     def capture(self, *, targets, layers=None, storage=None, directory=None,
-                dtype=None, scoped=False, sink=None, retain_tensors=True,
+                dtype=None, scoped=False, sink=None, retain_tensors=True, retain_gradients=True,
                 release_attention=False):
         """Create a session from collector classes or configured instances.
 
@@ -54,11 +54,14 @@ class ModelInspector(ABC):
         storage is live, cpu, or disk; disk requires directory. dtype applies to
         detached storage. scoped captures only inside session.forward(). The
         optional synchronous sink receives each completed capture; retain_tensors
-        controls raw result retention. release_attention drops returned weights
+        controls raw result retention. retain_gradients controls whether full
+        derivatives are saved in addition to collector measurements.
+        release_attention drops returned weights
         after all collection consumers have processed them.
         """
         return CaptureSession(
             self, targets=targets, layers=layers, storage=storage,
             directory=directory, dtype=dtype, scoped=scoped, sink=sink,
-            retain_tensors=retain_tensors, release_attention=release_attention,
+            retain_tensors=retain_tensors, retain_gradients=retain_gradients,
+            release_attention=release_attention,
         )

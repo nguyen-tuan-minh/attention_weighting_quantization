@@ -27,98 +27,13 @@ from attention_quantization.data import (  # noqa: E402
     get_data_paths,
     load_sharegpt4v_dataset,
 )
+from attention_quantization.inspection import LlavaInspector, IGACollector, AttentionWeightsCollector  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
 
 
 # ============================================================================
-# PHASE 3. REGISTER HOOKS
-# ============================================================================
-def register_attention_hooks(
-    model: torch.nn.Module,
-    mode: str,
-    active_sample: dict[str, Any],
-) -> list[torch.utils.hooks.RemovableHandle]:
-    """Register language-attention hooks for IGA maps or saved matrices.
-
-    Args:
-        model: Loaded LLaVA model containing decoder self-attention modules.
-        mode: ``online`` reduces attention to per-image-token IGA scores;
-            ``save`` writes raw matrices to the active sample directory.
-        active_sample: Shared state schema:
-            ``directory`` is an optional output path; ``captured`` is the
-            current sample's matrix count; ``text_mask`` and ``image_mask`` are
-            boolean [sequence] masks; ``iga`` maps layer names to CPU
-            [image_tokens] scores. Reset sample-scoped values before each
-            forward.
-
-    Returns:
-        Hook handles that the caller must remove in a ``finally`` block.
-
-    Hook contract:
-        Read post-softmax weights [batch, heads, query, key]. In online mode,
-        select text queries and image keys, then average over heads and queries
-        to produce one [image_tokens] vector. In save mode, write the raw matrix
-        as CPU float16. The attention output is left unchanged.
-    """
-    # handles: list[torch.utils.hooks.RemovableHandle], active hooks to return for caller cleanup.
-    handles = []
-    for name, module in model.named_modules():
-        if not name.endswith(".self_attn") or "vision_tower" in name:
-            continue
-
-        layer_name = name.replace(".", "_")
-
-        def save_attention(
-            _module: Any,
-            _inputs: Any,
-            output: Any,
-            *,
-            key: str = layer_name,
-        ) -> None:
-            if not isinstance(output, tuple) or len(output) < 2:
-                return
-            # attention_weights: torch.Tensor, [batch, heads, sequence, sequence], post-softmax weights.
-            attention_weights = output[1]
-            if not torch.is_tensor(attention_weights):
-                return
-
-            if mode == "save":
-                output_dir = active_sample["directory"]
-                if output_dir is None:
-                    return
-                # Saved attention shape is [batch, heads, sequence, sequence].
-                torch.save(
-                    attention_weights.detach().to(device="cpu", dtype=torch.float16),
-                    output_dir / f"{key}.pt",
-                )
-            else:
-                # For each layer, average post-softmax attention over text
-                # query positions and heads to get one score per image token.
-                # text_mask: torch.Tensor, bool [sequence] on attention device, text query positions.
-                text_mask = active_sample["text_mask"].to(attention_weights.device)
-                # image_mask: torch.Tensor, bool [sequence] on attention device, image key positions.
-                image_mask = active_sample["image_mask"].to(attention_weights.device)
-                # Shape after selection: heads x text queries x image keys.
-                # Select one batch item then query/key masks:
-                # [heads, sequence, sequence] -> [heads, text_queries, image_keys].
-                # text_to_image: torch.Tensor, [heads, text_queries, image_tokens], selected attention slice.
-                text_to_image = attention_weights[0][:, text_mask, :][:, :, image_mask]
-                # Average heads and text queries -> one score per image key.
-                # active_sample["iga"][key]: torch.Tensor, CPU [image_tokens], per-layer mean attention scores.
-                active_sample["iga"][key] = text_to_image.float().mean(dim=(0, 1)).cpu()
-            # active_sample["captured"]: int, incremented once for each module capture in this forward.
-            active_sample["captured"] += 1
-
-        handles.append(module.register_forward_hook(save_attention))
-
-    if not handles:
-        raise RuntimeError("No text self-attention modules were found in the loaded model")
-    return handles
-
-
-# ============================================================================
-# PHASE 5. ANALYSE CAPTURED ATTENTION
+# PHASE 4. ANALYSE CAPTURED ATTENTION
 # ============================================================================
 def show_iga_heatmap(
     source_image: Image.Image,
@@ -350,7 +265,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Run the five phases: dataset, model, hooks, sample forwards, and heatmaps."""
+    """Run the four phases: dataset, model, captured forwards, and heatmaps."""
     args = parse_args()
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
@@ -438,12 +353,9 @@ def main() -> int:
             log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
-        # 3. REGISTER ATTENTION HOOKS
+        # 3. CAPTURE AND FORWARD CALIBRATION SAMPLES
         # =====================================================================
-        # Inputs from phases 1–2:
-        # model: torch.nn.Module, loaded LLaVA model whose self-attention is hooked.
-        # dataset: datasets.Dataset, selected rows that phase 4 forwards.
-        hooks_started = time.perf_counter() if args.timing else None
+        inspector = LlavaInspector(model)
         attention_dir = repository_path(
             dataset_config.get(
                 "attention_output_dir",
@@ -452,170 +364,152 @@ def main() -> int:
         )
         if args.mode == "save":
             attention_dir.mkdir(parents=True, exist_ok=True)
-        # active_sample: dict[str, Any], per-sample state read and mutated by hooks.
-        # active_sample["directory"]: pathlib.Path | None, current raw-map output folder.
-        # active_sample["captured"]: int, number of attention modules run in current forward.
-        # active_sample["text_mask"] / ["image_mask"]: torch.Tensor | None, CPU bool [sequence] token masks.
-        # active_sample["iga"]: dict[str, torch.Tensor], layer name -> CPU [image_tokens] scores.
-        active_sample: dict[str, Any] = {
-            "directory": None,
-            "captured": 0,
-            "text_mask": None,
-            "image_mask": None,
-            "iga": {},
-        }
-        hook_handles = register_attention_hooks(model, args.mode, active_sample)
-        log(f"Registered hooks on {len(hook_handles)} self-attention layers")
-        if hooks_started is not None:
-            log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
-
-        # =====================================================================
-        # 4. FORWARD CALIBRATION SAMPLES
-        # =====================================================================
-        # Inputs from phase 3:
-        # hook_handles: list[torch.utils.hooks.RemovableHandle], hooks removed in finally.
-        # active_sample: dict[str, Any], hook state with CPU masks and per-layer CPU scores.
+        # Preserve historical module-based filenames and online layer labels.
+        module_names = {id(module): name.replace(".", "_") for name, module in model.named_modules()}
+        layer_names = {target.layer: module_names[id(target.module)] for target in inspector.targets()
+                       if target.name == "attention.weights"}
         log(f"Forwarding {len(dataset):,} samples one at a time...")
-        try:
-            for index, sample in enumerate(dataset, start=1):
-                sample_started = time.perf_counter() if args.timing else None
-                sample_dir = attention_dir / f"sample_{index:04d}" if args.mode == "save" else None
-                if sample_dir is not None:
-                    sample_dir.mkdir(parents=True, exist_ok=True)
-                # active_sample["directory"]: pathlib.Path | None, current sample's raw-map folder.
-                active_sample["directory"] = sample_dir
-                # active_sample["captured"]: int, reset to zero before this sample's forward pass.
-                active_sample["captured"] = 0
-                # active_sample["iga"]: dict[str, torch.Tensor], reset for current layer captures.
-                active_sample["iga"] = {}
-
-                user_text = next(
-                    (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"human", "user"}),
-                    "",
-                )
-                assistant_text = next(
-                    (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"gpt", "assistant"}),
-                    "",
-                )
-                # Input row schema consumed by the QIG adapter: conversation
-                # turns, stable sample id, and the local-image sentinel.
-                # row: dict[str, Any], QIG adapter input with conversations, sample id, and local-image sentinel.
-                row = {
-                    "conversations": sample["conversations"],
-                    "id": sample.get("id", str(index)),
-                    "image": "local",
-                }
-                # prepared: Any, adapter-preprocessed single-sample row.
-                prepared = input_adapter.preprocess_data([sample["image"]], row)
-                # batch: dict[str, Any], collated multimodal sample for input generation.
-                batch = input_adapter.data_collator([prepared])
-                # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
-                # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
-                prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
-                # Adapter masks may arrive on different devices; these CPU masks are moved to attention device by hooks.
-                # attention_mask: torch.Tensor, CPU bool [sequence], valid positions for this sample.
-                attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
-                # image_mask: torch.Tensor, CPU bool [sequence], image positions for this sample.
-                image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
-                # text_mask: torch.Tensor, CPU bool [sequence], valid non-image positions before query filtering.
-                text_mask = attention_mask & ~image_mask
-                if not image_mask.any() or not text_mask.any():
-                    raise ValueError("Could not identify text-query and image-key token positions")
-                # Image positions are [image_tokens]; use the final position to
-                # restrict IGA query rows to text after the image.
-                # image_end: torch.Tensor, scalar index of the final image token in the sequence.
-                image_end = image_mask.nonzero(as_tuple=True)[0][-1]
-                # text_mask after in-place filter: CPU bool [sequence], text query positions after final image token.
-                text_mask &= torch.arange(text_mask.numel()) > image_end
-                if not text_mask.any():
-                    raise ValueError("No text query tokens occur after the image tokens")
+        for index, sample in enumerate(dataset, start=1):
+            sample_started = time.perf_counter() if args.timing else None
+            sample_dir = attention_dir / f"sample_{index:04d}" if args.mode == "save" else None
+            if sample_dir is not None:
+                sample_dir.mkdir(parents=True, exist_ok=True)
+            user_text = next(
+                (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"human", "user"}),
+                "",
+            )
+            assistant_text = next(
+                (turn.get("value", "") for turn in sample["conversations"] if turn.get("from") in {"gpt", "assistant"}),
+                "",
+            )
+            # Input row schema consumed by the QIG adapter: conversation
+            # turns, stable sample id, and the local-image sentinel.
+            # row: dict[str, Any], QIG adapter input with conversations, sample id, and local-image sentinel.
+            row = {
+                "conversations": sample["conversations"],
+                "id": sample.get("id", str(index)),
+                "image": "local",
+            }
+            # prepared: Any, adapter-preprocessed single-sample row.
+            prepared = input_adapter.preprocess_data([sample["image"]], row)
+            # batch: dict[str, Any], collated multimodal sample for input generation.
+            batch = input_adapter.data_collator([prepared])
+            # prompt_inputs: dict[str, Any], model inputs including embeddings [batch, sequence, hidden].
+            # prompt_kwargs: dict[str, Any], adapter masks/labels and additional forward arguments.
+            prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
+            # Adapter masks may arrive on different devices; these CPU masks are moved to attention device by hooks.
+            # attention_mask: torch.Tensor, CPU bool [sequence], valid positions for this sample.
+            attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+            # image_mask: torch.Tensor, CPU bool [sequence], image positions for this sample.
+            image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu()
+            # text_mask: torch.Tensor, CPU bool [sequence], valid non-image positions before query filtering.
+            text_mask = attention_mask & ~image_mask
+            if not image_mask.any() or not text_mask.any():
+                raise ValueError("Could not identify text-query and image-key token positions")
+            # Image positions are [image_tokens]; use the final position to
+            # restrict IGA query rows to text after the image.
+            # image_end: torch.Tensor, scalar index of the final image token in the sequence.
+            image_end = image_mask.nonzero(as_tuple=True)[0][-1]
+            # text_mask after in-place filter: CPU bool [sequence], text query positions after final image token.
+            text_mask &= torch.arange(text_mask.numel()) > image_end
+            if not text_mask.any():
+                raise ValueError("No text query tokens occur after the image tokens")
+            log(
+                f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
+                f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
+                f"text_query_tokens={int(text_mask.sum())}",
+                level="extensive",
+            )
+            if sample_started is not None:
                 log(
-                    f"Sample {index} id={row['id']}: embeds={tuple(prompt_inputs['inputs_embeds'].shape)}, "
-                    f"valid_tokens={int(attention_mask.sum())}, image_tokens={int(image_mask.sum())}, "
-                    f"text_query_tokens={int(text_mask.sum())}",
-                    level="extensive",
+                    f"[timing] Sample {index} preprocessing: "
+                    f"{time.perf_counter() - sample_started:.2f} s",
                 )
-                # active_sample["image_mask"]: CPU bool [sequence], current sample's image key mask.
-                active_sample["image_mask"] = image_mask
-                # active_sample["text_mask"]: CPU bool [sequence], current sample's post-image text query mask.
-                active_sample["text_mask"] = text_mask
-                if sample_started is not None:
-                    log(
-                        f"[timing] Sample {index} preprocessing: "
-                        f"{time.perf_counter() - sample_started:.2f} s",
-                    )
 
-                forward_started = time.perf_counter() if args.timing else None
-                with torch.inference_mode():
-                    # outputs: ModelOutput, logits [batch, sequence, vocabulary] plus forward metadata.
+            forward_started = time.perf_counter() if args.timing else None
+            def save_attention(_forward, layer, _target, _call, tensor):
+                """Write one CPU float16 attention matrix using its historical filename."""
+                torch.save(tensor, sample_dir / f"{layer_names[layer]}.pt")
+
+            collector = (AttentionWeightsCollector() if args.mode == "save" else
+                         IGACollector(query_mask=text_mask, image_mask=image_mask))
+            with torch.inference_mode(), inspector.capture(
+                targets=[collector], storage="cpu", scoped=True,
+                dtype=torch.float16 if args.mode == "save" else None,
+                sink=save_attention if args.mode == "save" else None,
+                retain_tensors=False,
+            ) as capture:
+                with capture.forward():
                     outputs = input_adapter(
                         inputs_embeds=prompt_inputs["inputs_embeds"],
                         attention_mask=prompt_kwargs["attention_mask"],
-                        labels=prompt_kwargs["labels"],
-                        use_cache=False,
-                        return_dict=True,
+                        labels=prompt_kwargs["labels"], use_cache=False, return_dict=True,
                     )
-                # Forward logits shape: [batch, sequence, vocabulary].
-                if forward_started is not None:
-                    log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
-                if active_sample["captured"] == 0:
-                    raise RuntimeError(
-                        "Attention hooks captured no weights; check the Transformers attention implementation"
-                    )
-                log(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}", level="extensive")
+                captured = len(capture.results[0].tensors)
+                layer_scores = {}
+                if args.mode == "online":
+                    measurements = capture.results[0].collections[collector.name].measurements
+                    layer_scores = {layer_names[layer]: calls[0][0]
+                                    for (layer, _), calls in measurements.items()}
+                    del measurements
+            capture.clear()
+            # Forward logits shape: [batch, sequence, vocabulary].
+            if forward_started is not None:
+                log(f"[timing] Sample {index} forward: {time.perf_counter() - forward_started:.2f} s")
+            if captured == 0:
+                raise RuntimeError(
+                    "Attention hooks captured no weights; check the Transformers attention implementation"
+                )
+            log(f"[{index}/{len(dataset)}] logits {tuple(outputs.logits.shape)}", level="extensive")
+            log(
+                f"[{index}/{len(dataset)}] captured_attention_layers={captured}",
+                level="extensive",
+            )
+            if args.mode == "online":
+                # layer_scores: dict[str, torch.Tensor], CPU [image_tokens] IGA maps for this sample.
+                if not layer_scores:
+                    raise RuntimeError("No per-layer IGA scores were captured")
+                # Combine per-layer [image_tokens] vectors into one
+                # [layers * image_tokens] vector for the sample summary.
+                # score_values: torch.Tensor, [layers * image_tokens], concatenated layer scores.
+                score_values = torch.cat(list(layer_scores.values()))
                 log(
-                    f"[{index}/{len(dataset)}] captured_attention_layers={active_sample['captured']}",
+                    f"[{index}/{len(dataset)}] IGA layers={len(layer_scores)}, "
+                    f"image-token scores min={score_values.min():.6g}, "
+                    f"mean={score_values.mean():.6g}, max={score_values.max():.6g}",
                     level="extensive",
                 )
-                if args.mode == "online":
-                    # layer_scores: dict[str, torch.Tensor], CPU [image_tokens] IGA maps for this sample.
-                    layer_scores = active_sample["iga"]
-                    if not layer_scores:
-                        raise RuntimeError("No per-layer IGA scores were captured")
-                    # Combine per-layer [image_tokens] vectors into one
-                    # [layers * image_tokens] vector for the sample summary.
-                    # score_values: torch.Tensor, [layers * image_tokens], concatenated layer scores.
-                    score_values = torch.cat(list(layer_scores.values()))
+                # Print the conversation before showing the image and every layer's map.
+                log(f"[{index}/{len(dataset)}] Conversation:", level="extensive")
+                log(f"  USER: {user_text}", level="extensive")
+                log(f"  ASSISTANT: {assistant_text}", level="extensive")
+                plot_started = time.perf_counter() if args.timing else None
+                show_iga_heatmap(
+                    sample["image"],
+                    layer_scores,
+                    index,
+                    heatmap_only=args.heatmap_only,
+                    attention_percent=args.true_attention_percent,
+                    top_iga_percent=args.top_iga_percent,
+                )
+                if plot_started is not None:
                     log(
-                        f"[{index}/{len(dataset)}] IGA layers={len(layer_scores)}, "
-                        f"image-token scores min={score_values.min():.6g}, "
-                        f"mean={score_values.mean():.6g}, max={score_values.max():.6g}",
-                        level="extensive",
+                        f"[timing] Sample {index} heatmap display: "
+                        f"{time.perf_counter() - plot_started:.2f} s",
                     )
-                    # Print the conversation before showing the image and every layer's map.
-                    log(f"[{index}/{len(dataset)}] Conversation:", level="extensive")
-                    log(f"  USER: {user_text}", level="extensive")
-                    log(f"  ASSISTANT: {assistant_text}", level="extensive")
-                    plot_started = time.perf_counter() if args.timing else None
-                    show_iga_heatmap(
-                        sample["image"],
-                        layer_scores,
-                        index,
-                        heatmap_only=args.heatmap_only,
-                        attention_percent=args.true_attention_percent,
-                        top_iga_percent=args.top_iga_percent,
-                    )
-                    if plot_started is not None:
-                        log(
-                            f"[timing] Sample {index} heatmap display: "
-                            f"{time.perf_counter() - plot_started:.2f} s",
-                        )
-                else:
-                    log(
-                        f"  Saved {active_sample['captured']} attention matrices to {sample_dir}",
-                        level="extensive",
-                    )
-                del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
-        finally:
-            for handle in hook_handles:
-                handle.remove()
+            else:
+                log(
+                    f"  Saved {captured} attention matrices to {sample_dir}",
+                    level="extensive",
+                )
+            del outputs, prompt_inputs, prompt_kwargs, batch, prepared, sample
 
         # =====================================================================
-        # 5. ANALYSE CAPTURED ATTENTION
+        # 4. ANALYSE CAPTURED ATTENTION
         # =====================================================================
-        # Inputs from phase 4:
+        # Inputs from phase 3:
         # attention_dir: pathlib.Path, save directory for CPU float16 [batch, heads, sequence, sequence] matrices.
-        # dataset: datasets.Dataset, forwarded subset whose online plots were shown per sample in phase 4.
+        # dataset: datasets.Dataset, forwarded subset whose online plots were shown per sample in phase 3.
 
         if args.mode == "online":
             log("Online IGA heatmap display complete; no attention maps were saved.")

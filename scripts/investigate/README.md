@@ -4,7 +4,7 @@ This directory contains exploratory and diagnostic scripts for the LLaVA/QIG
 workflow. New investigation scripts should follow the common structure below so
 they are easy to run, compare, and maintain.
 
-## The five phases
+## The four phases
 
 Use these numbered section headings in `main()` so the workflow is easy to scan
 and familiar across investigation scripts:
@@ -18,20 +18,21 @@ and familiar across investigation scripts:
    explicit. The base model is the reference; the quantized model is the model
    under investigation. Do not require a quantized checkpoint for base-only
    analysis.
-3. **REGISTER HOOKS** — register only the hooks needed to capture the
-   investigation's measurements (for example, attention weights or activations)
-   and report how many hooks were attached. Remove hooks in a `finally` block.
-4. **FORWARD CALIBRATION SAMPLES** — preprocess and run the selected examples
-   with gradients disabled. Use consistent inputs, sample order, labels, and
-   masks across compared models. Move retained measurements to CPU promptly
-   and release per-sample/model memory when practical.
-5. **ANALYSE CAPTURED DATA** — compute the investigation-specific statistics,
+3. **CAPTURE AND FORWARD CALIBRATION SAMPLES** — preprocess samples, configure
+   collector instances with their masks, and open `LlavaInspector.capture(...)`
+   around each measured forward. Attach hooks and execute the forward in this
+   same phase; use the context manager for cleanup on success or failure.
+   Use consistent inputs, sample order, labels, and masks across compared models.
+   Normally run with gradients disabled. Move retained measurements to CPU
+   promptly and release per-sample/model memory when practical. Generation-only
+   comparisons can use a generation-specific phase title without capture hooks.
+4. **ANALYSE CAPTURED DATA** — compute the investigation-specific statistics,
    plots, or comparisons; save outputs in documented formats and locations; and
    print a concise completion message and output path. The existing attention
    script calls this phase `ANALYSE CAPTURED ATTENTION`, and the PCA script calls
    it `ANALYSE ACTIVATIONS`; use a specific noun where it improves clarity.
 
-Phase 4 normally runs inference without gradients. A gradient investigation can
+Phase 3 normally runs inference without gradients. A gradient investigation can
 enable gradients deliberately; document which activations require gradients and
 which loss is differentiated so this exception is clear.
 
@@ -43,7 +44,39 @@ greedy answer for each selected image before the script computes its gradient
 analysis; the script still performs that analysis and displays its plots.
 
 Read CLI arguments and configs before phase 1, and validate them before loading
-large resources. These setup steps do not replace or renumber the five phases.
+large resources. These setup steps do not replace or renumber the four phases.
+
+### Capture scopes
+
+Use collector classes or instances through the public inspector interface;
+scripts should not register forward hooks or maintain capture-enabled dictionaries.
+Masks and measurement labels belong to collectors. Use `scoped=True` and a
+`capture.forward()` context to validate that every requested target was observed.
+Retrieve measurements with the collector's `measurement_key(layer)` or its result
+namespace. For gradient investigations, compute derivatives inside the measured
+scope and retain only reduced scores when raw captures are not needed:
+
+```python
+collector = GradientImportanceCollector(
+    gradient_target="attention.value", reduction="sum_squared", accumulate=True,
+)
+with torch.enable_grad(), inspector.capture(
+    targets=[collector], storage="cpu", scoped=True,
+    retain_tensors=False, retain_gradients=False,
+) as capture:
+    with capture.forward():
+        outputs = model(**inputs)
+        for index, loss in enumerate(token_losses(outputs)):
+            capture.compute_gradients(loss, retain_graph=index + 1 < answer_count)
+```
+
+Generation and candidate continuation run outside these scopes. Interactive
+candidate scoring opens its own temporary scope on the selected model. Raw
+attention saving uses a sink to write one CPU float16 matrix at a time, preserving
+the historical module-based filenames. Error correlation retains float16 hidden
+outputs and float32 IGA scores. Gradient importance sums per-token squared
+gradients; overlap takes the L2 norm of the mean-answer-loss gradient. Keep those
+definitions separate when choosing collectors.
 
 ## Phase organization
 

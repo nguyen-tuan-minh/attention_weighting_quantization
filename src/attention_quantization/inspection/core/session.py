@@ -10,14 +10,15 @@ class CaptureSession:
 
     def __init__(self, inspector, *, targets, layers=None, storage=None,
                  directory=None, dtype=None, scoped=False, sink=None,
-                 retain_tensors=True, release_attention=False):
+                 retain_tensors=True, retain_gradients=True, release_attention=False):
         """Resolve collector dependencies and configure lifecycle/storage policy.
 
         targets contains public collector classes or configured instances; masks
         and analysis settings belong to those collectors. Storage defaults to live
         if any collector requires gradients and CPU otherwise. scoped enables
         explicit measured-forward boundaries. sink receives completed capture
-        values synchronously. No hooks attach until the session is entered.
+        values synchronously. retain_gradients=False discards full derivatives
+        after collection reductions. No hooks attach until the session is entered.
         """
         self.inspector = inspector
         self.collector = inspector.collection_group(targets)
@@ -25,6 +26,7 @@ class CaptureSession:
         self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory, dtype)
         self.scoped, self.sink = scoped, sink
         self.retain_tensors, self.release_attention = retain_tensors, release_attention
+        self.retain_gradients = retain_gradients
         self._in_forward = False
         requested = self.collector.required_targets()
         requested = set(requested)
@@ -111,7 +113,7 @@ class CaptureSession:
             self._live[(record.index, key, call)] = tensor
         keep_raw, measured = self.collector.process_tensor(record, target, tensor, call, self._store_tree)
         if keep_raw:
-            stored = self.storage.save(tensor)
+            stored = self.storage.save(tensor) if self.retain_tensors or self.sink is not None else None
             calls.append(stored if self.retain_tensors else None)
         else:
             stored = measured
@@ -130,6 +132,8 @@ class CaptureSession:
         Returns:
             The forward's gradient dictionary, keyed by (layer, target), with
             stored tensors appended in objective order then module-call order.
+            It remains empty when retain_gradients=False; collector measurements
+            are still populated.
 
         Updates gradients and derived measurements without modifying parameter
         .grad fields. Releases private graph references unless retaining them.
@@ -142,7 +146,8 @@ class CaptureSession:
         values = [self._live[identity] for identity in identities]
         gradients = self.inspector.gradient_collector().compute(loss, values, retain_graph=retain_graph)
         for (_, key, call), gradient in zip(identities, gradients):
-            record.gradients.setdefault(key, []).append(self.storage.save(gradient))
+            if self.retain_gradients:
+                record.gradients.setdefault(key, []).append(self.storage.save(gradient))
             self.collector.process_gradient(
                 record, key, call, gradient,
                 self._store_tree, self._load_tree,

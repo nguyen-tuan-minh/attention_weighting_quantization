@@ -25,6 +25,8 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.inspection import LlavaInspector, GradientImportanceCollector  # noqa: E402
+from attention_quantization.inspection.core.session import CaptureSession  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 from attention_quantization.interactive_terminal import (  # noqa: E402
     InteractiveSessionExit,
@@ -35,120 +37,18 @@ from investigation_logging import configure_logging, log  # noqa: E402
 
 
 # ============================================================================
-# PHASE 3. REGISTER HOOKS
+# PHASE 3. CAPTURE, FORWARD, AND SCORE SAMPLES
 # ============================================================================
-def register_decoder_activation_hooks(
-    model: torch.nn.Module,
-    active_sample: dict[str, Any],
-    capture_point: str,
-) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture selected decoder activations without changing model computation.
-
-    Args:
-        model: Loaded LLaVA causal language model with decoder blocks at
-            ``model.model.layers``.
-        active_sample: Mutable state whose ``layer_activations`` key maps each
-            decoder-layer index to a live tensor [batch, sequence, hidden].
-            The mapping is cleared before each sample; captured tensors remain
-            attached to the current forward graph.
-        capture_point: ``block_input`` for pre-normalization block inputs,
-            ``after_layer_norm`` for the output of each block's input norm, or
-            ``value`` for the output of the self-attention value projection.
-
-    Returns:
-        Hook handles. The caller must remove every handle in a ``finally`` block.
-
-    Hook contract:
-        For ``block_input``, read the first positional input to each decoder
-        block with a forward-pre-hook. For ``after_layer_norm``, read the
-        output of that block's ``input_layernorm``; for ``value``, read the
-        output of ``self_attn.v_proj``. Both use forward hooks. Store
-        the [batch, sequence, hidden] tensor by layer index; neither hook
-        changes model values.
-    """
-    if capture_point not in {"block_input", "after_layer_norm", "value"}:
+def activation_target(capture_point: str) -> str:
+    """Resolve the investigation CLI capture point to an inspector tensor target."""
+    targets = {"block_input": "block.input", "after_layer_norm": "input_norm.output", "value": "attention.value"}
+    if capture_point not in targets:
         raise ValueError(f"Unsupported activation capture point: {capture_point}")
-    layers = getattr(getattr(model, "model", None), "layers", None)
-    if layers is None:
-        raise RuntimeError("Could not find decoder blocks at model.model.layers")
-
-    # handles: list[torch.utils.hooks.RemovableHandle], hooks removed after all forwards.
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-    for layer_index, layer in enumerate(layers):
-        def store_activation(activation: Any, *, index: int) -> None:
-            if not torch.is_tensor(activation) or activation.ndim != 3:
-                shape = tuple(activation.shape) if torch.is_tensor(activation) else type(activation).__name__
-                raise RuntimeError(
-                    f"Decoder layer {index} captured an invalid activation; expected "
-                    f"[batch, sequence, hidden], got {shape}"
-                )
-            if not activation.requires_grad:
-                raise RuntimeError(
-                    f"Decoder layer {index} activation does not require gradients; "
-                    "ensure the model forward runs with gradients enabled"
-                )
-            # active_sample["layer_activations"][index]: torch.Tensor, live [batch, sequence, hidden] selected activation.
-            active_sample["layer_activations"][index] = activation
-
-        if capture_point == "block_input":
-            def capture_block_input(
-                _module: Any,
-                inputs: tuple[Any, ...],
-                *,
-                index: int = layer_index,
-            ) -> None:
-                if not active_sample.get("capture_enabled", True):
-                    return
-                if not inputs:
-                    raise RuntimeError(f"Decoder layer {index} received no hidden-state input")
-                store_activation(inputs[0], index=index)
-
-            handles.append(layer.register_forward_pre_hook(capture_block_input))
-        elif capture_point == "after_layer_norm":
-            layer_norm = getattr(layer, "input_layernorm", None)
-            if layer_norm is None:
-                raise RuntimeError(f"Decoder layer {layer_index} has no input_layernorm module")
-
-            def capture_after_layer_norm(
-                _module: Any,
-                _inputs: tuple[Any, ...],
-                output: Any,
-                *,
-                index: int = layer_index,
-            ) -> None:
-                if not active_sample.get("capture_enabled", True):
-                    return
-                store_activation(output, index=index)
-
-            handles.append(layer_norm.register_forward_hook(capture_after_layer_norm))
-        else:
-            attention = getattr(layer, "self_attn", None)
-            value_projection = getattr(attention, "v_proj", None)
-            if value_projection is None:
-                raise RuntimeError(
-                    f"Decoder layer {layer_index} has no self_attn.v_proj for value capture"
-                )
-
-            def capture_value_projection(
-                _module: Any,
-                _inputs: tuple[Any, ...],
-                output: Any,
-                *,
-                index: int = layer_index,
-            ) -> None:
-                if not active_sample.get("capture_enabled", True):
-                    return
-                store_activation(output, index=index)
-
-            handles.append(value_projection.register_forward_hook(capture_value_projection))
-
-    if not handles:
-        raise RuntimeError("No decoder blocks were found in the loaded model")
-    return handles
+    return targets[capture_point]
 
 
 # ============================================================================
-# PHASE 4. FORWARD SAMPLES AND BACKPROPAGATE ASSISTANT TOKEN LOSSES
+# CAPTURE, FORWARD, AND SCORE HELPERS
 # ============================================================================
 def _generate_assistant_once(
     input_adapter: Any,
@@ -157,7 +57,7 @@ def _generate_assistant_once(
     max_new_tokens: int,
     *,
     interactive: bool = False,
-    active_sample: dict[str, Any] | None = None,
+    capture_target: str = "block.input",
     sample_number: int = 1,
     heatmap_only: bool = False,
     scale: str = "log",
@@ -179,7 +79,7 @@ def _generate_assistant_once(
             user message, an id, and the local-image sentinel.
         max_new_tokens: Maximum number of generated assistant tokens.
         interactive: Generate the complete answer, then inspect positions and alternatives.
-        active_sample: Hook state required to inspect candidate gradient scores.
+        capture_target: Semantic activation target used during candidate scoring.
         sample_number: One-based calibration sample number for candidate heatmaps.
         heatmap_only: Use the separate-reference-image heatmap layout.
         scale: Heatmap color normalization, logarithmic or linear.
@@ -302,8 +202,6 @@ def _generate_assistant_once(
     ).strip()
     inspection_action = None
     if interactive:
-        if active_sample is None:
-            raise RuntimeError("Interactive inspection requires activation-hook state")
         log(f"GENERATED ASSISTANT ({sampling_mode}): {assistant_text}", level="normal")
         # initial_question: str, latest user-turn text currently used to condition this generated answer.
         initial_question = next(
@@ -340,7 +238,7 @@ def _generate_assistant_once(
             inspection_kwargs["show_gradient_heatmaps_fn"] = show_interactive_gradient_heatmaps
         inspection_action = inspect_generated_token_positions(
             input_adapter,
-            active_sample,
+            capture_target,
             prompt_inputs["inputs_embeds"],
             prompt_kwargs["attention_mask"],
             prompt_kwargs["vision_mask"][0].bool().detach().cpu(),
@@ -364,7 +262,7 @@ def generate_assistant_reply(
     max_new_tokens: int,
     *,
     interactive: bool = False,
-    active_sample: dict[str, Any] | None = None,
+    capture_target: str = "block.input",
     sample_number: int = 1,
     heatmap_only: bool = False,
     scale: str = "log",
@@ -383,7 +281,7 @@ def generate_assistant_reply(
         prompt_row: Adapter conversation through the initial user question.
         max_new_tokens: Per-generation assistant token cap.
         interactive: Run the two-screen token and candidate interface.
-        active_sample: Shared hook state used for candidate gradient inspection.
+        capture_target: Semantic activation target used for candidate gradient inspection.
         sample_number: One-based sample index shown in visualization titles.
         heatmap_only: Display plain patch maps beside a reference image.
         scale: Gradient-plot color scale.
@@ -414,7 +312,7 @@ def generate_assistant_reply(
             current_prompt_row,
             max_new_tokens,
             interactive=interactive,
-            active_sample=active_sample,
+            capture_target=capture_target,
             sample_number=sample_number,
             heatmap_only=heatmap_only,
             scale=scale,
@@ -491,178 +389,79 @@ def score_assistant_token_losses(
     labels: torch.Tensor,
     image_mask: torch.Tensor,
     text_mask: torch.Tensor,
-    layer_activations: dict[int, torch.Tensor],
+    capture: CaptureSession,
+    collector: GradientImportanceCollector,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], list[float]]:
-    """Sum squared selected-activation gradients for each answer-token CE.
+    """Sum each answer-token CE's squared activation gradients, then split modalities.
 
-    Args:
-        logits: Model output logits [1, sequence, vocabulary] for one sample.
-        labels: CPU integer token labels [sequence]; ``-100`` marks positions
-            that are not assistant answer targets.
-        image_mask: CPU boolean [sequence] mask selecting image tokens.
-        text_mask: CPU boolean [sequence] mask selecting valid non-image text tokens.
-        layer_activations: Layer index -> live selected activation tensor
-            [1, sequence, hidden] captured by phase 3.
-
-    Returns:
-        Image and text score dictionaries map each layer to CPU float32 vectors
-        over their respective positions. Each score sums squared gradients over
-        assistant answer tokens and hidden features. ``token_losses`` contains
-        each scalar CE in answer-token order for logging.
-
-    Assumptions:
-        The forward batch has one sample, logits and labels have matching
-        sequence length, and every captured decoder activation participates in the
-        loss graph. This performs one backward calculation per assistant token.
+    logits is [1, sequence, vocabulary]; labels and modality masks are CPU
+    [sequence] vectors. capture must be inside the measured forward with a
+    sum_squared, accumulating collector. Returns per-layer CPU float32 image/text
+    vectors and per-token scalar losses. Full derivative tensors are not retained.
     """
     if logits.ndim != 3 or logits.shape[0] != 1:
-        raise ValueError(f"Expected one-sample logits [1, sequence, vocabulary], got {tuple(logits.shape)}")
-    if labels.ndim != 1 or labels.numel() != logits.shape[1]:
-        raise ValueError("Labels must be [sequence] and align with the model logits")
-    if image_mask.ndim != 1 or image_mask.numel() != logits.shape[1]:
-        raise ValueError("Image mask must be [sequence] and align with the model logits")
-    if text_mask.ndim != 1 or text_mask.numel() != logits.shape[1]:
-        raise ValueError("Text mask must be [sequence] and align with the model logits")
-    if not layer_activations:
-        raise RuntimeError("Activation hooks captured no layer activations")
-
-    # answer_positions: torch.Tensor, CPU long [answer_tokens], shifted label indices to score.
+        raise ValueError("Expected one-sample logits [1, sequence, vocabulary]")
+    for name, vector in (("labels", labels), ("image_mask", image_mask), ("text_mask", text_mask)):
+        if vector.ndim != 1 or vector.numel() != logits.shape[1]:
+            raise ValueError(f"{name} must be [sequence] and align with logits")
     answer_positions = labels[1:].ne(-100).nonzero(as_tuple=True)[0] + 1
     if answer_positions.numel() == 0:
         raise ValueError("Sample has no assistant answer tokens with valid CE targets")
-
-    layer_indices = sorted(layer_activations)
-    captured_activations = [layer_activations[index] for index in layer_indices]
-    for layer_index, activation in zip(layer_indices, captured_activations):
-        if activation.shape[0] != 1 or activation.shape[1] != logits.shape[1]:
-            raise RuntimeError(
-                f"Layer {layer_index} activation shape {tuple(activation.shape)} does not align "
-                "with the one-sample logits"
-            )
-
-    # image_scores: dict[int, torch.Tensor], layer -> CPU float32 zeros [image_tokens], accumulated for this sample.
-    image_scores: dict[int, torch.Tensor] = {
-        layer_index: torch.zeros(int(image_mask.sum()), dtype=torch.float32)
-        for layer_index in layer_indices
-    }
-    # text_scores: dict[int, torch.Tensor], layer -> CPU float32 zeros [text_tokens], accumulated for this sample.
-    text_scores: dict[int, torch.Tensor] = {
-        layer_index: torch.zeros(int(text_mask.sum()), dtype=torch.float32)
-        for layer_index in layer_indices
-    }
-    # token_losses: list[float], detached scalar CE values in answer-token order.
-    token_losses: list[float] = []
-    answer_token_count = int(answer_positions.numel())
-
-    for token_number, target_position_tensor in enumerate(answer_positions):
-        target_position = int(target_position_tensor)
-        # target: torch.Tensor, device-local long [1], one assistant token id.
-        target = labels[target_position].to(device=logits.device, dtype=torch.long).reshape(1)
-        # token_logits: torch.Tensor, float [1, vocabulary], preceding-position logits for this target.
-        token_logits = logits[0, target_position - 1].float().unsqueeze(0)
-        # token_loss: torch.Tensor, scalar, CE for this single assistant answer token.
-        token_loss = F.cross_entropy(token_logits, target)
-        token_losses.append(float(token_loss.detach().cpu()))
-
-        # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] gradient per selected layer activation.
-        gradients = torch.autograd.grad(
-            token_loss,
-            tuple(captured_activations),
-            retain_graph=token_number + 1 < answer_token_count,
-            allow_unused=False,
-        )
-        for layer_index, gradient in zip(layer_indices, gradients):
-            # image_gradient: torch.Tensor, float [image_tokens, hidden], this CE's image-token input gradients.
-            image_gradient = gradient[0, image_mask.to(gradient.device), :].float()
-            # image_scores[layer_index]: torch.Tensor, CPU float32 [image_tokens], sum of squared gradients so far.
-            image_scores[layer_index] += image_gradient.square().sum(dim=-1).detach().cpu()
-            # text_gradient: torch.Tensor, float [text_tokens, hidden], this CE's valid text-token input gradients.
-            text_gradient = gradient[0, text_mask.to(gradient.device), :].float()
-            # text_scores[layer_index]: torch.Tensor, CPU float32 [text_tokens], sum of squared gradients so far.
-            text_scores[layer_index] += text_gradient.square().sum(dim=-1).detach().cpu()
-
+    token_losses = []
+    for index, position in enumerate(answer_positions.tolist()):
+        target = labels[position].to(device=logits.device, dtype=torch.long).reshape(1)
+        loss = F.cross_entropy(logits[0, position - 1].float().unsqueeze(0), target)
+        token_losses.append(float(loss.detach().cpu()))
+        capture.compute_gradients(loss, retain_graph=index + 1 < answer_positions.numel())
+    # Measurements contain one accumulated [sequence] vector for batch item 0.
+    measurements = capture.results[-1].collections[collector.name].measurements
+    image_scores, text_scores = {}, {}
+    for (layer, _), calls in measurements.items():
+        scores = calls[0][0]
+        image_scores[layer] = scores[image_mask.to(scores.device)].detach().cpu()
+        text_scores[layer] = scores[text_mask.to(scores.device)].detach().cpu()
     return image_scores, text_scores, token_losses
 
 
 def score_candidate_token_gradients(
     model: torch.nn.Module,
-    active_sample: dict[str, Any],
+    capture_target: str,
     prefix_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     image_mask: torch.Tensor,
     text_mask: torch.Tensor,
     candidate_token_id: torch.Tensor,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], float]:
-    """Score one candidate token's CE gradient over image and text positions.
+    """Capture and differentiate one candidate CE with temporary inspector hooks.
 
-    Args:
-        model: Loaded LLaVA causal language model.
-        active_sample: Hook state populated with live selected activations during
-            this temporary gradient-enabled forward.
-        prefix_embeds: Full prompt and accepted-token embeddings [1, sequence, hidden].
-        attention_mask: Device-local bool [1, sequence] valid prefix positions.
-        image_mask: CPU bool [sequence] positions belonging to the input image.
-        text_mask: CPU bool [sequence] valid non-image positions in the full prefix.
-        candidate_token_id: Device-local long [1, 1] candidate continuation token.
-
-    Returns:
-        Image and text score dictionaries map each layer to CPU float32 vectors
-        over their token positions, plus the candidate CE scalar.
-
-    Side effects:
-        Temporarily enables and populates the existing activation hooks; clears
-        captured graph references and disables capture before returning.
+    Prefix embeddings are [1, sequence, hidden]; modality masks are CPU
+    [sequence]. capture_target names the selected decoder activation. Returns
+    per-layer CPU float32 squared-gradient vectors and the scalar candidate CE.
+    The capture context removes hooks and live graph references on all exits.
     """
-    if image_mask.numel() != prefix_embeds.shape[1]:
-        raise ValueError("Image mask must align with the full candidate prefix")
-    if text_mask.numel() != prefix_embeds.shape[1]:
-        raise ValueError("Text mask must align with the full candidate prefix")
-    # active_sample["layer_activations"]: dict[int, torch.Tensor], reset for this candidate's gradient forward.
-    active_sample["layer_activations"] = {}
-    # active_sample["capture_enabled"]: bool, enable hooks for the candidate-conditioned scoring forward.
-    active_sample["capture_enabled"] = True
-    # grad_prefix: torch.Tensor, gradient-enabled [1, sequence, hidden] full prompt and chosen prefix embeddings.
+    for mask in (image_mask, text_mask):
+        if mask.ndim != 1 or mask.numel() != prefix_embeds.shape[1]:
+            raise ValueError("Modality masks must align with the full candidate prefix")
+    collector = GradientImportanceCollector(gradient_target=capture_target, reduction="sum_squared")
+    inspector = LlavaInspector(model)
     grad_prefix = prefix_embeds.detach().requires_grad_(True)
-    try:
-        with torch.enable_grad():
-            # outputs: ModelOutput, logits for the full candidate prefix.
-            outputs = model(
-                inputs_embeds=grad_prefix,
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-            # candidate_loss: torch.Tensor, scalar CE for the candidate at the final prefix position.
-            candidate_loss = F.cross_entropy(
-                outputs.logits[:, -1, :].float(),
-                candidate_token_id.to(device=outputs.logits.device, dtype=torch.long).reshape(1),
-            )
-            # layer_indices: list[int], decoder layers whose selected activations were captured.
-            layer_indices = sorted(active_sample["layer_activations"])
-            if not layer_indices:
-                raise RuntimeError("Candidate gradient hooks captured no decoder activations")
-            # captured_activations: list[torch.Tensor], one live [1, sequence, hidden] tensor per decoder layer.
-            captured_activations = [active_sample["layer_activations"][index] for index in layer_indices]
-            # gradients: tuple[torch.Tensor, ...], one [1, sequence, hidden] candidate CE gradient per layer.
-            gradients = torch.autograd.grad(candidate_loss, tuple(captured_activations))
-            # candidate_image_scores: dict[int, torch.Tensor], layer -> CPU float32 [image_tokens] squared-gradient sums.
-            candidate_image_scores = {}
-            # candidate_text_scores: dict[int, torch.Tensor], layer -> CPU float32 [text_tokens] squared-gradient sums.
-            candidate_text_scores = {}
-            for layer_index, gradient in zip(layer_indices, gradients):
-                # image_gradient: torch.Tensor, float [image_tokens, hidden], candidate's image-position gradient.
-                image_gradient = gradient[0, image_mask.to(gradient.device), :].float()
-                candidate_image_scores[layer_index] = image_gradient.square().sum(dim=-1).detach().cpu()
-                # text_gradient: torch.Tensor, float [text_tokens, hidden], candidate's valid-text-position gradient.
-                text_gradient = gradient[0, text_mask.to(gradient.device), :].float()
-                candidate_text_scores[layer_index] = text_gradient.square().sum(dim=-1).detach().cpu()
-            # candidate_loss_value: float, detached scalar CE for the selected candidate.
-            candidate_loss_value = float(candidate_loss.detach().cpu())
-    finally:
-        # active_sample state: clear graph-owning tensors and disable hooks after this candidate inspection.
-        active_sample["layer_activations"] = {}
-        active_sample["capture_enabled"] = False
-    return candidate_image_scores, candidate_text_scores, candidate_loss_value
+    with torch.enable_grad(), inspector.capture(
+        targets=[collector], storage="cpu", scoped=True,
+        retain_tensors=False, retain_gradients=False,
+    ) as capture:
+        with capture.forward():
+            outputs = model(inputs_embeds=grad_prefix, attention_mask=attention_mask,
+                            use_cache=False, return_dict=True)
+            loss = F.cross_entropy(outputs.logits[:, -1, :].float(),
+                                   candidate_token_id.to(device=outputs.logits.device, dtype=torch.long).reshape(1))
+            capture.compute_gradients(loss)
+            measurements = capture.results[0].collections[collector.name].measurements
+            image_scores = {layer: calls[0][0][image_mask.to(calls[0][0].device)].detach().cpu()
+                            for (layer, _), calls in measurements.items()}
+            text_scores = {layer: calls[0][0][text_mask.to(calls[0][0].device)].detach().cpu()
+                           for (layer, _), calls in measurements.items()}
+            loss_value = float(loss.detach().cpu())
+    return image_scores, text_scores, loss_value
 
 
 def generate_candidate_continuation(
@@ -733,7 +532,7 @@ def generate_candidate_continuation(
 
 
 # ============================================================================
-# PHASE 5. DISPLAY AND OPTIONALLY SAVE GRADIENT HEATMAPS
+# PHASE 4. DISPLAY AND OPTIONALLY SAVE GRADIENT HEATMAPS
 # ============================================================================
 def show_large_source_image(source_image: Image.Image, sample_number: int) -> None:
     """Display a sample image alone in a large figure for visual inspection.
@@ -1137,7 +936,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Run dataset setup, model loading, hooks, per-token backprop, and display."""
+    """Run dataset setup, model loading, scoped capture/backprop, and display."""
     args = parse_args()
     configure_logging(args.log_level, quiet_warnings=args.quiet_warnings)
     args.timing = args.timing or args.log_level == "extensive"
@@ -1258,218 +1057,173 @@ def main() -> int:
             log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # =====================================================================
-        # 3. REGISTER HOOKS
+        # 3. CAPTURE, FORWARD, AND SCORE SAMPLES
         # =====================================================================
-        # Inputs from phases 1–2:
-        # model: torch.nn.Module, frozen LLaVA model whose selected decoder activations are differentiated.
-        # dataset: datasets.Dataset, selected examples processed one at a time.
-        hooks_started = time.perf_counter() if args.timing else None
-        # active_sample: dict[str, Any], hook state for the current sample and selected forward.
-        # active_sample["layer_activations"]: dict[int, torch.Tensor], layer -> live [batch, sequence, hidden] activation.
-        # active_sample["capture_enabled"]: bool, false during inference-only answer generation, true for scored forward.
-        active_sample: dict[str, Any] = {"layer_activations": {}, "capture_enabled": True}
-        hook_handles = register_decoder_activation_hooks(model, active_sample, args.capture_point)
-        log(f"Registered {args.capture_point} hooks on {len(hook_handles)} layers")
-        if hooks_started is not None:
-            log(f"[timing] Register hooks: {time.perf_counter() - hooks_started:.2f} s")
-
-        # =====================================================================
-        # 4. FORWARD SAMPLES AND BACKPROPAGATE ASSISTANT TOKEN LOSSES
-        # =====================================================================
-        # Inputs from phase 3:
-        # hook_handles: list[torch.utils.hooks.RemovableHandle], removed in finally after all samples.
-        # active_sample["layer_activations"]: dict[int, torch.Tensor], reset per forward and retained for token gradients.
-        try:
-            for sample_index, sample in enumerate(dataset, start=1):
-                sample_started = time.perf_counter() if args.timing else None
-                # active_sample["layer_activations"]: dict[int, torch.Tensor], reset before this sample's scored forward.
-                active_sample["layer_activations"] = {}
-                # source_conversations: list[dict[str, str]], original user/assistant turns from the dataset.
-                source_conversations = sample["conversations"]
-                # row: dict[str, Any], QIG adapter input with conversation, stable id, and local-image sentinel.
-                row = {
-                    "conversations": source_conversations,
-                    "id": str(sample.get("id", sample_index)),
-                    "image": "local",
-                }
-                image = sample["image"]
-                if hasattr(image, "convert"):
-                    image = image.convert("RGB")
-                if args.answer_mode in {"generate", "interactive"}:
-                    # user_turn_indices: list[int], positions of user turns available as generation context.
-                    user_turn_indices = [
-                        index
-                        for index, turn in enumerate(source_conversations)
-                        if turn.get("from") in {"human", "user"}
-                    ]
-                    if not user_turn_indices:
-                        raise ValueError(f"Sample {row['id']} has no user turn to generate from")
-                    # prompt_conversations: list[dict[str, str]], turns through the latest user message, without its answer.
-                    prompt_conversations = source_conversations[: user_turn_indices[-1] + 1]
-                    # prompt_row: dict[str, Any], user-context row consumed only for assistant generation.
-                    prompt_row = {**row, "conversations": prompt_conversations}
-                    generation_started = time.perf_counter() if args.timing else None
-                    # active_sample["capture_enabled"]: bool, suspend gradient hooks during no-grad generation.
-                    active_sample["capture_enabled"] = False
-                    try:
-                        assistant_text = generate_assistant_reply(
-                            input_adapter,
-                            image,
-                            prompt_row,
-                            args.max_new_tokens,
-                            interactive=args.answer_mode == "interactive",
-                            active_sample=active_sample,
-                            sample_number=sample_index,
-                            heatmap_only=args.heatmap_only,
-                            scale=args.scale,
-                            score_normalization=args.score_normalization,
-                            top_token_percent=args.top_token_percent,
-                            top_token_cumulative_percent=args.top_token_cumulative_percent,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                            interactive_timeout_seconds=interactive_timeout_seconds,
-                        )
-                    finally:
-                        # active_sample["capture_enabled"]: bool, re-enable hooks for the answer-scoring forward.
-                        active_sample["capture_enabled"] = True
-                    if not assistant_text:
-                        raise ValueError(f"Sample {row['id']} produced an empty assistant response")
-                    if args.answer_mode == "generate":
-                        log(
-                            f"[{sample_index}/{len(dataset)}] GENERATED ASSISTANT: {assistant_text}",
-                            level="normal",
-                        )
-                    if generation_started is not None:
-                        log(
-                            f"[timing] Sample {sample_index} generation: "
-                            f"{time.perf_counter() - generation_started:.2f} s"
-                        )
-                    # row["conversations"]: list[dict[str, str]], prompt turns plus generated assistant answer for scoring.
-                    row["conversations"] = prompt_conversations + [
-                        {"from": "gpt", "value": assistant_text}
-                    ]
-                # prepared: Any, one adapter-preprocessed multimodal row.
-                prepared = input_adapter.preprocess_data([image], row)
-                # batch: dict[str, Any], collated single-sample input to generate_input.
-                batch = input_adapter.data_collator([prepared])
-                # prompt_inputs: dict[str, Any], includes inputs_embeds [1, sequence, hidden].
-                # prompt_kwargs: dict[str, Any], adapter attention/vision masks and labels.
-                prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
-
-                # attention_mask: torch.Tensor, CPU bool [sequence], valid token positions.
-                attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
-                # image_mask: torch.Tensor, CPU bool [sequence], image-token positions restricted to valid tokens.
-                image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu() & attention_mask
-                # labels: torch.Tensor, CPU long [sequence], assistant target ids and -100 ignored positions.
-                labels = prompt_kwargs["labels"][0].detach().to(device="cpu", dtype=torch.long)
-                answer_token_count = int(labels[1:].ne(-100).sum())
-                if not image_mask.any():
-                    raise ValueError(f"Sample {row['id']} has no image tokens")
-                if answer_token_count == 0:
-                    raise ValueError(f"Sample {row['id']} has no assistant answer tokens")
-
-                # inputs_embeds: torch.Tensor, gradient-enabled [1, sequence, hidden] leaf on its adapter device.
-                # Detach prevents unnecessary gradient tracking through embedding/vision-tower computation.
-                inputs_embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
-                log(
-                    f"Sample {sample_index}/{len(dataset)} id={row['id']}: "
-                    f"embeds={tuple(inputs_embeds.shape)}, image_tokens={int(image_mask.sum())}, "
-                    f"assistant_tokens={answer_token_count}",
-                    level="extensive",
-                )
-
-                forward_started = time.perf_counter() if args.timing else None
-                with torch.enable_grad():
-                    # outputs: ModelOutput, logits [1, sequence, vocabulary] and model metadata.
-                    outputs = input_adapter(
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=prompt_kwargs["attention_mask"],
-                        # QIG's LLaVA adapter requires labels and uses them only to populate its output loss;
-                        # assistant-token gradients below still use the individual logits-derived CEs.
-                        labels=prompt_kwargs["labels"],
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    if not active_sample["layer_activations"]:
-                        raise RuntimeError("Activation hooks captured no decoder activations")
-                    expected_layers = len(model.model.layers)
-                    missing_layers = sorted(
-                        set(range(expected_layers)) - set(active_sample["layer_activations"])
-                    )
-                    if missing_layers:
-                        raise RuntimeError(f"Activation hooks missed layers {missing_layers}")
-                    # logits: torch.Tensor, [1, sequence, vocabulary], causal-LM output used for per-token CE.
-                    logits = outputs.logits
-                    # forward_layer_activations: dict[int, torch.Tensor], layer -> live selected [1, sequence, hidden] activation.
-                    forward_layer_activations = active_sample["layer_activations"]
-                    # text_mask: torch.Tensor, CPU bool [sequence], valid non-image tokens aligned to the expanded decoder input.
-                    text_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu() & ~image_mask
-                    # text_token_labels: list[str], decoded original text pieces aligned with text_mask positions.
-                    text_token_labels = decode_non_image_token_labels(input_adapter, batch)
-                    if len(text_token_labels) != int(text_mask.sum()):
-                        raise RuntimeError("Input text labels do not align with non-image decoder positions")
-                    # layer_scores/text_layer_scores: per-layer CPU float32 image/text position sums of squared gradients.
-                    layer_scores, text_layer_scores, token_losses = score_assistant_token_losses(
-                        logits,
-                        labels,
-                        image_mask,
-                        text_mask,
-                        forward_layer_activations,
-                    )
-                if forward_started is not None:
-                    log(f"[timing] Sample {sample_index} forward and token gradients: {time.perf_counter() - forward_started:.2f} s")
-                log(
-                    f"[{sample_index}/{len(dataset)}] scored {len(token_losses)} assistant CE tokens; "
-                    f"mean CE={sum(token_losses) / len(token_losses):.6g}",
-                )
-
-                # Clear references to the completed graph before drawing or forwarding the next sample.
-                active_sample["layer_activations"] = {}
-                del outputs, logits, forward_layer_activations, inputs_embeds
-                plot_started = time.perf_counter() if args.timing else None
-                image_output_path = show_gradient_heatmaps(
+        inspector = LlavaInspector(model)
+        capture_target = activation_target(args.capture_point)
+        for sample_index, sample in enumerate(dataset, start=1):
+            sample_started = time.perf_counter() if args.timing else None
+            # source_conversations: list[dict[str, str]], original user/assistant turns from the dataset.
+            source_conversations = sample["conversations"]
+            # row: dict[str, Any], QIG adapter input with conversation, stable id, and local-image sentinel.
+            row = {
+                "conversations": source_conversations,
+                "id": str(sample.get("id", sample_index)),
+                "image": "local",
+            }
+            image = sample["image"]
+            if hasattr(image, "convert"):
+                image = image.convert("RGB")
+            if args.answer_mode in {"generate", "interactive"}:
+                # user_turn_indices: list[int], positions of user turns available as generation context.
+                user_turn_indices = [
+                    index
+                    for index, turn in enumerate(source_conversations)
+                    if turn.get("from") in {"human", "user"}
+                ]
+                if not user_turn_indices:
+                    raise ValueError(f"Sample {row['id']} has no user turn to generate from")
+                # prompt_conversations: list[dict[str, str]], turns through the latest user message, without its answer.
+                prompt_conversations = source_conversations[: user_turn_indices[-1] + 1]
+                # prompt_row: dict[str, Any], user-context row consumed only for assistant generation.
+                prompt_row = {**row, "conversations": prompt_conversations}
+                generation_started = time.perf_counter() if args.timing else None
+                assistant_text = generate_assistant_reply(
+                    input_adapter,
                     image,
-                    layer_scores,
-                    sample_index,
-                    text_scores=text_layer_scores,
-                    text_labels=text_token_labels,
-                    modality="image",
+                    prompt_row,
+                    args.max_new_tokens,
+                    interactive=args.answer_mode == "interactive",
+                    capture_target=capture_target,
+                    sample_number=sample_index,
                     heatmap_only=args.heatmap_only,
                     scale=args.scale,
                     score_normalization=args.score_normalization,
                     top_token_percent=args.top_token_percent,
                     top_token_cumulative_percent=args.top_token_cumulative_percent,
-                    display=not args.no_display,
-                    save_dir=save_dir,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    interactive_timeout_seconds=interactive_timeout_seconds,
                 )
-                text_output_path = show_gradient_heatmaps(
-                    image,
-                    layer_scores,
-                    sample_index,
-                    text_scores=text_layer_scores,
-                    text_labels=text_token_labels,
-                    modality="text",
-                    heatmap_only=args.heatmap_only,
-                    scale=args.scale,
-                    score_normalization=args.score_normalization,
-                    display=not args.no_display,
-                    save_dir=save_dir,
-                )
-                if image_output_path is None and text_output_path is None:
-                    log(f"Displayed image and text gradient plots for sample {sample_index}")
-                if plot_started is not None:
-                    log(f"[timing] Sample {sample_index} plot: {time.perf_counter() - plot_started:.2f} s")
-                if sample_started is not None:
-                    log(f"[timing] Sample {sample_index} total: {time.perf_counter() - sample_started:.2f} s")
-                del layer_scores, text_layer_scores, text_mask, text_token_labels, token_losses, prompt_inputs, prompt_kwargs, batch, prepared, image, sample
-        finally:
-            for handle in hook_handles:
-                handle.remove()
+                if not assistant_text:
+                    raise ValueError(f"Sample {row['id']} produced an empty assistant response")
+                if args.answer_mode == "generate":
+                    log(
+                        f"[{sample_index}/{len(dataset)}] GENERATED ASSISTANT: {assistant_text}",
+                        level="normal",
+                    )
+                if generation_started is not None:
+                    log(
+                        f"[timing] Sample {sample_index} generation: "
+                        f"{time.perf_counter() - generation_started:.2f} s"
+                    )
+                # row["conversations"]: list[dict[str, str]], prompt turns plus generated assistant answer for scoring.
+                row["conversations"] = prompt_conversations + [
+                    {"from": "gpt", "value": assistant_text}
+                ]
+            # prepared: Any, one adapter-preprocessed multimodal row.
+            prepared = input_adapter.preprocess_data([image], row)
+            # batch: dict[str, Any], collated single-sample input to generate_input.
+            batch = input_adapter.data_collator([prepared])
+            # prompt_inputs: dict[str, Any], includes inputs_embeds [1, sequence, hidden].
+            # prompt_kwargs: dict[str, Any], adapter attention/vision masks and labels.
+            prompt_inputs, prompt_kwargs = input_adapter.generate_input(batch)
+
+            # attention_mask: torch.Tensor, CPU bool [sequence], valid token positions.
+            attention_mask = prompt_kwargs["attention_mask"][0].bool().detach().cpu()
+            # image_mask: torch.Tensor, CPU bool [sequence], image-token positions restricted to valid tokens.
+            image_mask = prompt_kwargs["vision_mask"][0].bool().detach().cpu() & attention_mask
+            # labels: torch.Tensor, CPU long [sequence], assistant target ids and -100 ignored positions.
+            labels = prompt_kwargs["labels"][0].detach().to(device="cpu", dtype=torch.long)
+            answer_token_count = int(labels[1:].ne(-100).sum())
+            if not image_mask.any():
+                raise ValueError(f"Sample {row['id']} has no image tokens")
+            if answer_token_count == 0:
+                raise ValueError(f"Sample {row['id']} has no assistant answer tokens")
+
+            # inputs_embeds: torch.Tensor, gradient-enabled [1, sequence, hidden] leaf on its adapter device.
+            # Detach prevents unnecessary gradient tracking through embedding/vision-tower computation.
+            inputs_embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
+            log(
+                f"Sample {sample_index}/{len(dataset)} id={row['id']}: "
+                f"embeds={tuple(inputs_embeds.shape)}, image_tokens={int(image_mask.sum())}, "
+                f"assistant_tokens={answer_token_count}",
+                level="extensive",
+            )
+
+            forward_started = time.perf_counter() if args.timing else None
+            text_mask = attention_mask & ~image_mask
+            text_token_labels = decode_non_image_token_labels(input_adapter, batch)
+            if len(text_token_labels) != int(text_mask.sum()):
+                raise RuntimeError("Input text labels do not align with non-image decoder positions")
+            collector = GradientImportanceCollector(
+                gradient_target=capture_target, reduction="sum_squared", accumulate=True,
+            )
+            with torch.enable_grad(), inspector.capture(
+                targets=[collector], storage="cpu", scoped=True,
+                retain_tensors=False, retain_gradients=False,
+            ) as capture:
+                with capture.forward():
+                    outputs = input_adapter(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=prompt_kwargs["attention_mask"],
+                        labels=prompt_kwargs["labels"], use_cache=False, return_dict=True,
+                    )
+                    logits = outputs.logits
+                    layer_scores, text_layer_scores, token_losses = score_assistant_token_losses(
+                        logits, labels, image_mask, text_mask, capture, collector,
+                    )
+            capture.clear()
+            if forward_started is not None:
+                log(f"[timing] Sample {sample_index} forward and token gradients: {time.perf_counter() - forward_started:.2f} s")
+            log(
+                f"[{sample_index}/{len(dataset)}] scored {len(token_losses)} assistant CE tokens; "
+                f"mean CE={sum(token_losses) / len(token_losses):.6g}",
+            )
+
+            # Clear references to the completed graph before drawing or forwarding the next sample.
+            del outputs, logits, inputs_embeds
+            plot_started = time.perf_counter() if args.timing else None
+            image_output_path = show_gradient_heatmaps(
+                image,
+                layer_scores,
+                sample_index,
+                text_scores=text_layer_scores,
+                text_labels=text_token_labels,
+                modality="image",
+                heatmap_only=args.heatmap_only,
+                scale=args.scale,
+                score_normalization=args.score_normalization,
+                top_token_percent=args.top_token_percent,
+                top_token_cumulative_percent=args.top_token_cumulative_percent,
+                display=not args.no_display,
+                save_dir=save_dir,
+            )
+            text_output_path = show_gradient_heatmaps(
+                image,
+                layer_scores,
+                sample_index,
+                text_scores=text_layer_scores,
+                text_labels=text_token_labels,
+                modality="text",
+                heatmap_only=args.heatmap_only,
+                scale=args.scale,
+                score_normalization=args.score_normalization,
+                display=not args.no_display,
+                save_dir=save_dir,
+            )
+            if image_output_path is None and text_output_path is None:
+                log(f"Displayed image and text gradient plots for sample {sample_index}")
+            if plot_started is not None:
+                log(f"[timing] Sample {sample_index} plot: {time.perf_counter() - plot_started:.2f} s")
+            if sample_started is not None:
+                log(f"[timing] Sample {sample_index} total: {time.perf_counter() - sample_started:.2f} s")
+            del layer_scores, text_layer_scores, text_mask, text_token_labels, token_losses, prompt_inputs, prompt_kwargs, batch, prepared, image, sample
 
         # =====================================================================
-        # 5. DISPLAY AND OPTIONALLY SAVE RESULTS
+        # 4. DISPLAY AND OPTIONALLY SAVE RESULTS
         # =====================================================================
-        # Phase 4 displayed one per-layer heatmap grid per sample; --heatmap-only omits source-image backgrounds.
+        # Phase 3 displayed one per-layer heatmap grid per sample; --heatmap-only omits source-image backgrounds.
         # PNG files are written only when ``--save-dir`` was supplied.
         log(f"Gradient-importance analysis complete for {len(dataset):,} samples.")
         if save_dir is not None:

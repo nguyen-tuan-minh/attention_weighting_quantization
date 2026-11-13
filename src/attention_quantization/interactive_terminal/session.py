@@ -18,7 +18,7 @@ from .terminal_io import read_timed_input
 
 def inspect_generated_token_positions(
     input_adapter: Any,
-    active_sample: dict[str, Any],
+    capture_target: str,
     prompt_embeds: torch.Tensor,
     prompt_attention_mask: torch.Tensor,
     prompt_image_mask: torch.Tensor,
@@ -45,6 +45,7 @@ def inspect_generated_token_positions(
 ) -> dict[str, Any] | None:
     """Inspect stored top-token distributions and candidate gradients by generated position.
 
+    capture_target is the semantic decoder activation passed to the scoring callback.
     The model generates the full answer before this UI starts. Each stored
     distribution is conditioned on the prefix before its numbered token. The
     user may inspect several positions and optionally display one candidate's
@@ -444,7 +445,7 @@ def inspect_generated_token_positions(
             )
             candidate_image_scores, candidate_text_scores, candidate_loss = score_candidate_token_gradients_fn(
                 input_adapter.model,
-                active_sample,
+                capture_target,
                 prefix_embeds,
                 prefix_attention_mask,
                 prefix_image_mask,

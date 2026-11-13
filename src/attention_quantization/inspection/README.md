@@ -194,7 +194,7 @@ construction. Call `session.clear()` between samples to release result reference
 ## Storage and cleanup
 
 `capture()` accepts explicit lifecycle/storage settings: `layers`, `storage`,
-`directory`, `dtype`, `scoped`, `sink`, `retain_tensors`, and `release_attention`.
+`directory`, `dtype`, `scoped`, `sink`, `retain_tensors`, `retain_gradients`, and `release_attention`.
 No shared analysis-options dictionary or named `collection` selector is used.
 
 Storage modes are `cpu` (detached copies), `live` (original tensors), and `disk`
@@ -210,6 +210,12 @@ names to stored measurement dictionaries. Reduced results always remain availabl
 in their collector namespaces. `retain_tensors=False` avoids retaining raw result
 values in the session; the sink must consume or write them promptly. Caller-owned
 disk files are never deleted by cleanup.
+
+For gradient reductions over many objectives, use `retain_tensors=False` and
+`retain_gradients=False` to keep only the reduced measurements. Private live
+activations still support differentiation, but full raw tensor snapshots and
+derivative tensors are not copied or accumulated in results. `compute_gradients`
+then returns an empty raw-gradient dictionary; read the collector measurements.
 
 Attention capture requires eager attention and `output_attentions=True` on the
 model. `release_attention=True` removes returned weights after registered capture

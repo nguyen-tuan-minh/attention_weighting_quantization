@@ -23,115 +23,13 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
+from attention_quantization.inspection import LlavaInspector, IGACollector, GradientImportanceCollector  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 from investigation_logging import configure_logging, log  # noqa: E402
 
 
 # ============================================================================
-# PHASE 3. REGISTER HOOKS
-# ============================================================================
-def register_overlap_hooks(
-    model: torch.nn.Module,
-    active_sample: dict[str, Any],
-    layer_indices: list[int],
-) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture selected value-projection tensors and reduce attention to IGA.
-
-    Args:
-        model: Frozen LLaVA causal language model with decoder layers under
-            ``model.model.layers``.
-        active_sample: Per-sample mutable state initialized with ``capture``
-            (bool), CPU ``image_mask`` and ``assistant_query_mask`` (bool
-            vectors), ``iga`` (layer -> CPU float32 [image_tokens]), and
-            ``value_tensors`` (layer -> live [1, sequence, hidden] tensors).
-        layer_indices: Decoder layers for which to collect both scores.
-
-    Returns:
-        Hook handles; the caller must remove each handle in ``finally``.
-
-    Hook contracts:
-        The ``v_proj`` hook stores its unchanged tensor output at selected
-        layers so gradients can later be taken with respect to each image
-        token's concatenated value-head vector. The ``self_attn`` hook reads
-        post-softmax attention, averages over heads and generated assistant
-        query tokens for each image key (IGA), then returns the original
-        attention output with only the large attention matrix replaced by
-        ``None``. Both hooks are inactive during greedy generation.
-    """
-    layers = getattr(getattr(model, "model", None), "layers", None)
-    if layers is None:
-        raise RuntimeError("Could not find decoder layers at model.model.layers")
-    invalid = [index for index in layer_indices if index < 0 or index >= len(layers)]
-    if invalid:
-        raise ValueError(
-            f"Requested overlap layers {invalid}, but model has {len(layers)} decoder layers"
-        )
-
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-    for layer_index in layer_indices:
-        layer = layers[layer_index]
-        attention = getattr(layer, "self_attn", None)
-        value_projection = getattr(attention, "v_proj", None)
-        if attention is None or value_projection is None:
-            raise RuntimeError(f"Decoder layer {layer_index} has no self_attn.v_proj module")
-
-        def capture_value(
-            _module: Any,
-            _inputs: Any,
-            output: Any,
-            *,
-            index: int = layer_index,
-        ) -> None:
-            if not active_sample["capture"]:
-                return
-            if not torch.is_tensor(output) or output.ndim != 3 or not output.requires_grad:
-                shape = tuple(output.shape) if torch.is_tensor(output) else type(output).__name__
-                raise RuntimeError(
-                    f"Layer {index} value projection must produce a grad-enabled "
-                    f"[batch, sequence, hidden] tensor; got {shape}"
-                )
-            # active_sample["value_tensors"][index]: Tensor, live [1, sequence, hidden] V projection.
-            active_sample["value_tensors"][index] = output
-
-        def capture_attention(
-            _module: Any,
-            _inputs: Any,
-            output: Any,
-            *,
-            index: int = layer_index,
-        ) -> Any:
-            if not active_sample["capture"]:
-                return output
-            if not isinstance(output, tuple) or len(output) < 2:
-                return output
-            # weights: Tensor, [batch, heads, query_sequence, key_sequence], post-softmax probabilities.
-            weights = output[1]
-            if not torch.is_tensor(weights) or weights.ndim != 4:
-                return output
-            # query_mask: Tensor, device bool [sequence], generated assistant query positions.
-            query_mask = active_sample["assistant_query_mask"].to(weights.device)
-            # image_mask: Tensor, device bool [sequence], image key positions in the expanded multimodal prompt.
-            image_mask = active_sample["image_mask"].to(weights.device)
-            if weights.shape[-2] != query_mask.numel() or weights.shape[-1] != image_mask.numel():
-                raise RuntimeError(
-                    f"Layer {index} attention shape {tuple(weights.shape)} does not match token masks"
-                )
-            if not query_mask.any() or not image_mask.any():
-                raise RuntimeError("IGA needs at least one assistant query and one image key")
-            # text_to_image: Tensor, float [heads, generated_queries, image_tokens], selected attention.
-            text_to_image = weights[0][:, query_mask, :][:, :, image_mask].detach().float()
-            # active_sample["iga"][index]: Tensor, CPU float32 [image_tokens], mean attention by image key.
-            active_sample["iga"][index] = text_to_image.mean(dim=(0, 1)).cpu()
-            return (output[0], None, *output[2:])
-
-        handles.append(value_projection.register_forward_hook(capture_value))
-        handles.append(attention.register_forward_hook(capture_attention))
-
-    return handles
-
-
-# ============================================================================
-# PHASE 4. GENERATE GREEDY ANSWERS, THEN FORWARD AND BACKPROPAGATE
+# PHASE 3. GENERATE GREEDY ANSWERS, THEN FORWARD AND BACKPROPAGATE
 # ============================================================================
 def generate_greedy_answer(
     input_adapter: Any,
@@ -215,7 +113,6 @@ def score_generated_answer(
     image: Any,
     prompt_row: dict[str, Any],
     generated_ids: torch.Tensor,
-    active_sample: dict[str, Any],
     layer_indices: list[int],
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Compute mean generated-answer CE and return per-layer IGA and V-gradient scores."""
@@ -231,7 +128,7 @@ def score_generated_answer(
     prompt_length = int(prompt_embeds.shape[1])
     # embedding_layer: Module, model token embedding table used to append greedy answer tokens.
     embedding_layer = input_adapter.model.get_input_embeddings()
-    # answer_ids: Tensor, embedding-device long [1, answer_tokens], exact greedy IDs generated in phase 4.
+    # answer_ids: Tensor, embedding-device long [1, answer_tokens], exact greedy IDs generated in phase 3.
     answer_ids = generated_ids.to(device=embedding_layer.weight.device, dtype=torch.long)
     # answer_embeds: Tensor, prompt-device [1, answer_tokens, hidden], value-independent token embeddings.
     answer_embeds = embedding_layer(answer_ids).to(device=prompt_embeds.device)
@@ -251,12 +148,6 @@ def score_generated_answer(
     # assistant_query_mask: Tensor, CPU bool [prompt_tokens + answer_tokens], generated assistant positions as queries.
     assistant_query_mask = torch.zeros(prompt_length + answer_ids.shape[1], dtype=torch.bool)
     assistant_query_mask[prompt_length:] = True
-    # active_sample state: reset mask vectors and per-forward score/capture maps before the gradient forward.
-    active_sample["image_mask"] = image_mask
-    active_sample["assistant_query_mask"] = assistant_query_mask
-    active_sample["iga"] = {}
-    active_sample["value_tensors"] = {}
-    active_sample["capture"] = True
     # ignored_labels: Tensor, model-device long [1, prompt_tokens + answer_tokens], CE supplied manually below.
     ignored_labels = torch.full(
         (1, forward_embeds.shape[1]), -100, dtype=torch.long, device=forward_embeds.device
@@ -264,9 +155,18 @@ def score_generated_answer(
     model = input_adapter.model
     # output_attentions: bool model setting, enabled only for this scoring pass to control generation memory.
     original_output_attentions = getattr(model.config, "output_attentions", False)
-    model.config.output_attentions = True
+    inspector = LlavaInspector(model)
+    iga_collector = IGACollector(query_mask=assistant_query_mask, image_mask=image_mask)
+    importance_collector = GradientImportanceCollector(
+        gradient_target="attention.value", image_mask=image_mask, reduction="l2",
+    )
     try:
-        with torch.enable_grad():
+        model.config.output_attentions = True
+        with torch.enable_grad(), inspector.capture(
+            targets=[iga_collector, importance_collector], layers=layer_indices,
+            storage="cpu", scoped=True, release_attention=True,
+            retain_tensors=False, retain_gradients=False,
+        ) as capture, capture.forward():
             # outputs: ModelOutput, teacher-forced logits [1, prompt + answer, vocabulary].
             outputs = input_adapter(
                 inputs_embeds=forward_embeds,
@@ -275,46 +175,27 @@ def score_generated_answer(
                 use_cache=False,
                 return_dict=True,
             )
-            missing_iga = sorted(set(layer_indices) - set(active_sample["iga"]))
-            missing_values = sorted(set(layer_indices) - set(active_sample["value_tensors"]))
-            if missing_iga:
-                raise RuntimeError(
-                    f"No attention weights captured at layers {missing_iga}; configure eager attention"
-                )
-            if missing_values:
-                raise RuntimeError(f"No value projections captured at layers {missing_values}")
             # answer_logits: Tensor, float32 [answer_tokens, vocabulary], causal predictions aligned to answer IDs.
             answer_logits = outputs.logits[0, prompt_length - 1 : prompt_length + answer_ids.shape[1] - 1].float()
             if answer_logits.shape[0] != answer_ids.shape[1]:
                 raise RuntimeError("Generated answer IDs do not align with causal prediction positions")
             # answer_loss: Tensor, scalar mean CE over generated assistant tokens, including EOS when emitted.
             answer_loss = F.cross_entropy(answer_logits, answer_ids[0].to(answer_logits.device))
-            # selected_values: tuple[Tensor], live value-projection outputs for requested layers.
-            selected_values = tuple(active_sample["value_tensors"][index] for index in layer_indices)
-            # value_gradients: tuple[Tensor], gradient d(mean CE)/d(V) for each requested decoder layer.
-            value_gradients = torch.autograd.grad(answer_loss, selected_values)
-            # gradient_scores: dict[int, Tensor], CPU float32 [image_tokens], root sum of hidden-dimension squares.
-            gradient_scores: dict[int, torch.Tensor] = {}
-            for layer_index, value_gradient in zip(layer_indices, value_gradients):
-                # image_gradient: Tensor, float32 [image_tokens, hidden], dCE/dV at image positions only.
-                image_gradient = value_gradient[0].float()[image_mask.to(value_gradient.device)]
-                # gradient_scores[layer]: Tensor, CPU float32 [image_tokens], sqrt(sum_d gradient squared).
-                gradient_scores[layer_index] = image_gradient.square().sum(dim=-1).sqrt().detach().cpu()
-            iga_scores = {
-                layer_index: active_sample["iga"][layer_index]
-                for layer_index in layer_indices
-            }
+            capture.compute_gradients(answer_loss)
+            record = capture.results[0]
+            iga_scores = {layer: record.collections[iga_collector.name].measurements[
+                iga_collector.measurement_key(layer)][0][0] for layer in layer_indices}
+            gradient_scores = {layer: record.collections[importance_collector.name].measurements[
+                importance_collector.measurement_key(layer)][0][0] for layer in layer_indices}
     finally:
         model.config.output_attentions = original_output_attentions
-        active_sample["capture"] = False
-        active_sample["value_tensors"] = {}
-    del outputs, answer_logits, answer_loss, selected_values, value_gradients, forward_embeds
+    del outputs, answer_logits, answer_loss, forward_embeds
     del prompt_embeds, answer_embeds, prompt_inputs, prompt_kwargs, prompt_batch, prepared_prompt
     return iga_scores, gradient_scores
 
 
 # ============================================================================
-# PHASE 5. ANALYSE CAPTURED OVERLAP
+# PHASE 4. ANALYSE CAPTURED OVERLAP
 # ============================================================================
 def calculate_overlap(
     iga_scores: dict[int, torch.Tensor],
@@ -520,98 +401,75 @@ def main() -> int:
             log(f"[timing] Load model: {time.perf_counter() - model_started:.2f} s")
 
         # ====================================================================
-        # 3. REGISTER HOOKS
+        # 3. GENERATE, CAPTURE, AND SCORE ANSWERS
         # ====================================================================
-        # active_sample: dict[str, Any], ``capture`` gate, CPU query/image masks, per-layer IGA, live V tensors.
-        active_sample: dict[str, Any] = {
-            "capture": False,
-            "image_mask": torch.empty(0, dtype=torch.bool),
-            "assistant_query_mask": torch.empty(0, dtype=torch.bool),
-            "iga": {},
-            "value_tensors": {},
-        }
-        hook_handles = register_overlap_hooks(model, active_sample, args.layers)
-        log(f"Registered attention and value hooks on layers {args.layers}")
-
-        # ====================================================================
-        # 4. GENERATE GREEDY ANSWERS, THEN FORWARD AND BACKPROPAGATE
-        # ====================================================================
-        # overlap_rows: list[dict[str, Any]], per-sample/layer top-set intersection statistics for phase 5.
+        # overlap_rows: list[dict[str, Any]], per-sample/layer top-set intersection statistics for phase 4.
         overlap_rows: list[dict[str, Any]] = []
-        try:
-            for sample_index, sample in enumerate(dataset, start=1):
-                sample_started = time.perf_counter() if args.timing else None
-                conversations = sample["conversations"]
-                user_indices = [
-                    index for index, turn in enumerate(conversations)
-                    if turn.get("from") in {"human", "user"}
-                ]
-                if not user_indices:
-                    raise ValueError(f"Sample {sample.get('id', sample_index)} has no user question")
-                prompt_conversations = conversations[: user_indices[-1] + 1]
-                image = sample["image"].convert("RGB") if hasattr(sample["image"], "convert") else sample["image"]
-                prompt_row = {
-                    "conversations": prompt_conversations,
-                    "id": str(sample.get("id", sample_index)),
-                    "image": "local",
-                }
+        for sample_index, sample in enumerate(dataset, start=1):
+            sample_started = time.perf_counter() if args.timing else None
+            conversations = sample["conversations"]
+            user_indices = [
+                index for index, turn in enumerate(conversations)
+                if turn.get("from") in {"human", "user"}
+            ]
+            if not user_indices:
+                raise ValueError(f"Sample {sample.get('id', sample_index)} has no user question")
+            prompt_conversations = conversations[: user_indices[-1] + 1]
+            image = sample["image"].convert("RGB") if hasattr(sample["image"], "convert") else sample["image"]
+            prompt_row = {
+                "conversations": prompt_conversations,
+                "id": str(sample.get("id", sample_index)),
+                "image": "local",
+            }
 
-                # Disable capture and attention-matrix output during the cached, no-gradient generation pass.
-                active_sample["capture"] = False
-                model.config.output_attentions = False
-                generation_started = time.perf_counter() if args.timing else None
-                generated_ids, assistant_text = generate_greedy_answer(
-                    input_adapter, image, prompt_row, args.max_new_tokens
-                )
-                log(f"[{sample_index}/{len(dataset)}] GENERATED ASSISTANT: {assistant_text}", level="normal")
+            # Generation runs without capture scopes and without attention-matrix output.
+            model.config.output_attentions = False
+            generation_started = time.perf_counter() if args.timing else None
+            generated_ids, assistant_text = generate_greedy_answer(
+                input_adapter, image, prompt_row, args.max_new_tokens
+            )
+            log(f"[{sample_index}/{len(dataset)}] GENERATED ASSISTANT: {assistant_text}", level="normal")
+            log(
+                f"Sample {sample_index}: generated_tokens={generated_ids.shape[1]}, "
+                f"answer={assistant_text!r}",
+                level="extensive",
+            )
+            if generation_started is not None:
+                log(f"[timing] Sample {sample_index} greedy generation: {time.perf_counter() - generation_started:.2f} s")
+
+            # Free GPU KV state as generation helper returned CPU token IDs before the gradient pass.
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            scoring_started = time.perf_counter() if args.timing else None
+            iga_scores, gradient_scores = score_generated_answer(
+                input_adapter,
+                image,
+                prompt_row,
+                generated_ids,
+                args.layers,
+            )
+            per_layer_rows = calculate_overlap(iga_scores, gradient_scores, top_fraction)
+            sample_id = str(sample.get("id", sample_index))
+            for row in per_layer_rows:
+                overlap_rows.append({"sample_id": sample_id, **row})
                 log(
-                    f"Sample {sample_index}: generated_tokens={generated_ids.shape[1]}, "
-                    f"answer={assistant_text!r}",
+                    f"Sample {sample_index} L{row['layer']}: overlap="
+                    f"{row['overlap_count']}/{row['top_tokens_per_metric']} "
+                    f"({row['overlap_percent_of_top_set']:.1f}%), image_tokens={row['image_tokens']}",
                     level="extensive",
                 )
-                if generation_started is not None:
-                    log(f"[timing] Sample {sample_index} greedy generation: {time.perf_counter() - generation_started:.2f} s")
-
-                # Free GPU KV state as generation helper returned CPU token IDs before the gradient pass.
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                scoring_started = time.perf_counter() if args.timing else None
-                iga_scores, gradient_scores = score_generated_answer(
-                    input_adapter,
-                    image,
-                    prompt_row,
-                    generated_ids,
-                    active_sample,
-                    args.layers,
-                )
-                per_layer_rows = calculate_overlap(iga_scores, gradient_scores, top_fraction)
-                sample_id = str(sample.get("id", sample_index))
-                for row in per_layer_rows:
-                    overlap_rows.append({"sample_id": sample_id, **row})
-                    log(
-                        f"Sample {sample_index} L{row['layer']}: overlap="
-                        f"{row['overlap_count']}/{row['top_tokens_per_metric']} "
-                        f"({row['overlap_percent_of_top_set']:.1f}%), image_tokens={row['image_tokens']}",
-                        level="extensive",
-                    )
-                log(
-                    f"[{sample_index}/{len(dataset)}] mean overlap="
-                    f"{sum(int(row['overlap_count']) for row in per_layer_rows) / len(per_layer_rows):.2f} "
-                    f"image tokens across layers {args.layers}",
-                )
-                if scoring_started is not None:
-                    log(f"[timing] Sample {sample_index} scoring/backprop: {time.perf_counter() - scoring_started:.2f} s")
-                if sample_started is not None:
-                    log(f"[timing] Sample {sample_index} total: {time.perf_counter() - sample_started:.2f} s")
-                active_sample["iga"] = {}
-                active_sample["value_tensors"] = {}
-                del generated_ids, iga_scores, gradient_scores, per_layer_rows, image, sample
-        finally:
-            active_sample["capture"] = False
-            for handle in hook_handles:
-                handle.remove()
+            log(
+                f"[{sample_index}/{len(dataset)}] mean overlap="
+                f"{sum(int(row['overlap_count']) for row in per_layer_rows) / len(per_layer_rows):.2f} "
+                f"image tokens across layers {args.layers}",
+            )
+            if scoring_started is not None:
+                log(f"[timing] Sample {sample_index} scoring/backprop: {time.perf_counter() - scoring_started:.2f} s")
+            if sample_started is not None:
+                log(f"[timing] Sample {sample_index} total: {time.perf_counter() - sample_started:.2f} s")
+            del generated_ids, iga_scores, gradient_scores, per_layer_rows, image, sample
 
         # ====================================================================
-        # 5. ANALYSE CAPTURED OVERLAP
+        # 4. ANALYSE CAPTURED OVERLAP
         # ====================================================================
         analysis_started = time.perf_counter() if args.timing else None
         csv_path = save_overlap_results(overlap_rows, output_path, show=not args.no_display)
