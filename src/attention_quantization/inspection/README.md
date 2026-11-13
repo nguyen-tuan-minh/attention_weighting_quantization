@@ -160,7 +160,7 @@ deduplicated tensor capture stream.
 To add a collection, subclass `Collection` and override `required_targets`,
 `validate`, `measure_tensor`, and/or `process_gradient` as needed. Set `needs_grad`
 and override `wants_gradient` for derivative workflows. Return the new collector
-from the model inspector's `collection_collector` factory. The session configures
+from the model inspector's `collection_collector(collection)` factory. The session configures
 and binds it before registering hooks. `CaptureSession` requires no collection-name
-branches. The former `Measurements` dispatcher and inspector `measurements()`
-factory have been replaced by this collector contract.
+branches. The factory returns an unconfigured workflow; configuration and target
+binding each happen once before hooks are attached.

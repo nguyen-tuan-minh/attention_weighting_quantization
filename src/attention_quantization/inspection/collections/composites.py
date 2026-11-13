@@ -152,13 +152,10 @@ class OverlapCollector(Collection):
         record.measurements.setdefault((key[0], "overlap"), []).append(values)
 
 
-def compose(inspector, targets, collection):
-    """Select a workflow; model inspectors may override this factory for new types."""
+def create_collection(collection):
+    """Create an unconfigured workflow for subsequent configuration and target binding."""
     classes = {None: Collection, "iga": IGACollector, "attention_mass": AttentionMassCollector,
                "gradient_importance": GradientImportanceCollector, "overlap": OverlapCollector}
     if collection not in classes:
         raise ValueError(f"Unknown collection: {collection}")
-    result = classes[collection]([])
-    if targets:
-        result.bind(inspector, targets)
-    return result
+    return classes[collection]([])

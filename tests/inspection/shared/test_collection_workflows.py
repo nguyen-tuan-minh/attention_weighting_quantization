@@ -38,11 +38,11 @@ class FixtureInspector(ModelInspector):
         """Construct the generic derivative primitive."""
         return GradientCollector()
 
-    def collection_collector(self, targets, collection):
+    def collection_collector(self, collection):
         """Supply a custom workflow through the inspector extension point."""
         if collection == "custom_sum":
             return SumCollector([])
-        return super().collection_collector(targets, collection)
+        return super().collection_collector(collection)
 
 
 class CollectionWorkflowTests(unittest.TestCase):

@@ -31,10 +31,10 @@ class ModelInspector(ABC):
         """Build the model-specific objective differentiation implementation."""
         pass
 
-    def collection_collector(self, targets, collection):
-        """Compose resolved dependencies once; subclasses may override wiring."""
-        from ..collections.composites import compose
-        return compose(self, targets, collection)
+    def collection_collector(self, collection):
+        """Create an unconfigured workflow; the session configures and binds it once."""
+        from ..collections.composites import create_collection
+        return create_collection(collection)
 
     def release_attention_hooks(self, targets, enabled):
         """Register model-specific release hooks or reject unsupported release."""

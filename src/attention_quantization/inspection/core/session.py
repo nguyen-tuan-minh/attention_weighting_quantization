@@ -19,7 +19,7 @@ class CaptureSession:
         ValueError before model execution.
         """
         self.inspector, self.options = inspector, options
-        self.collector = inspector.collection_collector([], collection)
+        self.collector = inspector.collection_collector(collection)
         self.collector.configure(options)
         self.needs_grad = gradients or self.collector.needs_grad
         self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory, options.get("dtype"))

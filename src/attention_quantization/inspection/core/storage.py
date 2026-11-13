@@ -17,12 +17,12 @@ class Storage:
             raise ValueError("dtype conversion requires detached CPU or disk storage")
         self.dtype = dtype
         self.directory = Path(directory) if directory is not None else None
-        self.counter = 0
 
     def save(self, tensor):
         """Return the live tensor, detached CPU copy, or newly written .pt path.
 
-        Preserves shape and dtype. Disk mode creates directories as needed and
+        Preserves shape and uses the requested dtype for detached storage, or
+        the source dtype when none was requested. Disk mode creates directories as needed and
         never overwrites or removes existing captures. Filesystem errors propagate.
         """
         if self.mode == "live":
