@@ -8,30 +8,28 @@ from .storage import Storage
 class CaptureSession:
     """Own captures for one scope; callers own retained results after exit."""
 
-    def __init__(self, inspector, targets, layers, collection, gradients, storage, directory, options):
-        """Resolve targets and validate collection options without attaching hooks.
+    def __init__(self, inspector, *, targets, layers=None, storage=None,
+                 directory=None, dtype=None, scoped=False, sink=None,
+                 retain_tensors=True, release_attention=False):
+        """Resolve collector dependencies and configure lifecycle/storage policy.
 
-        `targets` are semantic names and `layers` are decoder indices; None
-        selects collection dependencies or all available layers, respectively.
-        `options` holds query/image/text masks, gradient_target, and top_fraction.
-        Storage defaults to live for gradients and CPU otherwise. Unsupported
-        targets, collections, masks missing from options, or policies raise
-        ValueError before model execution.
+        targets contains public collector classes or configured instances; masks
+        and analysis settings belong to those collectors. Storage defaults to live
+        if any collector requires gradients and CPU otherwise. scoped enables
+        explicit measured-forward boundaries. sink receives completed capture
+        values synchronously. No hooks attach until the session is entered.
         """
-        self.inspector, self.options = inspector, options
-        self.collector = inspector.collection_collector(collection)
-        self.collector.configure(options)
-        self.needs_grad = gradients or self.collector.needs_grad
-        self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory, options.get("dtype"))
-        self.scoped = options.get("scoped", False)
-        self.collector.validate(options, require_context=not self.scoped)
-        self.sink = options.get("sink")
-        self.release_attention = options.get("release_attention", False)
+        self.inspector = inspector
+        self.collector = inspector.collection_group(targets)
+        self.needs_grad = self.collector.needs_grad
+        self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory, dtype)
+        self.scoped, self.sink = scoped, sink
+        self.retain_tensors, self.release_attention = retain_tensors, release_attention
         self._in_forward = False
-        requested = list(targets or []) + self.collector.required_targets()
+        requested = self.collector.required_targets()
         requested = set(requested)
         if not requested:
-            raise ValueError("Specify targets or a collection")
+            raise ValueError("Collectors must declare at least one tensor dependency")
         available = inspector.targets()
         selected_layers = set(layers) if layers is not None else {t.layer for t in available}
         selected = [t for t in available if t.name in requested and t.layer in selected_layers]
@@ -62,7 +60,7 @@ class CaptureSession:
                 """Create an enabled forward's result without changing its inputs."""
                 if self.enabled:
                     record = ForwardCapture(len(self.results))
-                    record.options = dict(self.options)
+                    self.collector.begin_forward(record)
                     self.results.append(record)
             self.handles.append(self.inspector.model.register_forward_pre_hook(begin))
             def publish(target, tensor):
@@ -109,30 +107,25 @@ class CaptureSession:
         key = (target.layer, target.name)
         calls = record.tensors.setdefault(key, [])
         call = len(calls)
-        if self.needs_grad and self.collector.wants_gradient(target.name):
+        if self.needs_grad and self.collector.wants_gradient(record, target.name):
             self._live[(record.index, key, call)] = tensor
-        measured = self.collector.measure_tensor(target, tensor, record.options)
-        if measured is not None:
-            name, value = measured
-            stored = self._store_tree(value)
-            record.measurements.setdefault((target.layer, name), []).append(stored)
-            calls.append(None)
-        else:
+        keep_raw, measured = self.collector.process_tensor(record, target, tensor, call, self._store_tree)
+        if keep_raw:
             stored = self.storage.save(tensor)
-            calls.append(stored if self.options.get("retain_tensors", True) else None)
+            calls.append(stored if self.retain_tensors else None)
+        else:
+            stored = measured
+            calls.append(None)
         if self.sink is not None:
             self.sink(record.index, target.layer, target.name, call, stored)
 
-    def compute_gradients(self, loss, *, forward=-1, retain_graph=False, reduction="l2", accumulate=False):
+    def compute_gradients(self, loss, *, forward=-1, retain_graph=False):
         """Differentiate a scalar objective against one forward's live captures.
 
         Args:
             loss: Grad-enabled scalar depending on every captured target.
             forward: Index into results; defaults to the most recent forward.
             retain_graph: Preserve the graph for another objective when True.
-            reduction: l2 for a feature-vector norm or sum_squared for squared
-                gradients summed across features in importance collections.
-            accumulate: Sum importance scores over objectives per module call.
 
         Returns:
             The forward's gradient dictionary, keyed by (layer, target), with
@@ -144,7 +137,6 @@ class CaptureSession:
         """
         if not self._entered or not self.needs_grad:
             raise RuntimeError("Compute gradients inside a gradient-enabled capture scope")
-        self.collector.validate_gradient(reduction, accumulate)
         record = self.results[forward]
         identities = [identity for identity in self._live if identity[0] == record.index]
         values = [self._live[identity] for identity in identities]
@@ -152,7 +144,7 @@ class CaptureSession:
         for (_, key, call), gradient in zip(identities, gradients):
             record.gradients.setdefault(key, []).append(self.storage.save(gradient))
             self.collector.process_gradient(
-                record, key, call, gradient, reduction, accumulate,
+                record, key, call, gradient,
                 self._store_tree, self._load_tree,
             )
         if not retain_graph:
@@ -161,23 +153,16 @@ class CaptureSession:
         return record.gradients
 
     @contextmanager
-    def forward(self, **options):
-        """Capture exactly one measured model forward with sample-specific options.
+    def forward(self):
+        """Capture exactly one measured forward using collector-owned configuration.
 
-        Requires scoped=True and an entered session. Masks override session
-        defaults for this scope. Unmeasured model calls outside the scope are
+        Requires scoped=True and an entered session. Collectors snapshot their
+        configuration when the model starts. Calls outside the scope are
         ignored. On exit private graph references for the scope are released;
         public live results remain caller-owned. Nested scopes are rejected.
         """
         if not self._entered or not self.scoped or self._in_forward:
             raise RuntimeError("forward requires an entered scoped session and cannot nest")
-        previous = self.options
-        self.options = dict(previous, **options)
-        try:
-            self.collector.validate(self.options, require_context=True)
-        except BaseException:
-            self.options = previous
-            raise
         start = len(self.results)
         self._in_forward = self.enabled = True
         try:
@@ -190,7 +175,6 @@ class CaptureSession:
                 raise RuntimeError(f"Forward did not capture required targets: {sorted(missing)}")
         finally:
             self.enabled = self._in_forward = False
-            self.options = previous
             for identity in list(self._live):
                 if identity[0] >= start:
                     del self._live[identity]
@@ -207,7 +191,9 @@ class CaptureSession:
             handle.remove()
         self.handles.clear()
         self._live.clear()
-        self.inspector._active = self._entered = False
+        if self._entered:
+            self.inspector._active = False
+        self._entered = False
 
     def __exit__(self, *exc):
         """Close the scope on success or error without suppressing exceptions."""

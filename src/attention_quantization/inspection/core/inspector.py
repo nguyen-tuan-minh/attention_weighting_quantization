@@ -31,24 +31,34 @@ class ModelInspector(ABC):
         """Build the model-specific objective differentiation implementation."""
         pass
 
-    def collection_collector(self, collection):
-        """Create an unconfigured workflow; the session configures and binds it once."""
-        from ..collections.composites import create_collection
-        return create_collection(collection)
+    def collection_group(self, targets):
+        """Resolve public collector definitions into a shared capture workflow.
+
+        Model subclasses may override this factory to adapt collector behavior;
+        tensor extraction still uses their tensor_collector implementation.
+        """
+        from ..collections.composites import CollectionGroup
+        return CollectionGroup(targets)
 
     def release_attention_hooks(self, targets, enabled):
         """Register model-specific release hooks or reject unsupported release."""
         raise ValueError("This inspector does not support attention-output release")
 
-    def capture(self, *, targets=None, layers=None, collection=None,
-                gradients=False, storage=None, directory=None, **options):
-        """Create an unentered capture session without registering hooks.
+    def capture(self, *, targets, layers=None, storage=None, directory=None,
+                dtype=None, scoped=False, sink=None, retain_tensors=True,
+                release_attention=False):
+        """Create a session from collector classes or configured instances.
 
-        Select semantic targets or a named collection and optional layer indices.
-        gradients enables differentiation of explicit captures; storage selects
-        live, CPU, or disk retention (disk requires directory). Collection options
-        include query/image/text masks, gradient_target, and top_fraction.
-        The returned context manager owns registration and cleanup.
+        targets owns all analysis settings, including masks and gradient needs.
+        Remaining arguments configure selected layers, storage, and lifecycle.
+        storage is live, cpu, or disk; disk requires directory. dtype applies to
+        detached storage. scoped captures only inside session.forward(). The
+        optional synchronous sink receives each completed capture; retain_tensors
+        controls raw result retention. release_attention drops returned weights
+        after all collection consumers have processed them.
         """
-        return CaptureSession(self, targets, layers, collection, gradients,
-                              storage, directory, options)
+        return CaptureSession(
+            self, targets=targets, layers=layers, storage=storage,
+            directory=directory, dtype=dtype, scoped=scoped, sink=sink,
+            retain_tensors=retain_tensors, release_attention=release_attention,
+        )
