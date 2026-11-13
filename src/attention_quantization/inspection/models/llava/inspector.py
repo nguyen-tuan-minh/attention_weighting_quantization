@@ -57,3 +57,20 @@ class LlavaInspector(ModelInspector):
     def gradient_collector(self):
         """Return a gradient collector preserving LLaVA capture layouts."""
         return LlavaGradientCollector()
+
+    def release_attention_hooks(self, targets, enabled):
+        """Remove returned weights after capture consumers run, preserving other outputs."""
+        handles = []
+        try:
+            modules = {target.module for target in targets if target.name == "attention.weights"}
+            for module in modules:
+                def release(module, inputs, output):
+                    """Drop only tuple element 1 during enabled capture forwards."""
+                    if enabled() and isinstance(output, tuple) and len(output) > 1:
+                        return (output[0], None, *output[2:])
+                handles.append(module.register_forward_hook(release))
+        except BaseException:
+            for handle in handles:
+                handle.remove()
+            raise
+        return handles

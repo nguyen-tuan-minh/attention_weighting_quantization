@@ -21,6 +21,8 @@ class TensorCollector(Collector):
             for target in self.targets:
                 def receive(module, values, output=None, *, target=target):
                     """Extract and publish a tensor; return None to preserve model values."""
+                    if not getattr(publish, "enabled", lambda: True)():
+                        return
                     tensor = target.extract(values if target.before else output)
                     if not torch.is_tensor(tensor):
                         raise RuntimeError(

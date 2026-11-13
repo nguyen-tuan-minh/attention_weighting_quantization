@@ -1,9 +1,8 @@
 """Capture scope coordinating hooks, graph ownership, and derived measurements."""
-import math
+from contextlib import contextmanager
 import torch
 from .results import ForwardCapture
 from .storage import Storage
-from ..collections.attention import iga, attention_mass, mask_for
 
 
 class CaptureSession:
@@ -19,25 +18,17 @@ class CaptureSession:
         targets, collections, masks missing from options, or policies raise
         ValueError before model execution.
         """
-        supported = {None, "iga", "attention_mass", "gradient_importance", "overlap"}
-        if collection not in supported:
-            raise ValueError(f"Unknown collection: {collection}")
-        self.inspector, self.collection, self.options = inspector, collection, options
-        self.needs_grad = gradients or collection in {"gradient_importance", "overlap"}
-        self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory)
-        requested = list(targets or [])
-        if collection in {"iga", "attention_mass", "overlap"}:
-            requested.append("attention.weights")
-            for key in ("query_mask", "image_mask"):
-                if key not in options:
-                    raise ValueError(f"{collection} requires {key}")
-        if collection == "attention_mass" and "text_mask" not in options:
-            raise ValueError("attention_mass requires text_mask")
-        self.gradient_target = options.get("gradient_target", "attention.value")
-        if collection == "overlap" and not 0 < options.get("top_fraction", 0.1) <= 1:
-            raise ValueError("top_fraction must be in (0, 1]")
-        if collection in {"gradient_importance", "overlap"}:
-            requested.append(self.gradient_target)
+        self.inspector, self.options = inspector, options
+        self.collector = inspector.collection_collector([], collection)
+        self.collector.configure(options)
+        self.needs_grad = gradients or self.collector.needs_grad
+        self.storage = Storage(storage or ("live" if self.needs_grad else "cpu"), directory, options.get("dtype"))
+        self.scoped = options.get("scoped", False)
+        self.collector.validate(options, require_context=not self.scoped)
+        self.sink = options.get("sink")
+        self.release_attention = options.get("release_attention", False)
+        self._in_forward = False
+        requested = list(targets or []) + self.collector.required_targets()
         requested = set(requested)
         if not requested:
             raise ValueError("Specify targets or a collection")
@@ -48,7 +39,8 @@ class CaptureSession:
             (t.name, t.layer) for t in selected}
         if not selected or missing:
             raise ValueError(f"Unsupported capture targets/layers: {sorted(missing)}")
-        self.collector = inspector.collection_collector(selected, collection)
+        self.targets = selected
+        self.collector.bind(inspector, selected)
         # results: list[ForwardCapture], accumulated once per enabled forward;
         # handles: model-level hooks removed on scope exit or setup failure.
         self.results = []
@@ -58,7 +50,7 @@ class CaptureSession:
         # clear(), or close(); live public results have independent ownership.
         self._live = {}
         self._entered = False
-        self.enabled = True
+        self.enabled = not self.scoped
 
     def __enter__(self):
         """Attach hooks and claim the inspector; roll back if setup fails."""
@@ -69,9 +61,17 @@ class CaptureSession:
             def begin(module, inputs):
                 """Create an enabled forward's result without changing its inputs."""
                 if self.enabled:
-                    self.results.append(ForwardCapture(len(self.results)))
+                    record = ForwardCapture(len(self.results))
+                    record.options = dict(self.options)
+                    self.results.append(record)
             self.handles.append(self.inspector.model.register_forward_pre_hook(begin))
-            self.collector.start(self._publish)
+            def publish(target, tensor):
+                """Forward captures to the session while exposing the current capture gate."""
+                return self._publish(target, tensor)
+            publish.enabled = lambda: self.enabled
+            self.collector.start(publish)
+            if self.release_attention:
+                self.handles.extend(self.inspector.release_attention_hooks(self.targets, lambda: self.enabled))
         except BaseException:
             self.close()
             raise
@@ -87,6 +87,15 @@ class CaptureSession:
             return {key: self._store_tree(item) for key, item in value.items()}
         return value
 
+    def _load_tree(self, value):
+        """Load stored tensor paths recursively for dependent collection calculations."""
+        from pathlib import Path
+        if isinstance(value, Path):
+            return torch.load(value, weights_only=True)
+        if isinstance(value, list):
+            return [self._load_tree(item) for item in value]
+        return value
+
     def _publish(self, target, tensor):
         """Append one module call to the current forward without changing output.
 
@@ -100,31 +109,30 @@ class CaptureSession:
         key = (target.layer, target.name)
         calls = record.tensors.setdefault(key, [])
         call = len(calls)
-        if self.needs_grad and (self.collection not in {"gradient_importance", "overlap"}
-                                or target.name == self.gradient_target):
+        if self.needs_grad and self.collector.wants_gradient(target.name):
             self._live[(record.index, key, call)] = tensor
-        # Composite attention measurements are reduced immediately. Explicit raw
-        # capture still retains the weights when no collection was requested.
-        if target.name == "attention.weights" and self.collection in {"iga", "attention_mass", "overlap"}:
-            if self.collection == "attention_mass":
-                value = attention_mass(tensor, self.options["query_mask"],
-                                       self.options["image_mask"], self.options["text_mask"])
-                name = "attention_mass"
-            else:
-                value = iga(tensor, self.options["query_mask"], self.options["image_mask"])
-                name = "iga"
-            record.measurements.setdefault((target.layer, name), []).append(self._store_tree(value))
+        measured = self.collector.measure_tensor(target, tensor, record.options)
+        if measured is not None:
+            name, value = measured
+            stored = self._store_tree(value)
+            record.measurements.setdefault((target.layer, name), []).append(stored)
             calls.append(None)
         else:
-            calls.append(self.storage.save(tensor))
+            stored = self.storage.save(tensor)
+            calls.append(stored if self.options.get("retain_tensors", True) else None)
+        if self.sink is not None:
+            self.sink(record.index, target.layer, target.name, call, stored)
 
-    def compute_gradients(self, loss, *, forward=-1, retain_graph=False):
+    def compute_gradients(self, loss, *, forward=-1, retain_graph=False, reduction="l2", accumulate=False):
         """Differentiate a scalar objective against one forward's live captures.
 
         Args:
             loss: Grad-enabled scalar depending on every captured target.
             forward: Index into results; defaults to the most recent forward.
             retain_graph: Preserve the graph for another objective when True.
+            reduction: l2 for a feature-vector norm or sum_squared for squared
+                gradients summed across features in importance collections.
+            accumulate: Sum importance scores over objectives per module call.
 
         Returns:
             The forward's gradient dictionary, keyed by (layer, target), with
@@ -136,39 +144,56 @@ class CaptureSession:
         """
         if not self._entered or not self.needs_grad:
             raise RuntimeError("Compute gradients inside a gradient-enabled capture scope")
+        self.collector.validate_gradient(reduction, accumulate)
         record = self.results[forward]
         identities = [identity for identity in self._live if identity[0] == record.index]
         values = [self._live[identity] for identity in identities]
         gradients = self.inspector.gradient_collector().compute(loss, values, retain_graph=retain_graph)
         for (_, key, call), gradient in zip(identities, gradients):
             record.gradients.setdefault(key, []).append(self.storage.save(gradient))
-            if self.collection in {"gradient_importance", "overlap"}:
-                squared = gradient.float().square().sum(-1)
-                if "image_mask" in self.options:
-                    mask = mask_for(self.options["image_mask"], squared, -1)
-                    scores = [sample[selected].sqrt() for sample, selected in zip(squared, mask)]
-                else:
-                    scores = list(squared.sqrt())
-                record.measurements.setdefault((key[0], "gradient_importance"), []).append(self._store_tree(scores))
-                if self.collection == "overlap":
-                    # Compute on live scores before optional disk storage.
-                    attention = record.measurements[(key[0], "iga")][call]
-                    if self.storage.mode == "disk":
-                        attention = [torch.load(path, weights_only=True) for path in attention]
-                    fraction = self.options.get("top_fraction", 0.1)
-                    if not 0 < fraction <= 1:
-                        raise ValueError("top_fraction must be in (0, 1]")
-                    overlaps = []
-                    for a, b in zip(attention, scores):
-                        count = max(1, math.ceil(a.numel() * fraction))
-                        left = set(a.topk(count).indices.tolist())
-                        right = set(b.topk(count).indices.tolist())
-                        overlaps.append(len(left & right) / count)
-                    record.measurements.setdefault((key[0], "overlap"), []).append(overlaps)
+            self.collector.process_gradient(
+                record, key, call, gradient, reduction, accumulate,
+                self._store_tree, self._load_tree,
+            )
         if not retain_graph:
             for identity in identities:
                 del self._live[identity]
         return record.gradients
+
+    @contextmanager
+    def forward(self, **options):
+        """Capture exactly one measured model forward with sample-specific options.
+
+        Requires scoped=True and an entered session. Masks override session
+        defaults for this scope. Unmeasured model calls outside the scope are
+        ignored. On exit private graph references for the scope are released;
+        public live results remain caller-owned. Nested scopes are rejected.
+        """
+        if not self._entered or not self.scoped or self._in_forward:
+            raise RuntimeError("forward requires an entered scoped session and cannot nest")
+        previous = self.options
+        self.options = dict(previous, **options)
+        try:
+            self.collector.validate(self.options, require_context=True)
+        except BaseException:
+            self.options = previous
+            raise
+        start = len(self.results)
+        self._in_forward = self.enabled = True
+        try:
+            yield self
+            if len(self.results) != start + 1:
+                raise RuntimeError("A forward scope must execute exactly one model forward")
+            record = self.results[-1]
+            missing = {(t.layer, t.name) for t in self.targets} - set(record.tensors)
+            if missing:
+                raise RuntimeError(f"Forward did not capture required targets: {sorted(missing)}")
+        finally:
+            self.enabled = self._in_forward = False
+            self.options = previous
+            for identity in list(self._live):
+                if identity[0] >= start:
+                    del self._live[identity]
 
     def clear(self):
         """Release results and private graph references; leave hooks attached."""

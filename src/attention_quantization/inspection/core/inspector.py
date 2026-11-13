@@ -36,6 +36,10 @@ class ModelInspector(ABC):
         from ..collections.composites import compose
         return compose(self, targets, collection)
 
+    def release_attention_hooks(self, targets, enabled):
+        """Register model-specific release hooks or reject unsupported release."""
+        raise ValueError("This inspector does not support attention-output release")
+
     def capture(self, *, targets=None, layers=None, collection=None,
                 gradients=False, storage=None, directory=None, **options):
         """Create an unentered capture session without registering hooks.

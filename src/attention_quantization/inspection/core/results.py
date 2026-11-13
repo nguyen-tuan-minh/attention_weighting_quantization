@@ -16,3 +16,7 @@ class ForwardCapture:
     tensors: dict = field(default_factory=dict)
     measurements: dict = field(default_factory=dict)
     gradients: dict = field(default_factory=dict)
+    # Snapshot per forward so later scopes cannot change gradient masks.
+    options: dict = field(default_factory=dict)
+    # (target key, module-call index, reduction) -> detached per-sample scores.
+    accumulators: dict = field(default_factory=dict)

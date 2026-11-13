@@ -242,5 +242,65 @@ class InspectionTests(unittest.TestCase):
                             for m in self.model.modules()))
 
 
+    def test_scoped_capture_skips_generation_and_updates_masks(self):
+        """Only measured forwards are captured, using each scope's image mask."""
+        with self.inspector.capture(collection="iga", scoped=True) as session:
+            self.model(self.x)
+            with session.forward(query_mask=[False, True, True], image_mask=[True, False, False]):
+                self.model(self.x)
+            with session.forward(query_mask=[True, True, True], image_mask=[True, True, False]):
+                self.model(self.x)
+        self.assertEqual(len(session.results), 2)
+        self.assertEqual(session.results[0].measurements[(0, "iga")][0][0].shape, (1,))
+        self.assertEqual(session.results[1].measurements[(0, "iga")][0][0].shape, (2,))
+
+    def test_scoped_forward_validation_and_recovery(self):
+        """Missing forwards and nested scopes fail without poisoning subsequent scopes."""
+        with self.inspector.capture(targets=["block.output"], scoped=True) as session:
+            with self.assertRaises(RuntimeError):
+                with session.forward():
+                    pass
+            with session.forward():
+                with self.assertRaises(RuntimeError):
+                    with session.forward():
+                        pass
+                self.model(self.x)
+
+    def test_dtype_and_streaming_sink(self):
+        """The sink receives typed CPU snapshots without retaining tensor results."""
+        received = []
+        with self.inspector.capture(targets=["attention.key"], layers=[0], dtype=torch.float16,
+                                    retain_tensors=False, sink=lambda *event: received.append(event)) as session:
+            self.model(self.x)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0][-1].dtype, torch.float16)
+        self.assertIsNone(session.results[0].tensors[(0, "attention.key")][0])
+
+    def test_attention_release_runs_after_consumers(self):
+        """Release removes weights from module returns after IGA has consumed them."""
+        observed = []
+        with self.inspector.capture(collection="iga", release_attention=True,
+                                    query_mask=[True] * 3, image_mask=[True, False, False]) as session:
+            handle = self.model.model.layers[0].self_attn.register_forward_hook(
+                lambda module, inputs, output: observed.append(output[1]))
+            try:
+                self.model(self.x)
+            finally:
+                handle.remove()
+        self.assertEqual(observed, [None])
+        self.assertTrue(session.results[0].measurements)
+
+    def test_sum_squared_gradient_accumulation(self):
+        """Accumulated squared scores equal the sum of two explicit gradient objectives."""
+        with self.inspector.capture(collection="gradient_importance", layers=[0]) as session:
+            output = self.model(self.x)
+            value = session.results[0].tensors[(0, "attention.value")][0]
+            gradient = torch.autograd.grad(output.sum(), value, retain_graph=True)[0]
+            session.compute_gradients(output.sum(), reduction="sum_squared", accumulate=True, retain_graph=True)
+            session.compute_gradients(2 * output.sum(), reduction="sum_squared", accumulate=True)
+            actual = session.results[0].measurements[(0, "gradient_importance")][0]
+            torch.testing.assert_close(torch.stack(actual), 5 * gradient.square().sum(-1))
+
+
 if __name__ == "__main__":
     unittest.main()

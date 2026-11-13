@@ -94,8 +94,8 @@ target names supplied by a new inspector.
 
 Shared composite collectors coordinate registration and rollback. The default
 composition partitions resolved targets into attention and other captures so
-dependencies are registered once. Session-level reducers produce the aggregate
-measurements after extraction and differentiation.
+dependencies are registered once. High-level collectors produce aggregate measurements after extraction and
+differentiation; sessions provide storage callbacks and manage capture lifetime.
 
 Run behavioral tests in an environment with PyTorch installed:
 
@@ -106,3 +106,61 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 Shared infrastructure tests live in `tests/inspection/shared/`; LLaVA-specific
 tests live in `tests/inspection/llava/`. Give each future inspector its own
 test package, following `tests/README.md`.
+
+## Measured forward scopes
+
+Set `scoped=True` to attach hooks once while capturing only explicitly measured
+forwards. Supply sample-specific masks through `session.forward(...)`. Calls
+outside these scopes are ignored, including tensor extraction, so generation
+does not require attention weights. Each scope must execute exactly one model
+forward; nested scopes are rejected. Required targets are validated on normal
+scope exit. Gradients must be computed inside the measured scope, which releases
+private graph references on exit. Results remain in `session.results` and can
+be released between samples with `session.clear()`.
+
+```python
+with inspector.capture(collection="iga", scoped=True,
+                       release_attention=True) as session:
+    answer = generate_answer(model, inputs)
+    with session.forward(query_mask=assistant_mask, image_mask=image_mask):
+        outputs = model(**scoring_inputs)
+    scores = session.results[-1].measurements
+```
+
+`release_attention=True` asks the model inspector to replace returned attention
+weights with None after registered capture consumers have processed them. LLaVA
+preserves the remaining output tuple entries. This reduces model output retention;
+it does not prevent eager attention matrix allocation. Use one inspector per model
+and register all capture consumers through it. External hooks registered later
+will see the released output.
+
+Use `dtype=torch.float16` with CPU/disk storage to convert retained snapshots.
+Live storage rejects dtype conversion to preserve exact graph tensor identity.
+For streaming, pass a synchronous
+`sink(forward_index, layer, target, call_index, stored_value)` callback. It receives
+the configured storage result as each target is processed; attention collections
+send reduced values. `retain_tensors=False` leaves None placeholders instead of
+raw tensors in results. The sink must save or consume values promptly; retaining
+them in a list still consumes memory. Sink errors propagate through the context
+manager and trigger cleanup. Disk files remain caller-owned.
+
+For per-answer-token importance, call
+`compute_gradients(loss, reduction="sum_squared", accumulate=True, retain_graph=...)`
+once per objective, retaining the graph until the last call. Accumulation sums
+the selected reduction separately for each layer/module call; the default `l2`
+computes a feature-vector norm. A collection of mean-loss gradient norms and a
+sum of per-token squared gradients remain distinct calculations.
+
+Measurement formulas live as stateless functions in `collections/measurements.py`
+and `collections/attention.py`. High-level collectors in `collections/composites.py`
+own dependencies, context validation, reductions, and per-forward accumulation.
+`OverlapCollector` composes IGA and gradient-importance workflows over a shared,
+deduplicated tensor capture stream.
+
+To add a collection, subclass `Collection` and override `required_targets`,
+`validate`, `measure_tensor`, and/or `process_gradient` as needed. Set `needs_grad`
+and override `wants_gradient` for derivative workflows. Return the new collector
+from the model inspector's `collection_collector` factory. The session configures
+and binds it before registering hooks. `CaptureSession` requires no collection-name
+branches. The former `Measurements` dispatcher and inspector `measurements()`
+factory have been replaced by this collector contract.
