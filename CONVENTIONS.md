@@ -46,3 +46,11 @@ def capture_output(module, inputs, output):
     """
     captures.append(output.detach().to("cpu", copy=True))
 ```
+
+## Inspector tests
+
+Each model inspector must have its own test package under
+`tests/inspection/<model>/`, containing that inspector's tests and fixtures.
+Model-independent storage, reduction, and collector contracts belong in
+`tests/inspection/shared/`. See [tests/README.md](tests/README.md) for discovery
+commands and fixture guidance.

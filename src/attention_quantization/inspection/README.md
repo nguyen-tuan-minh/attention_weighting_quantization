@@ -100,5 +100,9 @@ measurements after extraction and differentiation.
 Run behavioral tests in an environment with PyTorch installed:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -p test_inspection.py
+PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+Shared infrastructure tests live in `tests/inspection/shared/`; LLaVA-specific
+tests live in `tests/inspection/llava/`. Give each future inspector its own
+test package, following `tests/README.md`.
