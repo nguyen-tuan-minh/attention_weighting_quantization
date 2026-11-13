@@ -5,6 +5,10 @@ specific workflow guidance lives in [`investigate/README.md`](investigate/README
 
 ## Readability and state
 
+Follow the repository-wide [CONVENTIONS.md](../CONVENTIONS.md), including
+function and method docstrings. The rules below also apply to script helpers
+and callbacks.
+
 - **Document function contracts.** Describe inputs, outputs, assumptions, and
   state a function reads or changes. Include tensor shapes and meanings where
   they help readers understand the operation.
