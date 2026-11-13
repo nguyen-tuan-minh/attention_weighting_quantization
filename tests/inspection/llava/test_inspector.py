@@ -397,6 +397,87 @@ class InspectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TensorCapture([])
 
+    def test_custom_attention_labels(self):
+        """IGA and modality totals publish configured keys without default aliases."""
+        iga = IGACollector(query_mask=[False, True, True], image_mask=[True, False, False],
+                           label="patch_scores")
+        mass = AttentionMassCollector(query_mask=[False, True, True], image_mask=[True, False, False],
+                                      text_mask=[False, True, True], label="modality_totals")
+        with self.inspector.capture(targets=[AttentionWeightsCollector, iga, mass], layers=[0]) as session:
+            self.model(self.x)
+        record = session.results[0]
+        weights = record.tensors[(0, "attention.weights")][0]
+        iga_result = record.collections[iga.name].measurements
+        mass_result = record.collections[mass.name].measurements
+        self.assertEqual(set(iga_result), {(0, "patch_scores")})
+        self.assertEqual(set(mass_result), {(0, "modality_totals")})
+        torch.testing.assert_close(iga_result[iga.measurement_key(0)][0][0], weights[0, :, 1:, :1].mean((0, 1)))
+        torch.testing.assert_close(mass_result[mass.measurement_key(0)][0][0]["image"], weights[0, :, 1:, 0].sum())
+
+    def test_custom_importance_output_accumulates(self):
+        """Renamed importance retains accumulation behavior and creates no default key."""
+        collector = GradientImportanceCollector(label="token_energy", reduction="sum_squared", accumulate=True)
+        with self.inspector.capture(targets=[collector], layers=[0]) as session:
+            output = self.model(self.x)
+            session.compute_gradients(output.sum(), retain_graph=True)
+            session.compute_gradients(2 * output.sum())
+        record = session.results[0]
+        measurements = record.collections[collector.name].measurements
+        self.assertEqual(set(measurements), {(0, "token_energy")})
+        gradient = record.gradients[(0, "attention.value")][0]
+        torch.testing.assert_close(torch.stack(measurements[collector.measurement_key(0)][0]),
+                                   5 * gradient.square().sum(-1))
+
+    def test_overlap_follows_all_component_labels(self):
+        """The composite reads renamed IGA and writes renamed importance/overlap on disk."""
+        collector = OverlapCollector(query_mask=[False, True, True], image_mask=[True, False, False],
+                                     label="agreement", iga_label="attention_scores",
+                                     importance_label="gradient_scores")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.inspector.capture(targets=[collector], layers=[0], storage="disk", directory=directory) as session:
+                output = self.model(self.x)
+                session.compute_gradients(output.sum())
+            measurements = session.results[0].collections[collector.name].measurements
+            self.assertEqual(set(measurements), {(0, name) for name in collector.labels})
+            self.assertEqual(set(collector.labels), {"attention_scores", "gradient_scores", "agreement"})
+            self.assertEqual(measurements[collector.measurement_key(0)][0], [1., 1.])
+            self.assertTrue(measurements[collector.iga.measurement_key(0)][0][0].exists())
+            self.assertTrue(measurements[collector.importance.measurement_key(0)][0][0].exists())
+
+    def test_labels_are_snapshotted_per_forward(self):
+        """Renaming a component after execution cannot break that forward's dependency lookup."""
+        collector = OverlapCollector(query_mask=[True] * 3, image_mask=[True, False, False])
+        with self.inspector.capture(targets=[collector], layers=[0]) as session:
+            output = self.model(self.x)
+            collector.iga.label = "next_attention"
+            collector.importance.label = "next_importance"
+            collector.label = "next_overlap"
+            session.compute_gradients(output.sum())
+            next_output = self.model(self.x)
+            session.compute_gradients(next_output.sum())
+        first = session.results[0].collections[collector.name]
+        second = session.results[1].collections[collector.name]
+        self.assertEqual(set(first.measurements), {(0, name) for name in first.collector.labels})
+        self.assertEqual(set(second.measurements), {(0, name) for name in second.collector.labels})
+        self.assertTrue(set(first.measurements).isdisjoint(second.measurements))
+
+    def test_invalid_labels_and_composite_collisions(self):
+        """Reject malformed names and shared keys that would overwrite component results."""
+        for label in ("", " ", 12, [], False):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                IGACollector(query_mask=[True], image_mask=[True], label=label)
+        for names in (
+            dict(label="same", iga_label="same"),
+            dict(iga_label="same", importance_label="same"),
+            dict(label="same", importance_label="same"),
+        ):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "unique"):
+                OverlapCollector(query_mask=[True], image_mask=[True], **names)
+        collector = OverlapCollector(query_mask=[True], image_mask=[True])
+        collector.iga.label = collector.label
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self.inspector.capture(targets=[collector])
+
 
 
 if __name__ == "__main__":

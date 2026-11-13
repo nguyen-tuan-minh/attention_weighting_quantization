@@ -49,8 +49,8 @@ with inspector.capture(
     outputs = model(**inputs)
 
 record = session.results[0]
-image_scores = record.collections[iga.name].measurements[(5, "iga")][0][0]
-modality_mass = record.collections[mass.name].measurements[(5, "attention_mass")][0][0]
+image_scores = record.collections[iga.name].measurements[iga.measurement_key(5)][0][0]
+modality_mass = record.collections[mass.name].measurements[mass.measurement_key(5)][0][0]
 ```
 
 Masks accept `[sequence]` or `[batch, sequence]`. Each collector owns its masks;
@@ -77,6 +77,48 @@ second = IGACollector(query_mask=answer_mask, image_mask=image_mask, name="answe
 session = inspector.capture(targets=[first, second])
 ```
 
+### Measurement labels
+
+`name` identifies a collector's namespace; `label` identifies its primary
+measurement within that namespace. Every built-in measurement collector accepts
+`label`. Use `collector.measurement_key(layer)` to access it without repeating
+a string literal. `collector.labels` lists all its declared outputs.
+
+```python
+iga = IGACollector(
+    query_mask=assistant_mask, image_mask=image_mask,
+    name="answer_analysis", label="patch_relevance",
+)
+with inspector.capture(targets=[iga], layers=[5]) as session:
+    outputs = model(**inputs)
+scores = session.results[0].collections[iga.name].measurements[
+    iga.measurement_key(5)
+][0][0]
+```
+
+Overlap also accepts `iga_label` and `importance_label` for its child
+measurements. Its output and both child outputs must have distinct labels because
+they share the composite result namespace. Dependency lookups use the child's
+declared output key, so renaming is safe:
+
+```python
+from attention_quantization.inspection import OverlapCollector
+
+collector = OverlapCollector(
+    query_mask=assistant_mask, image_mask=image_mask,
+    iga_label="attention_scores",
+    importance_label="sensitivity",
+    label="agreement",
+)
+# Keys are collector.iga.measurement_key(layer),
+# collector.importance.measurement_key(layer), and collector.measurement_key(layer).
+```
+
+Labels are snapshotted with the rest of the collector configuration. When accessing
+an older forward after changing a label, use
+`record.collections[name].collector.measurement_key(layer)` to reference that
+forward's declaration. Invalid labels and collisions are rejected before capture.
+
 ## Gradients
 
 ```python
@@ -93,7 +135,7 @@ with inspector.capture(targets=[importance], layers=[5, 10], storage="cpu") as s
         session.compute_gradients(loss, retain_graph=index < len(losses) - 1)
 
 scores = session.results[0].collections[importance.name].measurements[
-    (5, "gradient_importance")
+    importance.measurement_key(5)
 ][0]
 ```
 
@@ -195,6 +237,15 @@ Use `validate()` for configuration checks and override `snapshot()` when a custo
 configuration needs special copying. Runtime accumulation belongs in the supplied
 `CollectionCapture`, not the reusable definition. Pass the class or instance
 directly to `capture(targets=[...])`; no registry or session changes are needed.
+
+For a configurable single measurement, set `default_label` on the class,
+accept `label=None` in custom constructors and forward it to the base
+constructor, then return `(self.label, values)` from `measure_tensor()`.
+Gradient writers should use `self.measurement_key(layer)`, and composite readers
+should use the producing child's `measurement_key(layer)`. Override `labels`
+to declare multiple outputs and validate that their names cannot collide within
+one collector namespace. Raw tensor targets keep their model-defined semantic
+names and do not declare measurement outputs.
 
 Numerical functions in `collections/attention.py` and `collections/measurements.py`
 remain stateless. High-level workflows coordinate these functions; model-specific

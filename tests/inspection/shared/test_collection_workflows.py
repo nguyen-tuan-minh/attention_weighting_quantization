@@ -14,13 +14,15 @@ from attention_quantization.inspection.collections.composites import Collection,
 class SumCollector(Collection):
     """Example custom workflow unknown to CaptureSession."""
 
+    default_label = "sum"
+
     def required_targets(self):
         """Request the fixture model's output tensor."""
         return ["output"]
 
     def measure_tensor(self, target, tensor):
         """Return a scalar sum without retaining the source activation."""
-        return "sum", tensor.sum()
+        return self.label, tensor.sum()
 
 
 class FixtureInspector(ModelInspector):
@@ -41,6 +43,18 @@ class FixtureInspector(ModelInspector):
 
 
 class CollectionWorkflowTests(unittest.TestCase):
+    def test_custom_collector_output_declaration(self):
+        """A custom collector inherits output naming without inspector/session changes."""
+        model = nn.Linear(2, 2)
+        inspector = FixtureInspector(model)
+        collector = SumCollector(name="analysis", label="custom_total")
+        with inspector.capture(targets=[collector]) as session:
+            output = model(torch.ones(1, 2))
+        measurements = session.results[0].collections[collector.name].measurements
+        self.assertEqual(set(measurements), {(0, "custom_total")})
+        self.assertEqual(collector.labels, ("custom_total",))
+        torch.testing.assert_close(measurements[collector.measurement_key(0)][0], output.sum())
+
     def test_new_collection_requires_no_session_changes(self):
         """A custom dependency and reducer work through the existing public API."""
         model = nn.Linear(2, 2)

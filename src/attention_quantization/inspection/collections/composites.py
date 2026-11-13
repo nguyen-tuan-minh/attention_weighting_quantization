@@ -22,12 +22,36 @@ class Collection:
     """
 
     needs_grad = False
+    default_label = None
 
-    def __init__(self, *, name=None):
-        """Choose a unique result namespace, defaulting to the concrete class name."""
-        self.name = name or type(self).__name__
-        if not isinstance(self.name, str) or not self.name:
+    def __init__(self, *, name=None, label=None):
+        """Choose the collector namespace and optional declared measurement label.
+
+        Subclasses set default_label once. label overrides that
+        declaration; raw collectors have no measurement output by default.
+        """
+        self.name = type(self).__name__ if name is None else name
+        self.label = self.default_label if label is None else label
+        Collection.validate(self)
+
+    @property
+    def labels(self):
+        """List declared measurement labels, including component labels in composites."""
+        return () if self.label is None else (self.label,)
+
+    def measurement_key(self, layer):
+        """Return this collector's declared output key for a decoder layer."""
+        if self.label is None:
+            raise ValueError("This collector has no declared measurement output")
+        return layer, self.label
+
+    def _validate_names(self):
+        """Validate namespace and single-output declaration without inspecting children."""
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("Collector name must be a nonempty string")
+        if (self.label is not None or self.default_label is not None) and (
+                not isinstance(self.label, str) or not self.label.strip()):
+            raise ValueError("label must be a nonempty string")
 
     def required_targets(self):
         """Return semantic tensor names resolved by the model inspector."""
@@ -35,6 +59,7 @@ class Collection:
 
     def validate(self):
         """Validate analysis configuration before hooks attach or a forward begins."""
+        self._validate_names()
 
     def snapshot(self):
         """Copy configuration for one forward, isolating later collector changes."""
@@ -66,6 +91,7 @@ class TensorCapture(Collection):
 
     def validate(self):
         """Reject empty or non-string semantic tensor requests."""
+        super().validate()
         if not self.targets or any(not isinstance(name, str) or not name for name in self.targets):
             raise ValueError("TensorCapture requires nonempty semantic target names")
 
@@ -97,9 +123,11 @@ class ValueCollector(TensorCapture):
 class IGACollector(Collection):
     """Own query/image masks and reduce attention to image-token scores."""
 
-    def __init__(self, *, query_mask, image_mask, name=None):
+    default_label = "iga"
+
+    def __init__(self, *, query_mask, image_mask, name=None, label=None):
         """Own [sequence] or [batch, sequence] masks for attention query/key selection."""
-        super().__init__(name=name)
+        super().__init__(name=name, label=label)
         self.query_mask, self.image_mask = _mask(query_mask), _mask(image_mask)
 
     def required_targets(self):
@@ -108,31 +136,34 @@ class IGACollector(Collection):
 
     def measure_tensor(self, target, tensor):
         """Average selected queries and heads into one image-token vector per sample."""
-        return "iga", iga(tensor, self.query_mask, self.image_mask)
+        return self.label, iga(tensor, self.query_mask, self.image_mask)
 
 
 class AttentionMassCollector(IGACollector):
     """Own modality masks and calculate image/text attention totals."""
 
-    def __init__(self, *, query_mask, image_mask, text_mask, name=None):
+    default_label = "attention_mass"
+
+    def __init__(self, *, query_mask, image_mask, text_mask, name=None, label=None):
         """Configure answer queries and disjoint modality key masks."""
-        super().__init__(query_mask=query_mask, image_mask=image_mask, name=name)
+        super().__init__(query_mask=query_mask, image_mask=image_mask, name=name, label=label)
         self.text_mask = _mask(text_mask)
 
     def measure_tensor(self, target, tensor):
         """Sum selected image/text weights and count contributing head/query rows."""
-        return "attention_mass", attention_mass(tensor, self.query_mask, self.image_mask, self.text_mask)
+        return self.label, attention_mass(tensor, self.query_mask, self.image_mask, self.text_mask)
 
 
 class GradientImportanceCollector(Collection):
     """Own the activation target, masks, reduction, and objective accumulation."""
 
     needs_grad = True
+    default_label = "gradient_importance"
 
     def __init__(self, *, gradient_target="attention.value", image_mask=None,
-                 reduction="l2", accumulate=False, name=None):
+                 reduction="l2", accumulate=False, name=None, label=None):
         """Configure token scores; sum_squared supports per-token objective accumulation."""
-        super().__init__(name=name)
+        super().__init__(name=name, label=label)
         self.gradient_target = gradient_target
         self.image_mask = _mask(image_mask) if image_mask is not None else None
         self.reduction, self.accumulate = reduction, accumulate
@@ -140,6 +171,7 @@ class GradientImportanceCollector(Collection):
 
     def validate(self):
         """Validate reduction and target before differentiating any objective."""
+        super().validate()
         if self.reduction not in {"l2", "sum_squared"}:
             raise ValueError("reduction must be l2 or sum_squared")
         if not isinstance(self.gradient_target, str) or not self.gradient_target:
@@ -161,7 +193,7 @@ class GradientImportanceCollector(Collection):
         """
         options = {} if self.image_mask is None else {"image_mask": self.image_mask}
         scores = importance(gradient, options, self.reduction)
-        measurement_key = (key[0], "gradient_importance")
+        measurement_key = self.measurement_key(key[0])
         if self.accumulate:
             accumulator_key = (key, call)
             previous = result.accumulators.get(accumulator_key)
@@ -181,23 +213,34 @@ class OverlapCollector(Collection):
     """Compose IGA and gradient importance using collector-owned configuration."""
 
     needs_grad = True
+    default_label = "overlap"
 
     def __init__(self, *, query_mask, image_mask, gradient_target="attention.value",
-                 top_fraction=0.1, reduction="l2", accumulate=False, name=None):
-        """Configure component measurements and top-token overlap selection."""
-        super().__init__(name=name)
-        self.iga = IGACollector(query_mask=query_mask, image_mask=image_mask)
+                 top_fraction=0.1, reduction="l2", accumulate=False, name=None,
+                 label=None, iga_label=None, importance_label=None):
+        """Configure component calculations and independently named measurement outputs."""
+        super().__init__(name=name, label=label)
+        self.iga = IGACollector(query_mask=query_mask, image_mask=image_mask, label=iga_label)
         self.importance = GradientImportanceCollector(gradient_target=gradient_target,
-            image_mask=image_mask, reduction=reduction, accumulate=accumulate)
+            image_mask=image_mask, reduction=reduction, accumulate=accumulate,
+            label=importance_label)
         self.top_fraction = top_fraction
         self.validate()
 
     def validate(self):
         """Validate component calculations and the top-token fraction."""
+        super().validate()
         self.iga.validate()
         self.importance.validate()
+        if len(set(self.labels)) != len(self.labels):
+            raise ValueError("Composite measurement labels must be unique")
         if not 0 < self.top_fraction <= 1:
             raise ValueError("top_fraction must be in (0, 1]")
+
+    @property
+    def labels(self):
+        """Expose all component and aggregate outputs in the composite namespace."""
+        return (*self.iga.labels, *self.importance.labels, self.label)
 
     def required_targets(self):
         """Combine attention and activation dependencies before group deduplication."""
@@ -216,9 +259,9 @@ class OverlapCollector(Collection):
     def process_gradient(self, result, key, call, gradient, store, load):
         """Compute importance then compare it with this collector's matching IGA."""
         scores = self.importance.process_gradient(result, key, call, gradient, store, load)
-        attention = load(result.measurements[(key[0], "iga")][call])
+        attention = load(result.measurements[self.iga.measurement_key(key[0])][call])
         values = overlap(attention, scores, self.top_fraction)
-        result.measurements.setdefault((key[0], "overlap"), []).append(values)
+        result.measurements.setdefault(self.measurement_key(key[0]), []).append(values)
 
 
 class CollectionGroup(CompositeCollector):
