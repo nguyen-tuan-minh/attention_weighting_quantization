@@ -307,6 +307,16 @@ python scripts/investigate/investigate_pope.py \
   hallucination test.
 - `iga_error_correlation.py`: compares base and quantized layer errors and
   correlates them with an answer-level divergence/loss metric.
+- `compare_models.py`: generates answers independently from two local LLaVA
+  checkpoints on the same selected images and conversations. Model A defaults
+  to `model.yaml`; `--model-b` is required. Each model uses its own tokenizer
+  and image processor, so their vocabularies need not match. Supports the same
+  greedy/probabilistic settings, input previews, image-only export, timing, and
+  per-model placement caps as the contrastive script. Results contain a
+  `models` mapping with `model_a` and `model_b` response lists, including token
+  IDs and text. Token IDs belong to each model's own tokenizer. Outputs default
+  to `outputs/investigations/compare-models/results.jsonl` and `run_config.json`.
+  This compares generated responses; it does not compute an accuracy score.
 - `contrastive_decoding.py`: compares expert-only and expert-amateur
   contrastive decoding on identical multimodal prompts. It can also run the
   amateur-only baseline, greedy or probabilistic generation, and multiple
@@ -315,6 +325,26 @@ python scripts/investigate/investigate_pope.py \
   Greedy mode generates one answer per setting. It saves token IDs, decoded
   answers, and run settings under `outputs/investigations/contrastive-decoding`
   by default.
+
+Example, comparing two checkpoints independently:
+
+```bash
+python scripts/investigate/compare_models.py \
+  --model-a models/llava-v1.5-7b \
+  --model-b models/llava-v1.5-7b-gptq-w4g128 \
+  --samples 2 \
+  --seed 42 \
+  --generation-modes greedy probabilistic \
+  --num-generations 5 \
+  --max-model-a-memory-gpu 10GB \
+  --max-model-b-memory-gpu 8GB \
+  --log-level extensive
+```
+
+Both models stay loaded during the comparison. Choose placement caps with room
+for their combined weights, activations, and generation caches. Use
+`--max-model-a-memory-cpu` and `--max-model-b-memory-cpu` to cap CPU placement.
+Pass `--overwrite` to replace results in an existing output directory.
 
 Example, comparing expert and contrastive greedy decoding with five
 probabilistic generations per setting at three contrastive weights:

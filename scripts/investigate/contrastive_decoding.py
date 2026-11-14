@@ -277,6 +277,8 @@ def print_prompt_comparison(
     image_path: Path,
     expert_prompt: str | None,
     amateur_prompt: str | None,
+    *,
+    labels: tuple[str, str] = ("EXPERT PROMPT", "AMATEUR PROMPT"),
 ) -> None:
     """Save the sample image and print both model-formatted prompts in two columns."""
     image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,8 +286,8 @@ def print_prompt_comparison(
     log(f"Sample {sample_index} image saved to {image_path}", level="normal")
 
     columns = [
-        ("EXPERT PROMPT", expert_prompt or "(not prepared for this run)"),
-        ("AMATEUR PROMPT", amateur_prompt or "(not prepared for this run)"),
+        (labels[0], expert_prompt or "(not prepared for this run)"),
+        (labels[1], amateur_prompt or "(not prepared for this run)"),
     ]
     terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
     column_width = max(24, min(72, (terminal_width - 3) // 2))
