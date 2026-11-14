@@ -178,6 +178,8 @@ def load_model(
     role: str,
     device: str,
     output_dir: Path,
+    *,
+    device_map: Any = None,
 ) -> tuple[Any, Any, Any]:
     """Load one checkpoint and its input adapter, using role-specific placement caps."""
     if not (checkpoint / "config.json").is_file():
@@ -194,7 +196,8 @@ def load_model(
         checkpoint, configured_name=model_config.get("llava_model_name")
     )
     tokenizer, model, image_processor, _ = builder(
-        str(checkpoint), None, model_name, device_map="cpu" if device == "cpu" else "auto",
+        str(checkpoint), None, model_name,
+        device_map=device_map if device_map is not None else ("cpu" if device == "cpu" else "auto"),
         torch_dtype=model_config.get("torch_dtype", "float16"),
         attn_implementation=model_config.get("attn_implementation", "eager"),
         max_memory=max_memory, offload_folder=str(offload_dir), offload_state_dict=True,

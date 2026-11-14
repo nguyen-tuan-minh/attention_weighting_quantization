@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--display-images", action="store_true", help="Display each image with matplotlib.")
     parser.add_argument("--save-images-only", action="store_true", help="Save sample images without loading models.")
-    parser.add_argument("--device", help="cpu, auto, cuda, or cuda:N; defaults to model.yaml.")
+    parser.add_argument("--device", help="Device for all weights; defaults to model.yaml (cuda:0).")
     for role in ("a", "b"):
         for tier in ("gpu", "cpu"):
             parser.add_argument(
@@ -84,6 +84,8 @@ def validate_args(args: argparse.Namespace) -> None:
         return
     if args.model_b is None:
         raise ValueError("--model-b is required to compare two checkpoints")
+    if args.device == "auto":
+        raise ValueError("--device auto permits CPU placement; choose cpu or a specific CUDA device")
     if args.max_new_tokens < 1 or args.num_generations < 1:
         raise ValueError("--max-new-tokens and --num-generations must be positive")
     if not math.isfinite(args.temperature) or args.temperature <= 0:
@@ -150,8 +152,13 @@ def main() -> int:
             raise ValueError("Pass --model-a or configure model_dir in model.yaml")
         checkpoints = {"model_a": resolve_path(first_checkpoint), "model_b": resolve_path(args.model_b)}
         device = args.device or model_config.get("device_map", "cuda:0")
-        if device not in {"cpu", "cuda", "auto"} and not re.fullmatch(r"cuda:\d+", device):
-            raise ValueError("--device must be cpu, auto, cuda, or cuda:N")
+        if device not in {"cpu", "cuda"} and not re.fullmatch(r"cuda:\d+", device):
+            raise ValueError("--device must be cpu, cuda, or a CUDA device such as cuda:0")
+        if device.startswith("cuda"):
+            gpu_index = int(device.split(":", 1)[1]) if ":" in device else 0
+            strict_device_map: Any = {"": gpu_index}
+        else:
+            strict_device_map = "cpu"
         # Validate both paths before loading either large checkpoint.
         for checkpoint in checkpoints.values():
             if not (checkpoint / "config.json").is_file():
@@ -167,6 +174,7 @@ def main() -> int:
             log(f"Loading {role}: {checkpoint}")
             models[role] = load_model(
                 builder, get_process_model, checkpoint, model_config, args, role, device, output_dir,
+                device_map=strict_device_map,
             )
         if seed is not None:
             torch.manual_seed(seed)

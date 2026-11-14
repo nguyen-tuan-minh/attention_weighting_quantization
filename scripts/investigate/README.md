@@ -312,7 +312,10 @@ python scripts/investigate/investigate_pope.py \
   to `model.yaml`; `--model-b` is required. Each model uses its own tokenizer
   and image processor, so their vocabularies need not match. Supports the same
   greedy/probabilistic settings, input previews, image-only export, timing, and
-  per-model placement caps as the contrastive script. Results contain a
+  per-model GPU memory caps. By default each full model is placed on the
+  selected device; CUDA out-of-memory errors are raised if it does not fit,
+  rather than automatically spilling weights to CPU RAM. `--device cpu` loads
+  both models on CPU. Results contain a
   `models` mapping with `model_a` and `model_b` response lists, including token
   IDs and text. Token IDs belong to each model's own tokenizer. Outputs default
   to `outputs/investigations/compare-models/results.jsonl` and `run_config.json`.
