@@ -36,6 +36,7 @@ def inspect_generated_token_positions(
     top_token_percent: float | None,
     top_token_cumulative_percent: float | None,
     score_candidate_token_gradients_fn: Any,
+    score_candidate_vision_gradients_fn: Any,
     generate_candidate_continuation_fn: Any,
     show_gradient_heatmaps_fn: Any,
     show_large_source_image_fn: Any,
@@ -196,6 +197,34 @@ def inspect_generated_token_positions(
                 continue
             if read_only_inspection and len(command) >= 2 and command[1] in {"replace", "+"}:
                 print("Candidate replacement and continuation are unavailable in this answer inspection.")
+                continue
+            if len(command) == 2 and command[1] == "v":
+                token_id = torch.tensor(
+                    [[position_options[candidate_rank - 1][0]]],
+                    device=prompt_embeds.device, dtype=torch.long,
+                )
+                prefix_ids = generated_ids[:, : position - 1]
+                prefix_embeds = prompt_embeds
+                if prefix_ids.shape[1]:
+                    prefix_embeds = torch.cat(
+                        (prompt_embeds, input_adapter.model.get_input_embeddings()(prefix_ids)), dim=1
+                    )
+                prefix_attention = torch.cat((
+                    prompt_attention_mask,
+                    torch.ones((1, prefix_ids.shape[1]), dtype=prompt_attention_mask.dtype,
+                               device=prompt_attention_mask.device),
+                ), dim=1)
+                vision_scores = score_candidate_vision_gradients_fn(
+                    input_adapter, image, prefix_embeds, prefix_attention,
+                    prompt_image_mask, token_id, capture_target,
+                )
+                show_gradient_heatmaps_fn(
+                    image, vision_scores, sample_number, modality="image",
+                    heatmap_only=heatmap_only, scale=scale,
+                    score_normalization=score_normalization,
+                    title_suffix=f"Vision encoder candidate {candidate_rank} at answer token {position}",
+                    display=True,
+                )
                 continue
             if len(command) >= 2 and command[1] == "replace":
                 if len(command) == 3 and (not command[2].isdigit() or int(command[2]) < 1):

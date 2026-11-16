@@ -47,6 +47,6 @@ def read_all_tokens_command(
 def show_all_tokens_help(*, read_only: bool = False) -> None:
     """Print the all-token screen command summary."""
     if read_only:
-        print("Select n, n k count, or n p mass; i shows the image, b returns, q exits.")
+        print("Select n, n k count, n p mass; i shows the image, v finishes and shows the vision map, b returns, q exits.")
     else:
-        print("Select n, n k count, or n p mass; r regenerates, r s samples, e edits the question, i shows the image, q exits.")
+        print("Select n, n k count, n p mass; r regenerates, r s samples, e edits the question, i shows the image, v finishes and shows the vision map, q exits.")

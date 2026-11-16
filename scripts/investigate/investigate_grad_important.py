@@ -218,6 +218,7 @@ def _generate_assistant_once(
             "score_normalization": score_normalization,
             "top_token_percent": top_token_percent,
             "score_candidate_token_gradients_fn": score_candidate_token_gradients,
+            "score_candidate_vision_gradients_fn": score_candidate_vision_gradients,
             "generate_candidate_continuation_fn": generate_candidate_continuation,
             "show_gradient_heatmaps_fn": show_gradient_heatmaps,
             "show_large_source_image_fn": show_large_source_image,
@@ -485,6 +486,48 @@ def score_vision_token_gradients(adapter, image, prompt_inputs, prompt_kwargs, c
         measurements = capture.results[-1].collections[collector.name].measurements
         scores = {index: torch.zeros(patches.shape[1]) for index in range(layer_count)}
         for index in range(selected_hidden):
+            scores[index] = measurements[collector.measurement_key(index)][0][0][1:].detach().cpu()
+        return scores
+
+
+def score_candidate_vision_gradients(adapter, image, prefix_embeds, prefix_attention,
+                                     image_mask, candidate_id, capture_target):
+    """Score CLIP patch gradients for one selected candidate token."""
+    model = adapter.model
+    inspector = LlavaVisionInspector(model)
+    tower, encoder = inspector.tower, inspector.model
+    if tower.select_feature != "patch":
+        raise ValueError("Vision candidate maps require patch-only visual features")
+    layer_count = len(inspector.capture_targets()["block.input"])
+    selected = tower.select_layer
+    selected = selected if selected >= 0 else selected + layer_count + 1
+    collector = GradientImportanceCollector(gradient_target=capture_target,
+                                            reduction="sum_squared", accumulate=True)
+    with torch.enable_grad(), inspector.capture(
+        targets=[collector], layers=range(selected), storage="cpu",
+        retain_tensors=False, retain_gradients=False,
+    ) as capture:
+        pixels = tower.image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+        pixels = pixels.to(device=tower.device, dtype=tower.dtype).requires_grad_(True)
+        features = encoder(pixels, output_hidden_states=True).hidden_states[tower.select_layer][:, 1:]
+        projector = model.get_model().mm_projector
+        parameter = next(projector.parameters())
+        projected = projector(features.to(parameter.device, parameter.dtype))
+        embeds = prefix_embeds.detach().requires_grad_(True)
+        mask = image_mask.to(device=embeds.device, dtype=torch.bool)
+        if projected.shape != embeds[:, mask].shape or not torch.allclose(
+            projected.detach().to(embeds), embeds[:, mask].detach(), rtol=1e-3, atol=1e-3,
+        ):
+            raise ValueError("Vision features do not match candidate prefix image embeddings")
+        outputs = model(inputs_embeds=embeds, attention_mask=prefix_attention,
+                        use_cache=False, return_dict=True)
+        loss = F.cross_entropy(outputs.logits[:, -1].float(), candidate_id.to(outputs.logits.device).reshape(1))
+        embedding_gradient, = torch.autograd.grad(loss, embeds)
+        objective = (projected * embedding_gradient[:, mask].detach().to(projected)).sum()
+        capture.compute_gradients(objective)
+        measurements = capture.results[-1].collections[collector.name].measurements
+        scores = {index: torch.zeros(features.shape[1]) for index in range(layer_count)}
+        for index in range(selected):
             scores[index] = measurements[collector.measurement_key(index)][0][0][1:].detach().cpu()
         return scores
 
