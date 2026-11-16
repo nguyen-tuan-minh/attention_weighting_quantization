@@ -214,9 +214,13 @@ def inspect_generated_token_positions(
                     torch.ones((1, prefix_ids.shape[1]), dtype=prompt_attention_mask.dtype,
                                device=prompt_attention_mask.device),
                 ), dim=1)
+                prefix_image_mask = torch.cat((
+                    prompt_image_mask,
+                    torch.zeros(prefix_ids.shape[1], dtype=torch.bool, device=prompt_image_mask.device),
+                ))
                 vision_scores = score_candidate_vision_gradients_fn(
                     input_adapter, image, prefix_embeds, prefix_attention,
-                    prompt_image_mask, token_id, capture_target,
+                    prefix_image_mask, token_id, capture_target,
                 )
                 show_gradient_heatmaps_fn(
                     image, vision_scores, sample_number, modality="image",
