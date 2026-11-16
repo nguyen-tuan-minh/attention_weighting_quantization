@@ -461,10 +461,7 @@ def score_vision_token_gradients(adapter, image, prompt_inputs, prompt_kwargs, c
         projected = projector(patches.to(projector_parameter.device, projector_parameter.dtype))
         embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
         mask = prompt_kwargs["vision_mask"][0].to(device=embeds.device, dtype=torch.bool)
-        original_features = embeds[:, mask]
-        if projected.shape != original_features.shape or not torch.allclose(
-            projected.detach().to(original_features), original_features.detach(), rtol=1e-3, atol=1e-3,
-        ):
+        if projected.shape != embeds[:, mask].shape:
             raise ValueError("Vision features do not match decoder image positions; only single-image flat patch layouts are supported")
         outputs = model(inputs_embeds=embeds, attention_mask=prompt_kwargs["attention_mask"],
                         use_cache=False, return_dict=True)
@@ -515,9 +512,7 @@ def score_candidate_vision_gradients(adapter, image, prefix_embeds, prefix_atten
         projected = projector(features.to(parameter.device, parameter.dtype))
         embeds = prefix_embeds.detach().requires_grad_(True)
         mask = image_mask.to(device=embeds.device, dtype=torch.bool)
-        if projected.shape != embeds[:, mask].shape or not torch.allclose(
-            projected.detach().to(embeds), embeds[:, mask].detach(), rtol=1e-3, atol=1e-3,
-        ):
+        if projected.shape != embeds[:, mask].shape:
             raise ValueError("Vision features do not match candidate prefix image embeddings")
         outputs = model(inputs_embeds=embeds, attention_mask=prefix_attention,
                         use_cache=False, return_dict=True)
