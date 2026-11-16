@@ -1,6 +1,7 @@
 """Model inspectors and collector definitions for the public capture API."""
 
 from .models.llava.inspector import LlavaInspector
+from .models.llava.vision import LlavaVisionInspector
 from .collections.composites import (
     Collection,
     TensorCapture,
@@ -13,7 +14,8 @@ from .collections.composites import (
 )
 
 __all__ = [
-    "LlavaInspector", "Collection", "TensorCapture", "AttentionWeightsCollector",
+    "LlavaInspector", "LlavaVisionInspector",
+    "Collection", "TensorCapture", "AttentionWeightsCollector",
     "ValueCollector", "IGACollector", "AttentionMassCollector",
     "GradientImportanceCollector", "OverlapCollector",
 ]

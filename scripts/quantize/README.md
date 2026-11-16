@@ -2,6 +2,33 @@
 
 ## Disk-backed GPTQ for LLaVA 1.5
 
+Decoder-only quantization remains the default. Add `--quantize-vision` to also
+quantize the CLIP vision encoder's attention and MLP Linear weights, using the
+same `--bits`, `--group-size`, and `--damp` settings. Patch embeddings, biases,
+normalization parameters, and the multimodal projector retain their original
+precision. `--layers` still selects decoder layers only.
+
+```bash
+python scripts/quantize/quantize_gptq.py \
+  --output-dir outputs/quantized/llava-gptq-with-vision \
+  --quantize-vision
+```
+
+Vision quantization requires multimodal calibration, resident vision weights,
+and standalone output. Packed-overlay output is currently decoder-only. Vision
+Hessians use uniform image-token weights independently of the decoder's
+`--hessian-weighting` and `--hessian-token-scope` settings. One vision Linear
+is calibrated and quantized at a time, with a full pass over the selected images
+for each Linear; this can add substantial runtime. Earlier quantized vision
+weights participate in later vision calibration passes. Decoder calibration
+and quantization finish before this additional phase.
+
+The exported `vision_encoder/` directory holds the quantized CLIP checkpoint,
+and the LLaVA config points to its absolute path so ordinary LLaVA loading
+restores it. If moving the output to another machine or directory, update
+`mm_vision_tower` in `config.json` to the new `vision_encoder/` location.
+The GPTQ metadata records the vision module names and uniform weighting.
+
 The scripts support both LLaVA 1.5 7B and 13B checkpoints. Select
 `--model-config configs/model-llava-v1.5-13b.yaml` to use the 13B model in a
 quantization run; the same config option is available in evaluation and

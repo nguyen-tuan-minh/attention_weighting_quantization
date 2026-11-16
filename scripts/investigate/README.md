@@ -221,6 +221,30 @@ optional reference override when the base path normally comes from
 
 ## Current scripts
 
+The gradient investigator accepts `--include-vision` to add CLIP vision-encoder
+patch heatmaps to the completed-answer analysis. Decoder-only inspection remains
+the default. For example:
+
+```bash
+python scripts/investigate/investigate_grad_important.py \
+  --samples 1 --answer-mode generate --include-vision \
+  --save-dir outputs/gradient-inspection
+```
+
+Vision maps use the selected `--capture-point`: CLIP block input,
+`layer_norm1` output, or attention value-projection output. Scores sum squared
+gradients separately for each assistant-token cross-entropy, propagated through
+the multimodal projector to vision activations. CLS is excluded from the patch
+maps. Layers after the configured vision feature-selection layer have no path
+to the answer and therefore score zero. Vision figures are saved in the
+`vision_encoder/` subdirectory when saving is enabled. Display, normalization,
+and top-token selection flags also apply to these maps.
+
+This option supports single-image CLIP inputs with flat patch features and
+checks that those features match the decoder's image embeddings. In interactive
+mode, candidate inspections continue to show decoder gradients; vision maps are
+computed for the completed answer after interactive inspection finishes.
+
 - `investigate_pope.py`: downloads POPE directly with `datasets`, then runs an
   interactive question browser without LMMS-Eval. `--question-id ID` selects
   the starting question; without it, a seeded random row is used. If that

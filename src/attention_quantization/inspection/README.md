@@ -229,6 +229,50 @@ checkpoint recomputation require additional model-specific support.
 
 ## Extending models and collectors
 
+### Shared implementation convention
+
+Quantization and investigation scripts must reuse this package for model-specific
+layer discovery and activation capture. Add new vision/decoder locations as
+inspector targets and reuse capture sessions for hook lifetime and cleanup.
+Do not add parallel hook implementations or CLIP/decoder module-path mappings in
+individual scripts. Inspectors and collectors own reusable capture, gradient
+differentiation, and measurement reduction. Scripts own scoring workflows,
+feature alignment, objective construction, CLI parsing, dataset iteration,
+plotting, quantization algorithms, and checkpoint export. They must import the
+shared collectors rather than duplicate their gradient reduction or accumulation;
+quantization scripts may consume captured activations through a sink.
+
+`LlavaInspector(model)` continues to inspect decoder blocks.
+`LlavaVisionInspector(model)` inspects the loaded CLIP encoder, with its own
+zero-based block indices and the same semantic targets (`block.input`,
+`input_norm.output`, `attention.value`, etc.). It does not load models or change
+their weights. Collectors and storage policies work with either inspector.
+
+For quantization, `vision.linear_modules()` returns encoder Linear modules in
+stable named-module order. A separate `linear.input` capture uses indices into
+that mapping. Do not mix these Linear indices with encoder block indices in one
+session. For example:
+
+```python
+from attention_quantization.inspection import LlavaVisionInspector, TensorCapture
+
+vision = LlavaVisionInspector(model)
+with vision.capture(
+    targets=[TensorCapture("linear.input")], layers=[linear_index],
+    storage="live", sink=accumulate_hessian, retain_tensors=False,
+) as capture:
+    model.get_vision_tower()(pixels)
+    capture.clear()
+```
+
+`score_vision_token_gradients()` lives in the gradient investigation script. It
+aligns CLIP/projector features with decoder embeddings and constructs one scalar
+objective per answer token. It imports `LlavaVisionInspector` and
+`GradientImportanceCollector`, calling `capture.compute_gradients()` for shared
+differentiation, squared-gradient reduction, and accumulation. Only blocks that
+contribute to the selected CLIP hidden state are captured; later blocks receive
+zero scores in the script's plotting output. CLS is excluded from patch maps.
+
 New model inspectors subclass `ModelInspector` and implement `targets()`,
 `tensor_collector()`, and `gradient_collector()`. They can override
 `collection_group(targets)` to specialize definition resolution and

@@ -5,6 +5,15 @@ specific workflow guidance lives in [`investigate/README.md`](investigate/README
 
 ## Readability and state
 
+- **Reuse shared inspection.** Implement new model-specific layer discovery,
+  activation targets, and capture hooks in `src/attention_quantization/inspection`.
+  Both quantization and investigation scripts must use its inspectors and capture
+  sessions rather than duplicating vision/decoder hooks. Keep scoring workflows,
+  feature alignment, and objective construction in scripts, importing shared
+  collectors for gradient reduction and accumulation. Scripts also own CLI,
+  orchestration, plotting, and export. See the
+  [inspection convention](../src/attention_quantization/inspection/README.md#shared-implementation-convention).
+
 Follow the repository-wide [CONVENTIONS.md](../CONVENTIONS.md), including
 function and method docstrings. The rules below also apply to script helpers
 and callbacks.

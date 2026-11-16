@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import load_sharegpt4v_dataset  # noqa: E402
-from attention_quantization.inspection import LlavaInspector, GradientImportanceCollector  # noqa: E402
+from attention_quantization.inspection import LlavaInspector, LlavaVisionInspector, GradientImportanceCollector  # noqa: E402
 from attention_quantization.inspection.core.session import CaptureSession  # noqa: E402
 from attention_quantization.models import load_model  # noqa: E402
 from attention_quantization.interactive_terminal import (  # noqa: E402
@@ -421,6 +421,72 @@ def score_assistant_token_losses(
         image_scores[layer] = scores[image_mask.to(scores.device)].detach().cpu()
         text_scores[layer] = scores[text_mask.to(scores.device)].detach().cpu()
     return image_scores, text_scores, token_losses
+
+
+def score_vision_token_gradients(adapter, image, prompt_inputs, prompt_kwargs, capture_target, *, progress=None):
+    """Orchestrate image-feature alignment and per-answer-token vision scoring.
+
+    The shared inspector owns capture hooks; GradientImportanceCollector reduces
+    and accumulates squared activation gradients. Bridge decoder embedding
+    gradients through the projector because adapter preprocessing uses no_grad.
+    Return CPU patch scores, excluding CLS, for a single flat-patch CLIP image.
+    Encoder blocks after feature selection contribute zero scores.
+    """
+    model = adapter.model
+    inspector = LlavaVisionInspector(model)
+    tower, encoder = inspector.tower, inspector.model
+    if getattr(tower, "select_feature", "patch") != "patch":
+        raise ValueError("Vision heatmaps require patch-only visual features")
+    layer_count = len(inspector.capture_targets()["block.input"])
+    # CLIP hidden_states includes the embedding output before the first block.
+    selected_hidden = tower.select_layer
+    if selected_hidden < 0:
+        selected_hidden += layer_count + 1
+    if not 0 < selected_hidden <= layer_count:
+        raise ValueError("Vision gradient maps require selection of a transformer-block output")
+    collector = GradientImportanceCollector(
+        gradient_target=capture_target, reduction="sum_squared", accumulate=True,
+    )
+    with torch.enable_grad(), inspector.capture(
+        targets=[collector], layers=range(selected_hidden), storage="cpu",
+        retain_tensors=False, retain_gradients=False,
+    ) as capture:
+        pixels = tower.image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+        pixels = pixels.to(device=tower.device, dtype=tower.dtype).requires_grad_(True)
+        vision_output = encoder(pixels, output_hidden_states=True)
+        patches = vision_output.hidden_states[tower.select_layer][:, 1:]
+        projector = model.get_model().mm_projector
+        projector_parameter = next(projector.parameters())
+        projected = projector(patches.to(projector_parameter.device, projector_parameter.dtype))
+        embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
+        mask = prompt_kwargs["vision_mask"][0].to(device=embeds.device, dtype=torch.bool)
+        original_features = embeds[:, mask]
+        if projected.shape != original_features.shape or not torch.allclose(
+            projected.detach().to(original_features), original_features.detach(), rtol=1e-3, atol=1e-3,
+        ):
+            raise ValueError("Vision features do not match decoder image positions; only single-image flat patch layouts are supported")
+        outputs = model(inputs_embeds=embeds, attention_mask=prompt_kwargs["attention_mask"],
+                        use_cache=False, return_dict=True)
+        labels = prompt_kwargs["labels"][0]
+        positions = (labels[1:] != -100).nonzero(as_tuple=True)[0] + 1
+        if not positions.numel():
+            raise ValueError("No assistant targets for vision gradients")
+        for number, position in enumerate(positions.tolist()):
+            retain = number + 1 < positions.numel()
+            loss = F.cross_entropy(outputs.logits[:, position - 1].float(),
+                                   labels[position].to(outputs.logits.device).reshape(1))
+            embedding_gradient, = torch.autograd.grad(loss, embeds, retain_graph=retain)
+            # This scalar has the same first derivative as the assistant CE
+            # through visual features; detach the upstream derivative explicitly.
+            objective = (projected * embedding_gradient[:, mask].detach().to(projected)).sum()
+            capture.compute_gradients(objective, retain_graph=retain)
+            if progress is not None and (number + 1) % 16 == 0:
+                progress(number + 1, positions.numel())
+        measurements = capture.results[-1].collections[collector.name].measurements
+        scores = {index: torch.zeros(patches.shape[1]) for index in range(layer_count)}
+        for index in range(selected_hidden):
+            scores[index] = measurements[collector.measurement_key(index)][0][0][1:].detach().cpu()
+        return scores
 
 
 def score_candidate_token_gradients(
@@ -841,6 +907,10 @@ def parse_args() -> argparse.Namespace:
         help="Local checkpoint directory overriding model_dir in --model-config.",
     )
     parser.add_argument("--samples", type=int, default=None, help="Override configured sample count.")
+    parser.add_argument(
+        "--include-vision", action="store_true",
+        help="Also plot CLIP vision encoder patch gradients for the completed answer; default: decoder only.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Override configured sample seed.")
     parser.add_argument(
         "--capture-point",
@@ -1183,6 +1253,24 @@ def main() -> int:
 
             # Clear references to the completed graph before drawing or forwarding the next sample.
             del outputs, logits, inputs_embeds
+            if args.include_vision:
+                vision_started = time.perf_counter()
+                vision_scores = score_vision_token_gradients(
+                    input_adapter, image, prompt_inputs, prompt_kwargs, capture_target,
+                    progress=lambda done, total: log(f"Vision gradients: scored {done}/{total} assistant tokens"),
+                )
+                log(f"Vision encoder gradients: {len(vision_scores)} layers, {time.perf_counter() - vision_started:.2f}s")
+                show_gradient_heatmaps(
+                    image, vision_scores, sample_index, modality="image",
+                    heatmap_only=args.heatmap_only, scale=args.scale,
+                    score_normalization=args.score_normalization,
+                    top_token_percent=args.top_token_percent,
+                    top_token_cumulative_percent=args.top_token_cumulative_percent,
+                    title_suffix="Vision encoder (patch tokens; CLS excluded)",
+                    display=not args.no_display,
+                    save_dir=save_dir / "vision_encoder" if save_dir is not None else None,
+                )
+                del vision_scores
             plot_started = time.perf_counter() if args.timing else None
             image_output_path = show_gradient_heatmaps(
                 image,

@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from attention_quantization.config import read_yaml, repository_path  # noqa: E402
 from attention_quantization.data import get_data_paths, load_sharegpt4v_dataset  # noqa: E402
 from attention_quantization.models.qig_loader import resolve_llava_model_name  # noqa: E402
+from attention_quantization.inspection import LlavaVisionInspector, TensorCapture  # noqa: E402
 
 LOG_LEVEL = "normal"
 SHOW_TIMING = False
@@ -156,6 +157,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet-warnings", action="store_true", help="Suppress noisy Python and dependency warnings.")
     parser.add_argument("--timing", action="store_true", help="Show timing details at normal verbosity.")
     parser.add_argument("--bits", type=int, choices=(2, 3, 4, 8), default=4, help="Weight precision in bits.")
+    parser.add_argument(
+        "--quantize-vision", action="store_true",
+        help="Also GPTQ-quantize CLIP vision encoder Linear weights (standalone, multimodal only). Default: decoder only.",
+    )
     parser.add_argument(
         "--output-format", choices=("standalone", "packed-overlay"), default="standalone",
         help=(
@@ -815,6 +820,83 @@ def quantize_linear_gptq(
     return entry
 
 
+def quantize_vision_encoder(model, image_processor, dataset, args, output_dir: Path, scratch: Path) -> list[str]:
+    """Quantize CLIP Linear weights sequentially using uniform image-activation Hessians.
+
+    One Linear's Hessian is active at a time; each Linear requires a new image
+    pass. Previously quantized weights participate in subsequent passes. Patch
+    embeddings, normalization, biases, and the multimodal projector are retained.
+    Save a separate CLIP checkpoint because LLaVA reloads its tower separately.
+    """
+    inspector = LlavaVisionInspector(model)
+    tower, encoder = inspector.tower, inspector.model
+    linears = inspector.linear_modules()
+    if not linears:
+        raise ValueError("The vision encoder contains no Linear layers")
+    for module in encoder.modules():
+        if getattr(getattr(module, "_hf_hook", None), "offload", False):
+            raise ValueError("--quantize-vision requires resident vision weights; increase the model memory budget")
+    if any(parameter.device.type == "meta" for parameter in encoder.parameters()):
+        raise ValueError("--quantize-vision cannot quantize a vision encoder with meta weights")
+    completed = []
+    for index, (name, linear) in enumerate(linears.items(), 1):
+        started = time.monotonic()
+        size = linear.in_features ** 2 * 4
+        if args.max_hessian_memory_gpu is not None and size > args.max_hessian_memory_gpu:
+            raise ValueError(f"Vision Hessian for {name} needs {size} bytes, exceeding --max-hessian-memory-gpu")
+        backing_dir = scratch / f"vision-{index:03d}"
+        backing_dir.mkdir(parents=True, exist_ok=True)
+        matrices, paths, _, _, _, _ = allocate_hessians(
+            [{name: linear}], backing_dir, args.max_hessian_memory_cpu,
+            args.max_hessian_memory_disk, {0},
+        )
+        key = f"0:{name}"
+        hessian = torch.zeros((linear.in_features, linear.in_features), device="cuda", dtype=torch.float32)
+        count = 0
+
+        def collect(_forward, _layer, _target, _call, tensor):
+            nonlocal count
+            rows = tensor.detach().reshape(-1, linear.in_features).to(hessian.device, torch.float32)
+            hessian.addmm_(rows.T, rows)
+            count += rows.shape[0]
+
+        try:
+            with torch.inference_mode(), inspector.capture(
+                targets=[TensorCapture("linear.input")], layers=[index - 1],
+                storage="live", sink=collect, retain_tensors=False,
+            ) as capture:
+                for sample_index, sample in enumerate(dataset, 1):
+                    image = sample["image"]
+                    if isinstance(image, dict):
+                        with Image.open(image["path"]) as source:
+                            image = source.convert("RGB")
+                    else:
+                        image = image.convert("RGB")
+                    pixels = image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+                    tower(pixels.to(device=tower.device, dtype=tower.dtype))
+                    capture.clear()
+                    if sample_index % 16 == 0 or sample_index == len(dataset):
+                        log(f"Vision Linear {index}/{len(linears)} {name}: images {sample_index}/{len(dataset)}")
+            if not count:
+                raise RuntimeError(f"No image activations captured for vision Linear {name}")
+            matrices[key][:] = hessian.cpu().numpy()
+            if isinstance(matrices[key], np.memmap):
+                matrices[key].flush()
+        finally:
+            del hessian
+        quantize_linear_gptq(
+            linear, matrices[key], count, bits=args.bits, group_size=args.group_size, damp=args.damp,
+        )
+        release_hessian(key, matrices, paths, args.keep_hessians)
+        completed.append(name)
+        record_timing("vision Linear calibration and GPTQ", time.monotonic() - started)
+    destination = output_dir / "vision_encoder"
+    encoder.save_pretrained(destination, safe_serialization=False)
+    image_processor.save_pretrained(destination)
+    log(f"Saved {len(completed)} quantized vision Linear modules to {destination}")
+    return completed
+
+
 def main() -> int:
     """Collect grouped GPU Hessians, quantize selected layers, and save a standalone model."""
     global LOG_LEVEL, SHOW_TIMING, RUN_STARTED
@@ -834,6 +916,10 @@ def main() -> int:
             except ImportError:
                 pass
     run_started = RUN_STARTED
+    if args.quantize_vision and args.calibration_modality != "multimodal":
+        raise ValueError("--quantize-vision requires --calibration-modality multimodal")
+    if args.quantize_vision and args.output_format != "standalone":
+        raise ValueError("--quantize-vision currently requires --output-format standalone")
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
@@ -1681,6 +1767,12 @@ def main() -> int:
             f"Quantized {len(quantized_layers)} of {len(selected_layers)} selected decoder layers during finalization"
         )
 
+    vision_modules = []
+    if args.quantize_vision:
+        vision_modules = quantize_vision_encoder(
+            model, image_processor, dataset, args, output_dir, hessian_dir,
+        )
+
     # Release the offloaded calibration model before either retaining the
     # packed GPTQ layers or loading a complete CPU copy for dense export.
     quantize_handles.clear()
@@ -1705,6 +1797,10 @@ def main() -> int:
         "base_model": str(checkpoint),
         "model_family": "llava-v1.5",
         "bits": args.bits,
+        "quantize_vision": args.quantize_vision,
+        "vision_quantized_linear_modules": vision_modules,
+        "vision_hessian_weighting": "uniform" if args.quantize_vision else None,
+        "vision_checkpoint": "vision_encoder" if args.quantize_vision else None,
         "group_size": args.group_size,
         "selected_layers_1based": sorted(index + 1 for index in selected_layers),
         "hessian_token_scope": args.hessian_token_scope,
@@ -1796,6 +1892,18 @@ def main() -> int:
     # Return the complete model to CPU before applying weights and serializing.
     export_model.to("cpu")
     export_model.eval()
+    if args.quantize_vision:
+        vision_path = output_dir / "vision_encoder"
+        export_tower = export_model.get_vision_tower()
+        export_tower.vision_tower = type(export_tower.vision_tower).from_pretrained(
+            str(vision_path), torch_dtype=torch.float16,
+        )
+        export_tower.vision_tower.requires_grad_(False)
+        export_tower.vision_tower.eval()
+        export_tower.vision_tower_name = str(vision_path)
+        export_model.config.mm_vision_tower = str(vision_path)
+        if hasattr(export_model.config, "vision_tower"):
+            export_model.config.vision_tower = str(vision_path)
     export_blocks = export_model.model.layers
     apply_started = time.monotonic()
     applied_layers = 0
