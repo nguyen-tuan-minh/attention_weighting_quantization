@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import traceback
 import math
 import os
 import subprocess
@@ -99,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="llava", help="LMMS-Eval model adapter name (default: llava).")
     parser.add_argument("--model-args", default="", help="Additional comma-separated LMMS-Eval model arguments.")
     parser.add_argument("--tasks", default=PAPER_TASKS, help=f"Comma-separated LMMS-Eval task IDs (default: {PAPER_TASKS}).")
-    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size; use 1 for LLaVA 1.5 compatibility.")
+    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size; start with 2 for batched LLaVA generation. Contrastive mode currently requires 1.")
     parser.add_argument("--device", default=None, help="Evaluation device, for example cuda:0.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: outputs/evaluations/<timestamp>).")
     parser.add_argument("--limit", type=float, default=None, help="Limit examples per task for a smoke run; do not use for reported metrics.")
@@ -115,6 +117,96 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verbosity", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
+
+
+def install_batch_diagnostics(arguments: list[str]) -> None:
+    """Configure LLaVA generation padding and log batch shapes without prompt data.
+
+    Installed only in the worker. Persist diagnostics and full generation
+    tracebacks next to evaluation results; exceptions are re-raised unchanged.
+    """
+    from lmms_eval.models.llava import Llava
+
+    output_index = arguments.index("--output_path") + 1
+    output_dir = Path(arguments[output_index])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "batch_diagnostics.jsonl"
+
+    def describe(value):
+        if hasattr(value, "shape"):
+            return {"shape": list(value.shape), "dtype": str(value.dtype), "device": str(value.device)}
+        if isinstance(value, (list, tuple)):
+            return [describe(item) for item in value]
+        return value if isinstance(value, (str, int, float, bool, type(None))) else type(value).__name__
+
+    def record(event):
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, default=str) + "\n")
+
+    original_init = Llava.__init__
+    original_generate_until = Llava.generate_until
+
+    def generate_until(self, requests):
+        try:
+            return original_generate_until(self, requests)
+        except Exception:
+            record({"event": "evaluation_failed", "requests": len(requests),
+                    "traceback": traceback.format_exc()})
+            print(f"Evaluation failed. Full traceback saved in {log_path}", file=sys.stderr, flush=True)
+            raise
+
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # LLaVA strips input padding and pads again after image expansion.
+        # Both padding settings must agree for batched next-token generation.
+        self.tokenizer.padding_side = "left"
+        self.model.config.tokenizer_padding_side = "left"
+        generate = self.model.generate
+
+        def generate_with_diagnostics(*positional, **options):
+            ids = positional[0] if positional else options.get("input_ids", options.get("inputs"))
+            mask = options.get("attention_mask")
+            event = {
+                "event": "generate", "input_ids": describe(ids),
+                "attention_mask": describe(mask), "images": describe(options.get("images")),
+                "image_sizes": describe(options.get("image_sizes")),
+                "valid_text_lengths": mask.long().sum(-1).tolist() if mask is not None else None,
+                "image_tokens_per_row": ids.eq(-200).sum(-1).tolist() if ids is not None else None,
+                "max_new_tokens": options.get("max_new_tokens"),
+                "num_beams": options.get("num_beams"),
+                "padding_side": self.model.config.tokenizer_padding_side,
+            }
+            record(event)
+            try:
+                result = generate(*positional, **options)
+                if ids is not None and hasattr(result, "shape") and result.shape[0] != ids.shape[0]:
+                    raise RuntimeError(f"Generation returned {result.shape[0]} rows for a batch of {ids.shape[0]}")
+                record({"event": "generated", "output": describe(result)})
+                return result
+            except Exception:
+                event["event"] = "generation_failed"
+                event["traceback"] = traceback.format_exc()
+                record(event)
+                print(f"Batch generation failed. Diagnostics: {log_path}", file=sys.stderr, flush=True)
+                raise
+
+        self.model.generate = generate_with_diagnostics
+        record({"event": "model_loaded", "batch_size": self.batch_size,
+                "device_map": getattr(self.model, "hf_device_map", None)})
+        print(f"Batch diagnostics: {log_path}", flush=True)
+
+    Llava.__init__ = initialize
+    Llava.generate_until = generate_until
+
+
+def run_lmms_eval_worker(arguments: list[str]) -> int:
+    """Run ordinary evaluation with local batching fixes and failure diagnostics."""
+    if "--model" in arguments and arguments[arguments.index("--model") + 1] == "llava":
+        install_batch_diagnostics(arguments)
+    sys.argv = [sys.argv[0], *arguments]
+    from lmms_eval.__main__ import cli_evaluate
+    cli_evaluate()
+    return 0
 
 
 def run_lmms_eval_with_overlay(arguments: list[str]) -> int:
@@ -179,6 +271,7 @@ def run_lmms_eval_with_overlay(arguments: list[str]) -> int:
         print(f"Applied {applied} GPTQ decoder layer overlays from {overlay_dir}", flush=True)
 
     Llava.__init__ = init_with_overlay
+    install_batch_diagnostics(arguments)
     sys.argv = [sys.argv[0], *arguments]
     from lmms_eval.__main__ import cli_evaluate
 
@@ -560,6 +653,8 @@ def remove_new_cache_files(
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--_lmms-eval-worker":
+        return run_lmms_eval_worker(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "--_lmms-eval-overlay-worker":
         return run_lmms_eval_with_overlay(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "--_lmms-eval-contrastive-worker":
@@ -690,7 +785,7 @@ def main() -> int:
 
     command = [sys.executable]
     if overlay_dir is None:
-        command.extend(["-m", "lmms_eval"])
+        command.extend([str(Path(__file__).resolve()), "--_lmms-eval-worker"])
     else:
         command.extend([str(Path(__file__).resolve()), "--_lmms-eval-overlay-worker"])
     command.extend([
