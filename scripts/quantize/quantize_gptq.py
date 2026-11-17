@@ -162,6 +162,18 @@ def parse_args() -> argparse.Namespace:
         help="Also GPTQ-quantize CLIP vision encoder Linear weights (standalone, multimodal only). Default: decoder only.",
     )
     parser.add_argument(
+        "--vision-layers", default=None,
+        help="1-based CLIP encoder layers/ranges to quantize (for example 1-4,22-24); requires --quantize-vision. Default: all.",
+    )
+    parser.add_argument(
+        "--vision-hessian-weighting", choices=("uniform", "grad"), default="uniform",
+        help="Weight vision-layer Hessians uniformly (default) or by assistant-answer gradients.",
+    )
+    parser.add_argument(
+        "--vision-grad-normal-layers", default=None,
+        help="1-based vision layers kept on ordinary gradient weighting when top-token exclusion is enabled; requires vision grad weighting.",
+    )
+    parser.add_argument(
         "--output-format", choices=("standalone", "packed-overlay"), default="standalone",
         help=(
             "standalone writes a complete dense FP16 LLaVA checkpoint; packed-overlay keeps GPTQ codes "
@@ -820,7 +832,99 @@ def quantize_linear_gptq(
     return entry
 
 
-def quantize_vision_encoder(model, image_processor, dataset, args, output_dir: Path, scratch: Path) -> list[str]:
+def collect_vision_gradient_weights(model, adapter, dataset, selected_layers: set[int], args):
+    """Compute mean-one patch weights from summed assistant CE gradients per CLIP layer."""
+    inspector = LlavaVisionInspector(model)
+    tower, encoder = inspector.tower, inspector.model
+    layer_count = len(encoder.vision_model.encoder.layers)
+    feature_layer = tower.select_layer
+    feature_layer = feature_layer if feature_layer >= 0 else feature_layer + layer_count + 1
+    active_layers = sorted(layer for layer in selected_layers if layer < feature_layer)
+    normal_layers = (
+        parse_layer_selection(args.vision_grad_normal_layers, layer_count)
+        if args.vision_grad_normal_layers else set()
+    )
+    normal_layers &= set(active_layers)
+    if args.vision_grad_normal_layers:
+        requested_normal = parse_layer_selection(args.vision_grad_normal_layers, layer_count)
+        if requested_normal - selected_layers:
+            raise ValueError("--vision-grad-normal-layers must be a subset of --vision-layers")
+    weights_by_sample: dict[tuple[int, int], torch.Tensor] = {}
+    if not active_layers:
+        raise ValueError("Selected vision layers do not contribute to the configured CLIP feature output")
+    collector = GradientImportanceCollector(
+        gradient_target="block.output", reduction="sum_squared", accumulate=True,
+    )
+    for sample_index, sample in enumerate(dataset):
+        image = sample["image"]
+        if isinstance(image, dict):
+            with Image.open(image["path"]) as source:
+                image = source.convert("RGB")
+        else:
+            image = image.convert("RGB")
+        row = {"conversations": sample["conversations"], "id": str(sample.get("id", sample_index)), "image": "local"}
+        prepared = adapter.preprocess_data([image], row)
+        batch = adapter.data_collator([prepared])
+        prompt_inputs, prompt_kwargs = adapter.generate_input(batch)
+        embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
+        with torch.enable_grad(), inspector.capture(
+            targets=[collector], layers=active_layers, storage="cpu",
+            retain_tensors=False, retain_gradients=False,
+        ) as capture:
+            pixels, _, _ = adapter.vision_preprocess(image)
+            if not torch.is_tensor(pixels):
+                raise ValueError("Vision gradient weighting requires flat tensor image crops")
+            if pixels.ndim == 3:
+                pixels = pixels.unsqueeze(0)
+            pixels = pixels.to(device=tower.device, dtype=tower.dtype).requires_grad_(True)
+            vision_output = encoder(pixels, output_hidden_states=True)
+            patches = vision_output.hidden_states[tower.select_layer][:, 1:]
+            projector = model.get_model().mm_projector
+            projector_parameter = next(projector.parameters())
+            projected = projector(patches.to(projector_parameter.device, projector_parameter.dtype))
+            image_mask = prompt_kwargs["vision_mask"][0].to(device=embeds.device, dtype=torch.bool)
+            if projected.shape != embeds[:, image_mask].shape or not torch.allclose(
+                projected.detach().to(embeds), embeds[:, image_mask].detach(), rtol=1e-3, atol=1e-3,
+            ):
+                raise ValueError("Recomputed vision features do not match adapter-prepared image embeddings")
+            outputs = model(inputs_embeds=embeds, attention_mask=prompt_kwargs["attention_mask"],
+                            use_cache=False, return_dict=True)
+            labels = prompt_kwargs["labels"][0]
+            positions = (labels[1:] != -100).nonzero(as_tuple=True)[0] + 1
+            if not positions.numel():
+                raise ValueError(f"Sample {row['id']} has no assistant targets for vision gradient weighting")
+            losses = F.cross_entropy(
+                outputs.logits[0, positions - 1].float(),
+                labels.to(outputs.logits.device, dtype=torch.long)[positions], reduction="sum",
+            )
+            embedding_gradient, = torch.autograd.grad(losses, embeds, retain_graph=True)
+            objective = (projected * embedding_gradient[:, image_mask].detach().to(projected)).sum()
+            capture.compute_gradients(objective)
+            measurements = capture.results[-1].collections[collector.name].measurements
+            for layer in active_layers:
+                patch_score = measurements[collector.measurement_key(layer)][0][0][1:].float()
+                patch_norm = patch_score.clamp_min(0).sqrt()
+                mean = patch_norm.mean().clamp_min(torch.finfo(torch.float32).tiny)
+                layer_weights = patch_norm / mean
+                if args.top_token_cumulative_percent is not None and layer not in normal_layers:
+                    total = patch_norm.sum()
+                    if total > 0:
+                        order = torch.argsort(patch_norm, descending=True)
+                        count = int(torch.searchsorted(torch.cumsum(patch_norm[order], 0),
+                                                       total * args.top_token_cumulative_percent).item()) + 1
+                        omitted = order[:count]
+                        layer_weights[omitted] = 0
+                        retained = layer_weights.sum()
+                        if retained > 0:
+                            layer_weights *= patch_norm.sum() / mean / retained
+                weights_by_sample[(sample_index, layer)] = layer_weights.detach().cpu()
+        capture.clear()
+        del outputs, projected, vision_output, embeds, prompt_inputs, prompt_kwargs, batch, prepared
+        log(f"Vision gradient weights: sample {sample_index + 1}/{len(dataset)}")
+    return weights_by_sample, normal_layers
+
+
+def quantize_vision_encoder(model, adapter, dataset, args, output_dir: Path, scratch: Path) -> list[str]:
     """Quantize CLIP Linear weights sequentially using uniform image-activation Hessians.
 
     One Linear's Hessian is active at a time; each Linear requires a new image
@@ -830,7 +934,17 @@ def quantize_vision_encoder(model, image_processor, dataset, args, output_dir: P
     """
     inspector = LlavaVisionInspector(model)
     tower, encoder = inspector.tower, inspector.model
-    linears = inspector.linear_modules()
+    all_linears = inspector.linear_modules()
+    linears = all_linears
+    selected_layers = parse_layer_selection(args.vision_layers, len(encoder.vision_model.encoder.layers))
+    selected_linears = {
+        name: linear for name, linear in linears.items()
+        if name.startswith("vision_model.encoder.layers.")
+        and int(name.split(".")[3]) in selected_layers
+    }
+    if not selected_linears:
+        raise ValueError("--vision-layers selected no CLIP Linear modules")
+    linears = selected_linears
     if not linears:
         raise ValueError("The vision encoder contains no Linear layers")
     for module in encoder.modules():
@@ -838,6 +952,12 @@ def quantize_vision_encoder(model, image_processor, dataset, args, output_dir: P
             raise ValueError("--quantize-vision requires resident vision weights; increase the model memory budget")
     if any(parameter.device.type == "meta" for parameter in encoder.parameters()):
         raise ValueError("--quantize-vision cannot quantize a vision encoder with meta weights")
+    vision_weights = {}
+    normal_layers = set()
+    if args.vision_hessian_weighting == "grad":
+        vision_weights, normal_layers = collect_vision_gradient_weights(
+            model, adapter, dataset, selected_layers, args,
+        )
     completed = []
     for index, (name, linear) in enumerate(linears.items(), 1):
         started = time.monotonic()
@@ -854,25 +974,42 @@ def quantize_vision_encoder(model, image_processor, dataset, args, output_dir: P
         hessian = torch.zeros((linear.in_features, linear.in_features), device="cuda", dtype=torch.float32)
         count = 0
 
+        vision_layer = int(name.split(".")[3])
+        capture_index = list(all_linears).index(name)
+        current_sample = -1
+
         def collect(_forward, _layer, _target, _call, tensor):
             nonlocal count
             rows = tensor.detach().reshape(-1, linear.in_features).to(hessian.device, torch.float32)
-            hessian.addmm_(rows.T, rows)
-            count += rows.shape[0]
+            if args.vision_hessian_weighting == "grad":
+                patch_weights = vision_weights[(current_sample, vision_layer)].to(hessian.device)
+                token_weights = torch.cat((torch.ones(1, device=hessian.device), patch_weights))
+                if token_weights.numel() != rows.shape[0]:
+                    raise RuntimeError(f"Vision gradient weights do not match activation rows for {name}")
+                hessian.addmm_(rows.T, rows * token_weights.unsqueeze(1))
+                count += int((token_weights > 0).sum())
+            else:
+                hessian.addmm_(rows.T, rows)
+                count += rows.shape[0]
 
         try:
             with torch.inference_mode(), inspector.capture(
-                targets=[TensorCapture("linear.input")], layers=[index - 1],
+                targets=[TensorCapture("linear.input")], layers=[capture_index],
                 storage="live", sink=collect, retain_tensors=False,
             ) as capture:
                 for sample_index, sample in enumerate(dataset, 1):
+                    current_sample = sample_index - 1
                     image = sample["image"]
                     if isinstance(image, dict):
                         with Image.open(image["path"]) as source:
                             image = source.convert("RGB")
                     else:
                         image = image.convert("RGB")
-                    pixels = image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+                    pixels, _, _ = adapter.vision_preprocess(image)
+                    if not torch.is_tensor(pixels):
+                        raise ValueError("Vision quantization requires flat tensor image crops")
+                    if pixels.ndim == 3:
+                        pixels = pixels.unsqueeze(0)
                     tower(pixels.to(device=tower.device, dtype=tower.dtype))
                     capture.clear()
                     if sample_index % 16 == 0 or sample_index == len(dataset):
@@ -920,6 +1057,15 @@ def main() -> int:
         raise ValueError("--quantize-vision requires --calibration-modality multimodal")
     if args.quantize_vision and args.output_format != "standalone":
         raise ValueError("--quantize-vision currently requires --output-format standalone")
+    if args.vision_layers is not None and not args.quantize_vision:
+        raise ValueError("--vision-layers requires --quantize-vision")
+    if args.vision_hessian_weighting != "uniform" and not args.quantize_vision:
+        raise ValueError("--vision-hessian-weighting requires --quantize-vision")
+    if args.vision_grad_normal_layers is not None:
+        if not args.quantize_vision or args.vision_hessian_weighting != "grad":
+            raise ValueError("--vision-grad-normal-layers requires --quantize-vision --vision-hessian-weighting grad")
+        if args.top_token_cumulative_percent is None:
+            raise ValueError("--vision-grad-normal-layers requires --top-token-cumulative-percent")
     if args.group_size < 1:
         raise ValueError("--group-size must be positive")
     if args.hessian_group_layers < 1:
@@ -1770,7 +1916,7 @@ def main() -> int:
     vision_modules = []
     if args.quantize_vision:
         vision_modules = quantize_vision_encoder(
-            model, image_processor, dataset, args, output_dir, hessian_dir,
+            model, adapter, dataset, args, output_dir, hessian_dir,
         )
 
     # Release the offloaded calibration model before either retaining the
@@ -1799,7 +1945,12 @@ def main() -> int:
         "bits": args.bits,
         "quantize_vision": args.quantize_vision,
         "vision_quantized_linear_modules": vision_modules,
-        "vision_hessian_weighting": "uniform" if args.quantize_vision else None,
+        "vision_hessian_weighting": args.vision_hessian_weighting if args.quantize_vision else None,
+        "vision_grad_normal_layers": args.vision_grad_normal_layers,
+        "vision_layers_1based": (
+            sorted({int(name.split(".")[3]) + 1 for name in vision_modules})
+            if args.quantize_vision else None
+        ),
         "vision_checkpoint": "vision_encoder" if args.quantize_vision else None,
         "group_size": args.group_size,
         "selected_layers_1based": sorted(index + 1 for index in selected_layers),

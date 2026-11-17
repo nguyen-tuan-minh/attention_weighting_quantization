@@ -6,18 +6,39 @@ Decoder-only quantization remains the default. Add `--quantize-vision` to also
 quantize the CLIP vision encoder's attention and MLP Linear weights, using the
 same `--bits`, `--group-size`, and `--damp` settings. Patch embeddings, biases,
 normalization parameters, and the multimodal projector retain their original
-precision. `--layers` still selects decoder layers only.
+precision. `--layers` selects decoder layers; `--vision-layers` independently
+selects 1-based CLIP transformer layers and defaults to all when vision
+quantization is enabled. The option requires `--quantize-vision`.
 
 ```bash
 python scripts/quantize/quantize_gptq.py \
   --output-dir outputs/quantized/llava-gptq-with-vision \
-  --quantize-vision
+  --quantize-vision \
+  --vision-layers 1-4,22-24
 ```
 
 Vision quantization requires multimodal calibration, resident vision weights,
 and standalone output. Packed-overlay output is currently decoder-only. Vision
-Hessians use uniform image-token weights independently of the decoder's
-`--hessian-weighting` and `--hessian-token-scope` settings. One vision Linear
+Hessians default to uniform patch weights, independently of the decoder's
+`--hessian-weighting` and `--hessian-token-scope` settings. Set
+`--vision-hessian-weighting grad` to weight patch rows using assistant-answer
+gradients. When `--top-token-cumulative-percent` is set, the highest-gradient
+patches up to that score mass are omitted per sample and layer, except layers
+listed in `--vision-grad-normal-layers`, which retain ordinary gradient weights.
+Remaining patch weights are rescaled to preserve their pre-selection sum. The
+vision weights are computed from the selected answer and image per sample.
+For example, keep vision layers 1 and 2 on ordinary gradient weights while
+applying top-90% exclusion to other selected vision layers:
+
+```bash
+--quantize-vision \
+--vision-layers 1-24 \
+--vision-hessian-weighting grad \
+--vision-grad-normal-layers 1,2 \
+--top-token-cumulative-percent 0.9
+```
+
+One vision Linear
 is calibrated and quantized at a time, with a full pass over the selected images
 for each Linear; this can add substantial runtime. Earlier quantized vision
 weights participate in later vision calibration passes. Decoder calibration

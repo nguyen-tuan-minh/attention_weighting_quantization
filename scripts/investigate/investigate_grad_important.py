@@ -452,7 +452,11 @@ def score_vision_token_gradients(adapter, image, prompt_inputs, prompt_kwargs, c
         targets=[collector], layers=range(selected_hidden), storage="cpu",
         retain_tensors=False, retain_gradients=False,
     ) as capture:
-        pixels = tower.image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+        pixels, _, _ = adapter.vision_preprocess(image)
+        if not torch.is_tensor(pixels):
+            raise ValueError("Vision gradient maps require one flat tensor of image crops")
+        if pixels.ndim == 3:
+            pixels = pixels.unsqueeze(0)
         pixels = pixels.to(device=tower.device, dtype=tower.dtype).requires_grad_(True)
         vision_output = encoder(pixels, output_hidden_states=True)
         patches = vision_output.hidden_states[tower.select_layer][:, 1:]
@@ -461,8 +465,10 @@ def score_vision_token_gradients(adapter, image, prompt_inputs, prompt_kwargs, c
         projected = projector(patches.to(projector_parameter.device, projector_parameter.dtype))
         embeds = prompt_inputs["inputs_embeds"].detach().requires_grad_(True)
         mask = prompt_kwargs["vision_mask"][0].to(device=embeds.device, dtype=torch.bool)
-        if projected.shape != embeds[:, mask].shape:
-            raise ValueError("Vision features do not match decoder image positions; only single-image flat patch layouts are supported")
+        if projected.shape != embeds[:, mask].shape or not torch.allclose(
+            projected.detach().to(embeds), embeds[:, mask].detach(), rtol=1e-3, atol=1e-3,
+        ):
+            raise ValueError("Adapter-preprocessed vision features do not align with decoder image positions")
         outputs = model(inputs_embeds=embeds, attention_mask=prompt_kwargs["attention_mask"],
                         use_cache=False, return_dict=True)
         labels = prompt_kwargs["labels"][0]
@@ -504,7 +510,11 @@ def score_candidate_vision_gradients(adapter, image, prefix_embeds, prefix_atten
         targets=[collector], layers=range(selected), storage="cpu",
         retain_tensors=False, retain_gradients=False,
     ) as capture:
-        pixels = tower.image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
+        pixels, _, _ = adapter.vision_preprocess(image)
+        if not torch.is_tensor(pixels):
+            raise ValueError("Vision gradient maps require one flat tensor of image crops")
+        if pixels.ndim == 3:
+            pixels = pixels.unsqueeze(0)
         pixels = pixels.to(device=tower.device, dtype=tower.dtype).requires_grad_(True)
         features = encoder(pixels, output_hidden_states=True).hidden_states[tower.select_layer][:, 1:]
         projector = model.get_model().mm_projector
@@ -512,8 +522,10 @@ def score_candidate_vision_gradients(adapter, image, prefix_embeds, prefix_atten
         projected = projector(features.to(parameter.device, parameter.dtype))
         embeds = prefix_embeds.detach().requires_grad_(True)
         mask = image_mask.to(device=embeds.device, dtype=torch.bool)
-        if projected.shape != embeds[:, mask].shape:
-            raise ValueError("Vision features do not match candidate prefix image embeddings")
+        if projected.shape != embeds[:, mask].shape or not torch.allclose(
+            projected.detach().to(embeds), embeds[:, mask].detach(), rtol=1e-3, atol=1e-3,
+        ):
+            raise ValueError("Adapter-preprocessed vision features do not align with candidate prefix image embeddings")
         outputs = model(inputs_embeds=embeds, attention_mask=prefix_attention,
                         use_cache=False, return_dict=True)
         loss = F.cross_entropy(outputs.logits[:, -1].float(), candidate_id.to(outputs.logits.device).reshape(1))
