@@ -147,6 +147,24 @@ def install_batch_diagnostics(arguments: list[str]) -> None:
     original_init = Llava.__init__
     original_generate_until = Llava.generate_until
 
+    # The adapter uses the first row's task, split and visual callback for
+    # every document in a batch. Generation kwargs alone are not a safe key
+    # when evaluating several benchmarks together.
+    adapter_utils = original_generate_until.__globals__["utils"]
+
+    class TaskCollator(adapter_utils.Collator):
+        def __init__(self, arr, sort_fn, group_fn=lambda row: row[1], grouping=False):
+            def task_group(row):
+                return {**group_fn(row), "__evaluation_task": row[4],
+                        "__evaluation_split": row[5]}
+
+            super().__init__(arr, sort_fn, group_fn=task_group, grouping=grouping)
+
+    # Keep this compatibility fix local to the LLaVA adapter.
+    original_generate_until.__globals__["utils"] = types.SimpleNamespace(
+        **{**vars(adapter_utils), "Collator": TaskCollator}
+    )
+
     def generate_until(self, requests):
         try:
             results = original_generate_until(self, requests)
