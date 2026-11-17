@@ -148,10 +148,34 @@ def install_batch_diagnostics(arguments: list[str]) -> None:
 
     def generate_until(self, requests):
         try:
-            return original_generate_until(self, requests)
-        except Exception:
-            record({"event": "evaluation_failed", "requests": len(requests),
-                    "traceback": traceback.format_exc()})
+            results = original_generate_until(self, requests)
+            if len(results) != len(requests):
+                raise RuntimeError(
+                    f"Evaluation returned {len(results)} results for {len(requests)} requests"
+                )
+            record({"event": "evaluation_completed", "requests": len(requests), "results": len(results)})
+            return results
+        except Exception as error:
+            event = {"event": "evaluation_failed", "requests": len(requests),
+                     "traceback": traceback.format_exc()}
+            # Older LMMS-Eval reports only `assert all(cov)` when restoring
+            # request order. Read counts from that frame without logging prompts.
+            for frame, _ in traceback.walk_tb(error.__traceback__):
+                if frame.f_code.co_name != "get_original":
+                    continue
+                collator = frame.f_locals.get("self")
+                if not hasattr(collator, "reorder_indices"):
+                    continue
+                indices = collator.reorder_indices
+                outputs = frame.f_locals.get("newarr", [])
+                event["reordering"] = {
+                    "expected_results": collator.size,
+                    "actual_results": len(outputs),
+                    "reorder_indices": list(indices),
+                    "missing_positions": sorted(set(range(collator.size)) - set(indices[:len(outputs)])),
+                }
+                print(f"Result reordering failed: {json.dumps(event['reordering'])}", file=sys.stderr, flush=True)
+            record(event)
             print(f"Evaluation failed. Full traceback saved in {log_path}", file=sys.stderr, flush=True)
             raise
 
@@ -162,6 +186,18 @@ def install_batch_diagnostics(arguments: list[str]) -> None:
         self.tokenizer.padding_side = "left"
         self.model.config.tokenizer_padding_side = "left"
         generate = self.model.generate
+        batch_decode = self.tokenizer.batch_decode
+
+        def decode_with_diagnostics(sequences, *args, **kwargs):
+            outputs = batch_decode(sequences, *args, **kwargs)
+            record({"event": "decoded", "input_rows": len(sequences), "output_rows": len(outputs)})
+            if len(outputs) != len(sequences):
+                raise RuntimeError(
+                    f"Tokenizer decoded {len(outputs)} results from {len(sequences)} generated rows"
+                )
+            return outputs
+
+        self.tokenizer.batch_decode = decode_with_diagnostics
 
         def generate_with_diagnostics(*positional, **options):
             ids = positional[0] if positional else options.get("input_ids", options.get("inputs"))
