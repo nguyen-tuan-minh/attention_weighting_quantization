@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import traceback
 import math
@@ -186,6 +187,7 @@ def install_batch_diagnostics(arguments: list[str]) -> None:
         self.tokenizer.padding_side = "left"
         self.model.config.tokenizer_padding_side = "left"
         generate = self.model.generate
+        supports_modalities = "modalities" in inspect.signature(generate).parameters
         batch_decode = self.tokenizer.batch_decode
 
         def decode_with_diagnostics(sequences, *args, **kwargs):
@@ -201,11 +203,17 @@ def install_batch_diagnostics(arguments: list[str]) -> None:
 
         def generate_with_diagnostics(*positional, **options):
             ids = positional[0] if positional else options.get("input_ids", options.get("inputs"))
+            # LLaVA-NeXT zips embeddings with modalities during truncation.
+            # Its singleton default silently truncates a multi-row batch.
+            # Older LLaVA implementations do not accept this argument.
+            if supports_modalities and ids is not None and options.get("images") is not None:
+                options.setdefault("modalities", ["image"] * ids.shape[0])
             mask = options.get("attention_mask")
             event = {
                 "event": "generate", "input_ids": describe(ids),
                 "attention_mask": describe(mask), "images": describe(options.get("images")),
                 "image_sizes": describe(options.get("image_sizes")),
+                "modalities": options.get("modalities"),
                 "valid_text_lengths": mask.long().sum(-1).tolist() if mask is not None else None,
                 "image_tokens_per_row": ids.eq(-200).sum(-1).tolist() if ids is not None else None,
                 "max_new_tokens": options.get("max_new_tokens"),
