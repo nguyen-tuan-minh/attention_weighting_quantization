@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="llava", help="LMMS-Eval model adapter name (default: llava).")
     parser.add_argument("--model-args", default="", help="Additional comma-separated LMMS-Eval model arguments.")
     parser.add_argument("--tasks", default=PAPER_TASKS, help=f"Comma-separated LMMS-Eval task IDs (default: {PAPER_TASKS}).")
-    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size. Contrastive mode processes rows sequentially within each batch.")
+    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size. Both contrastive models process the full batch at each decoding step.")
     parser.add_argument("--device", default=None, help="Evaluation device, for example cuda:0.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: outputs/evaluations/<timestamp>).")
     parser.add_argument("--limit", type=float, default=None, help="Limit examples per task for a smoke run; do not use for reported metrics.")
@@ -494,40 +494,41 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
         ):
             if num_beams != 1:
                 raise ValueError("Contrastive decoding requires num_beams=1")
-            if input_ids.shape[0] > 1:
-                # Each row needs its own multimodal prefill, KV caches and EOS
-                # state. Preserve the proven single-row decoder for now.
-                batch_size = input_ids.shape[0]
-                image_counts = input_ids.eq(-200).sum(-1).tolist()
-                image_count = len(images) if images is not None else 0
-                if images is not None and image_count not in (batch_size, sum(image_counts)):
-                    raise ValueError("Cannot align contrastive batch images with input rows")
-                outputs = []
-                offset = 0
-                for row in range(batch_size):
-                    row_ids = input_ids[row:row + 1]
-                    if attention_mask is not None:
-                        row_ids = row_ids[:, attention_mask[row].bool()]
-                    flattened_images = image_count == sum(image_counts)
-                    start = offset if flattened_images else row
-                    count = image_counts[row] if flattened_images else 1
-                    offset += image_counts[row]
-                    outputs.append(contrastive_generate(
-                        _expert, row_ids, attention_mask=torch.ones_like(row_ids),
-                        images=images[start:start + count] if images is not None and count else None,
-                        image_sizes=image_sizes[start:start + count] if image_sizes is not None and count else None,
-                        max_new_tokens=max_new_tokens, do_sample=do_sample,
-                        temperature=temperature, top_p=top_p, num_beams=num_beams,
-                        use_cache=use_cache,
-                    )[0])
-                pad_id = self.tokenizer.pad_token_id
-                if pad_id is None:
-                    pad_id = self.tokenizer.eos_token_id
-                return torch.nn.utils.rnn.pad_sequence(outputs, batch_first=True, padding_value=pad_id)
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
             sequence = input_ids
-            expert_past = amateur_past = None
+            live = torch.ones_like(input_ids[:, :1], dtype=torch.bool)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id
+
+            def prepare(model):
+                model.config.tokenizer_padding_side = "left"
+                prepare_inputs = model.prepare_inputs_labels_for_multimodal
+                options = {"image_sizes": image_sizes}
+                if "modalities" in inspect.signature(prepare_inputs).parameters:
+                    options["modalities"] = ["image"] * input_ids.size(0)
+                ids, _, mask, _, embeds, _ = prepare_inputs(
+                    input_ids, None, attention_mask, None, None, images,
+                    **options,
+                )
+                if embeds is None:
+                    embeds = model.get_input_embeddings()(ids)
+                return embeds, mask
+
+            def forward_step(model, embeds, mask, past, token):
+                positions = (mask.long().cumsum(-1) - 1).clamp_min(0)
+                if past is None:
+                    inputs = {"inputs_embeds": embeds}
+                else:
+                    inputs = {"input_ids": token}
+                    positions = positions[:, -1:]
+                output = model(**inputs, position_ids=positions, attention_mask=mask,
+                               past_key_values=past, use_cache=use_cache, return_dict=True)
+                if use_cache and output.past_key_values is None:
+                    raise RuntimeError("Contrastive model did not return the requested KV cache")
+                return output.logits[:, -1, :].float(), output.past_key_values
+
             eos_value = getattr(expert_model.config, "eos_token_id", None)
             eos_ids = set(eos_value) if isinstance(eos_value, (list, tuple)) else ({eos_value} if eos_value is not None else set())
             temperature = float(temperature or 0.0)
@@ -536,52 +537,16 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                 raise ValueError("LMMS-Eval top_p must be in (0, 1] for probabilistic contrastive decoding")
 
             with torch.inference_mode():
+                expert_embeds, expert_mask = prepare(expert_model)
+                amateur_embeds, amateur_mask = prepare(amateur_model_ref)
+                decodable_mask = None
+                expert_past = amateur_past = token = None
                 for _ in range(int(max_new_tokens)):
-                    expert_cached = use_cache and expert_past is not None
-                    amateur_cached = use_cache and amateur_past is not None
-                    expert_input = sequence[:, -1:] if expert_cached else sequence
-                    amateur_input = sequence[:, -1:] if amateur_cached else sequence
-                    expert_output = expert_model(
-                        input_ids=expert_input,
-                        attention_mask=attention_mask,
-                        past_key_values=expert_past if expert_cached else None,
-                        images=images if not expert_cached else None,
-                        image_sizes=image_sizes if not expert_cached else None,
-                        use_cache=True,
-                        return_dict=True,
-                    )
-                    amateur_output = amateur_model_ref(
-                        input_ids=amateur_input,
-                        attention_mask=attention_mask,
-                        past_key_values=amateur_past if amateur_cached else None,
-                        images=images if not amateur_cached else None,
-                        image_sizes=image_sizes if not amateur_cached else None,
-                        use_cache=True,
-                        return_dict=True,
-                    )
-                    # LLaVA expands each image placeholder into visual tokens
-                    # during the prefill. The caller's attention mask only
-                    # covers the original text tokens, so rebuild it from the
-                    # actual cache length before the next cached step.
-                    if use_cache and expert_past is None:
-                        expert_past = expert_output.past_key_values
-                        amateur_past = amateur_output.past_key_values
-
-                        def cache_length(cache):
-                            if hasattr(cache, "get_seq_length"):
-                                return int(cache.get_seq_length())
-                            return int(cache[0][0].shape[-2])
-
-                        expert_length = cache_length(expert_past)
-                        amateur_length = cache_length(amateur_past)
-                        if expert_length != amateur_length:
-                            raise RuntimeError(
-                                "Expert and amateur produced different KV sequence lengths "
-                                f"({expert_length} vs {amateur_length}); check image preprocessing and prompt tokenization"
-                            )
-                        attention_mask = attention_mask.new_ones((input_ids.shape[0], expert_length))
-                    expert_logits = expert_output.logits[:, -1, :].float()
-                    amateur_logits = amateur_output.logits[:, -1, :].float().to(expert_logits.device)
+                    expert_logits, expert_past = forward_step(
+                        expert_model, expert_embeds, expert_mask, expert_past, token)
+                    amateur_logits, amateur_past = forward_step(
+                        amateur_model_ref, amateur_embeds, amateur_mask, amateur_past, token)
+                    amateur_logits = amateur_logits.to(expert_logits.device)
                     if expert_logits.shape[-1] != amateur_logits.shape[-1]:
                         raise RuntimeError("Expert and amateur output vocabulary sizes differ")
                     valid_vocab_size = min(
@@ -593,26 +558,27 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                     # plausibility filter, as well as before choosing a token.
                     expert_logits = expert_logits[:, :valid_vocab_size]
                     amateur_logits = amateur_logits[:, :valid_vocab_size]
-                    valid_ids = [
-                        token_id for token_id in decodable_token_ids if token_id < valid_vocab_size
-                    ]
-                    if not valid_ids:
-                        raise RuntimeError("Tokenizer exposes no decodable IDs within the model vocabulary")
-                    decodable_mask = torch.zeros(
-                        valid_vocab_size, dtype=torch.bool, device=expert_logits.device
-                    )
-                    decodable_mask[valid_ids] = True
+                    if decodable_mask is None:
+                        valid_ids = [
+                            token_id for token_id in decodable_token_ids if token_id < valid_vocab_size
+                        ]
+                        if not valid_ids:
+                            raise RuntimeError("Tokenizer exposes no decodable IDs within the model vocabulary")
+                        decodable_mask = torch.zeros(
+                            valid_vocab_size, dtype=torch.bool, device=expert_logits.device
+                        )
+                        decodable_mask[valid_ids] = True
                     expert_logits = expert_logits.masked_fill(~decodable_mask.unsqueeze(0), -torch.inf)
                     amateur_logits = amateur_logits.masked_fill(~decodable_mask.unsqueeze(0), -torch.inf)
-                    expert_log_probs = functional.log_softmax(expert_logits[0], dim=-1)
+                    expert_log_probs = functional.log_softmax(expert_logits, dim=-1)
                     expert_probabilities = expert_log_probs.exp()
-                    allowed = expert_probabilities >= expert_probabilities.max() * threshold
+                    allowed = expert_probabilities >= expert_probabilities.amax(dim=-1, keepdim=True) * threshold
                     if score_type == "logits":
-                        expert_scores = expert_logits[0]
-                        amateur_scores = amateur_logits[0]
+                        expert_scores = expert_logits
+                        amateur_scores = amateur_logits
                     else:
                         expert_scores = expert_log_probs
-                        amateur_scores = functional.log_softmax(amateur_logits[0], dim=-1)
+                        amateur_scores = functional.log_softmax(amateur_logits, dim=-1)
                     scores = ((1 + weight) * expert_scores - weight * amateur_scores).masked_fill(
                         ~allowed, -torch.inf
                     )
@@ -622,23 +588,25 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
                         sorted_probabilities, sorted_ids = torch.sort(probabilities, descending=True)
                         cumulative = torch.cumsum(sorted_probabilities, dim=-1)
                         remove = cumulative - sorted_probabilities >= top_p
-                        probabilities[sorted_ids[remove]] = 0
-                        probabilities /= probabilities.sum()
-                        next_token = torch.multinomial(probabilities, num_samples=1).reshape(1, 1)
+                        sorted_probabilities.masked_fill_(remove, 0)
+                        sampled = torch.multinomial(sorted_probabilities, num_samples=1)
+                        next_token = sorted_ids.gather(-1, sampled)
                     else:
-                        next_token = scores.argmax(dim=-1).reshape(1, 1)
-                    next_token = next_token.to(input_ids.device)
-                    sequence = torch.cat((sequence, next_token), dim=1)
-                    attention_mask = torch.cat(
-                        (attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))), dim=1
-                    )
-                    expert_past = expert_output.past_key_values
-                    amateur_past = amateur_output.past_key_values
-                    if int(next_token.item()) in eos_ids:
+                        next_token = scores.argmax(dim=-1, keepdim=True)
+                    token = torch.where(live, next_token.to(input_ids.device), pad_id)
+                    sequence = torch.cat((sequence, token), dim=1)
+                    expert_mask = torch.cat((expert_mask, live.to(expert_mask)), dim=1)
+                    amateur_mask = torch.cat((amateur_mask, live.to(amateur_mask)), dim=1)
+                    if not use_cache:
+                        expert_embeds = torch.cat((expert_embeds, expert_model.get_input_embeddings()(token).to(expert_embeds)), dim=1)
+                        amateur_embeds = torch.cat((amateur_embeds, amateur_model_ref.get_input_embeddings()(token).to(amateur_embeds)), dim=1)
+                    for eos_id in eos_ids:
+                        live = live & token.ne(eos_id)
+                    if not live.any():
                         break
 
             generated_tokens = sequence[:, input_ids.shape[1] :]
-            generated_ids = generated_tokens[0].tolist()
+            generated_ids = generated_tokens.flatten().tolist()
             invalid_ids = [
                 int(token_id) for token_id in generated_ids if int(token_id) not in decodable_token_ids
             ]
@@ -789,9 +757,6 @@ def main() -> int:
     if args.contrastive_amateur is not None:
         if args.model != "llava":
             raise ValueError("Contrastive decoding is currently supported with --model llava only")
-        if int(args.batch_size) > 1:
-            print("Contrastive evaluation decodes rows sequentially within each batch; "
-                  "increasing batch size does not enable parallel decoding.", flush=True)
         if args.remove_new_task_data:
             raise ValueError("--remove-new-task-data cannot be combined with contrastive weight sweeps")
         if not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1:
