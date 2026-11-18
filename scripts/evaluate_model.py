@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="llava", help="LMMS-Eval model adapter name (default: llava).")
     parser.add_argument("--model-args", default="", help="Additional comma-separated LMMS-Eval model arguments.")
     parser.add_argument("--tasks", default=PAPER_TASKS, help=f"Comma-separated LMMS-Eval task IDs (default: {PAPER_TASKS}).")
-    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size; start with 2 for batched LLaVA generation. Contrastive mode currently requires 1.")
+    parser.add_argument("--batch-size", default="1", help="LMMS-Eval batch size. Contrastive mode processes rows sequentially within each batch.")
     parser.add_argument("--device", default=None, help="Evaluation device, for example cuda:0.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: outputs/evaluations/<timestamp>).")
     parser.add_argument("--limit", type=float, default=None, help="Limit examples per task for a smoke run; do not use for reported metrics.")
@@ -390,8 +390,6 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
         contrastive_offload_dir: str | None = None,
         **model_kwargs,
     ) -> None:
-        if int(model_kwargs.get("batch_size", 1)) != 1:
-            raise ValueError("Contrastive LLaVA evaluation currently requires --batch-size 1")
         expert_path = str(model_kwargs.get("pretrained", model_args[0] if model_args else ""))
         if not expert_path:
             raise ValueError("Contrastive evaluation needs the expert checkpoint in pretrained=...")
@@ -494,8 +492,38 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
             use_cache=True,
             **unused,
         ):
-            if input_ids.shape[0] != 1 or num_beams != 1:
-                raise ValueError("Contrastive decoding supports batch size 1 and num_beams=1")
+            if num_beams != 1:
+                raise ValueError("Contrastive decoding requires num_beams=1")
+            if input_ids.shape[0] > 1:
+                # Each row needs its own multimodal prefill, KV caches and EOS
+                # state. Preserve the proven single-row decoder for now.
+                batch_size = input_ids.shape[0]
+                image_counts = input_ids.eq(-200).sum(-1).tolist()
+                image_count = len(images) if images is not None else 0
+                if images is not None and image_count not in (batch_size, sum(image_counts)):
+                    raise ValueError("Cannot align contrastive batch images with input rows")
+                outputs = []
+                offset = 0
+                for row in range(batch_size):
+                    row_ids = input_ids[row:row + 1]
+                    if attention_mask is not None:
+                        row_ids = row_ids[:, attention_mask[row].bool()]
+                    flattened_images = image_count == sum(image_counts)
+                    start = offset if flattened_images else row
+                    count = image_counts[row] if flattened_images else 1
+                    offset += image_counts[row]
+                    outputs.append(contrastive_generate(
+                        _expert, row_ids, attention_mask=torch.ones_like(row_ids),
+                        images=images[start:start + count] if images is not None and count else None,
+                        image_sizes=image_sizes[start:start + count] if image_sizes is not None and count else None,
+                        max_new_tokens=max_new_tokens, do_sample=do_sample,
+                        temperature=temperature, top_p=top_p, num_beams=num_beams,
+                        use_cache=use_cache,
+                    )[0])
+                pad_id = self.tokenizer.pad_token_id
+                if pad_id is None:
+                    pad_id = self.tokenizer.eos_token_id
+                return torch.nn.utils.rnn.pad_sequence(outputs, batch_first=True, padding_value=pad_id)
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
             sequence = input_ids
@@ -635,6 +663,7 @@ def run_lmms_eval_with_contrastive_decoding(arguments: list[str]) -> int:
         )
 
     Llava.__init__ = init_with_contrastive
+    install_batch_diagnostics(arguments)
     sys.argv = [sys.argv[0], *arguments]
     from lmms_eval.__main__ import cli_evaluate
 
@@ -760,8 +789,9 @@ def main() -> int:
     if args.contrastive_amateur is not None:
         if args.model != "llava":
             raise ValueError("Contrastive decoding is currently supported with --model llava only")
-        if str(args.batch_size) != "1":
-            raise ValueError("Contrastive LLaVA evaluation currently requires --batch-size 1")
+        if int(args.batch_size) > 1:
+            print("Contrastive evaluation decodes rows sequentially within each batch; "
+                  "increasing batch size does not enable parallel decoding.", flush=True)
         if args.remove_new_task_data:
             raise ValueError("--remove-new-task-data cannot be combined with contrastive weight sweeps")
         if not math.isfinite(args.plausibility_threshold) or not 0 < args.plausibility_threshold <= 1:
